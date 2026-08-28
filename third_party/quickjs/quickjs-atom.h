@@ -75,6 +75,10 @@ DEF(public, "public")
 DEF(static, "static")
 DEF(yield, "yield")
 DEF(await, "await")
+DEF(safe, "safe")
+DEF(mut, "mut")
+DEF(unsafe, "unsafe")
+DEF(extern, "extern")
 
 /* empty string */
 DEF(empty_string, "")

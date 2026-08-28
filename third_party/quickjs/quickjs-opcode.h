@@ -230,6 +230,9 @@ DEF(       post_inc, 1, 1, 2, none)
 DEF(        dec_loc, 2, 0, 0, loc8)
 DEF(        inc_loc, 2, 0, 0, loc8)
 DEF(        add_loc, 2, 1, 0, loc8)
+/* SX safe i32 compound-add fast path. */
+DEF( add_loc_safe_i32, 2, 1, 0, loc8)
+DEF( inc_loc_safe_i32, 1, 0, 0, loc8)
 DEF(            not, 1, 1, 1, none)
 DEF(           lnot, 1, 1, 1, none)
 DEF(         typeof, 1, 1, 1, none)
@@ -260,6 +263,18 @@ DEF(             eq, 1, 2, 1, none)
 DEF(            neq, 1, 2, 1, none)
 DEF(      strict_eq, 1, 2, 1, none)
 DEF(     strict_neq, 1, 2, 1, none)
+/* SX safe i32 comparison fast path: get_loc(n) <rhs> cmp -> <rhs> cmp_loc_safe_i32(n).
+   Single opcode (opcode space is a byte and nearly full): u16 operand packs
+   the relop code in the high byte and the local index in the low byte. */
+DEF( cmp_loc_safe_i32, 3, 1, 1, u16)
+/* SX whole-loop fast path: fuses `for (let i=N; i<LIMIT; i++) accum OP= i;`
+   (safe/i32-inferred accum and induction locals) into one native loop that
+   never re-enters bytecode dispatch. Operands: accum local (u16), induction
+   local (u16), limit_kind byte (0=i32 immediate, 1=local index), limit
+   value/index (i32), relop byte (always 0=`<` for now, kept explicit for
+   future relops), accum_op byte (0=add,1=sub,2=mul). No stack effect: it
+   only touches var_buf[] locals directly. */
+DEF(loop_i32_accum, 12, 0, 0, none)
 DEF(is_undefined_or_null, 1, 1, 1, none)
 DEF(     private_in, 1, 2, 1, none)
 DEF(push_bigint_i32, 5, 0, 1, i32)
@@ -317,7 +332,6 @@ DEF(       get_loc8, 2, 0, 1, loc8)
 DEF(       put_loc8, 2, 1, 0, loc8)
 DEF(       set_loc8, 2, 1, 1, loc8)
 
-DEF(  get_loc0_loc1, 1, 0, 2, none_loc)
 DEF(       get_loc0, 1, 0, 1, none_loc)
 DEF(       get_loc1, 1, 0, 1, none_loc)
 DEF(       get_loc2, 1, 0, 1, none_loc)

@@ -526,6 +526,11 @@ typedef void JS_MarkFunc(JSRuntime *rt, JSGCObjectHeader *gp);
 JS_EXTERN void JS_MarkValue(JSRuntime *rt, JSValueConst val,
                             JS_MarkFunc *mark_func);
 JS_EXTERN void JS_RunGC(JSRuntime *rt);
+/* Defer threshold-triggered cycle collection across a proven allocation-free
+   SX execution region. Any allocation that crosses the threshold is collected
+   when the outermost section is left. */
+JS_EXTERN void JS_EnterGCFreeSection(JSRuntime *rt);
+JS_EXTERN void JS_LeaveGCFreeSection(JSRuntime *rt);
 JS_EXTERN bool JS_IsLiveObject(JSRuntime *rt, JSValueConst obj);
 
 JS_EXTERN JSContext *JS_NewContext(JSRuntime *rt);
