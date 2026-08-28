@@ -1,0 +1,17 @@
+interface Transform {
+    x: f32;
+    y: f32;
+    z: f32;
+}
+
+const applyVelocity = (transform: &mut Transform, velocity: &Transform, dt: f32): void => {
+    transform.x += velocity.x * dt;
+    transform.y += velocity.y * dt;
+    transform.z += velocity.z * dt;
+};
+
+let mut pos: Transform = { x: 0.0, y: 10.0, z: 5.0 };
+let vel: Transform = { x: 1.0, y: 0.0, z: 0.0 };
+applyVelocity(&mut pos, &vel, 0.016);
+console.log(JSON.stringify(pos));
+

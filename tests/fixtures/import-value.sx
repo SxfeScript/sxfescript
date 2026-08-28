@@ -1,0 +1,4 @@
+interface Answer { value: i32; }
+const wrapped: Answer = { value: 42 };
+export const answer: i32 = wrapped.value;
+

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "SxfeScript",
+  "scopeName": "source.sxfe",
+  "patterns": [
+    { "include": "#comments" },
+    { "name": "keyword.control.sxfe", "match": "\\b(unsafe|if|else|for|while|return|throw|try|catch|finally|await|async)\\b" },
+    { "name": "storage.modifier.sxfe", "match": "\\b(let\\s+mut|let|const|interface|type|mut)\\b" },
+    { "name": "storage.type.sxfe", "match": "\\b(i32|f32|f64|bool|void)\\b" },
+    { "name": "keyword.operator.borrow.sxfe", "match": "&(mut\\b)?" },
+    { "name": "string.quoted.double.sxfe", "begin": "\"", "end": "\"", "patterns": [{ "match": "\\\\.", "name": "constant.character.escape.sxfe" }] },
+    { "name": "string.quoted.single.sxfe", "begin": "'", "end": "'", "patterns": [{ "match": "\\\\.", "name": "constant.character.escape.sxfe" }] },
+    { "name": "constant.numeric.sxfe", "match": "\\b(?:0x[0-9a-fA-F]+|\\d+(?:\\.\\d+)?)\\b" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        { "name": "comment.line.double-slash.sxfe", "begin": "//", "end": "$" },
+        { "name": "comment.block.sxfe", "begin": "/\\*", "end": "\\*/" }
+      ]
+    }
+  }
+}
+

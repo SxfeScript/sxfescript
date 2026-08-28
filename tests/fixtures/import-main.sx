@@ -1,0 +1,3 @@
+import { answer } from "./import-value.sx";
+if (answer !== 42) throw new Error(".sx module loader did not transform the import");
+

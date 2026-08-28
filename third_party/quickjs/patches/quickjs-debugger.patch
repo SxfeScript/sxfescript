@@ -1,0 +1,39 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -538,6 +538,10 @@ struct JSContext {
+                              const char *filename, int line, int flags, int scope_idx);
+     void *user_opaque;
++
++    JSDebuggerCallback *debugger_handler;
++    void *debugger_opaque;
++    int debugger_enabled;
+ };
+ 
+@@ -2120,6 +2124,17 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
+     rt->interrupt_opaque = opaque;
+ }
+ 
++void JS_SetDebuggerHandler(JSContext *ctx, JSDebuggerCallback *cb, void *opaque)
++{
++    ctx->debugger_handler = cb;
++    ctx->debugger_opaque = opaque;
++}
++
++void JS_EnableDebuggerMode(JSContext *ctx, bool enabled)
++{
++    ctx->debugger_enabled = enabled ? 1 : 0;
++}
++
+ diff --git a/quickjs.h b/quickjs.h
+ --- a/quickjs.h
+ +++ b/quickjs.h
+@@ -1141,6 +1141,11 @@ typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
+ JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
+ 
++typedef void JSDebuggerCallback(JSContext *ctx, const char *event,
++                                const char *data_json, void *opaque);
++JS_EXTERN void JS_SetDebuggerHandler(JSContext *ctx, JSDebuggerCallback *cb, void *opaque);
++JS_EXTERN void JS_EnableDebuggerMode(JSContext *ctx, bool enabled);
++
+ /* if can_block is true, Atomics.wait() can be used */

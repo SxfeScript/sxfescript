@@ -1,0 +1,130 @@
+diff --git a/quickjs.c b/quickjs.c
+index 8176bc4..48c1301 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -293,6 +293,7 @@ struct JSRuntime {
+     struct list_head tmp_obj_list; /* used during GC */
+     JSGCPhaseEnum gc_phase : 8;
+     size_t malloc_gc_threshold;
++    JSGCStats gc_stats; /* rayact: cumulative JS_RunGC counters */
+ #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
+     struct list_head string_list; /* list of JSString.link */
+ #endif
+@@ -7092,15 +7093,42 @@ static void gc_free_cycles(JSRuntime *rt)
+ 
+ void JS_RunGC(JSRuntime *rt)
+ {
++    /* rayact: per-pass timing so the host can attribute frame spikes to the
++       collector (and to the pass that dominates them) without sampling. */
++    uint64_t t0 = js__hrtime_ns(), t1, t2, t3;
++
+     /* decrement the reference of the children of each object. mark =
+        1 after this pass. */
+     gc_decref(rt);
++    t1 = js__hrtime_ns();
+ 
+     /* keep the GC objects with a non zero refcount and their childs */
+     gc_scan(rt);
++    t2 = js__hrtime_ns();
+ 
+     /* free the GC objects in a cycle */
+     gc_free_cycles(rt);
++    t3 = js__hrtime_ns();
++
++    rt->gc_stats.count++;
++    rt->gc_stats.decref_ns += t1 - t0;
++    rt->gc_stats.scan_ns += t2 - t1;
++    rt->gc_stats.free_ns += t3 - t2;
++    rt->gc_stats.last_ns = t3 - t0;
++    if (t3 - t0 > rt->gc_stats.max_ns)
++        rt->gc_stats.max_ns = t3 - t0;
++    rt->gc_stats.total_ns += t3 - t0;
++}
++
++/* rayact: snapshot the cumulative GC counters (all zero at runtime birth). */
++void JS_GetGCStats(JSRuntime *rt, JSGCStats *stats)
++{
++    *stats = rt->gc_stats;
++}
++
++size_t JS_GetMallocSize(JSRuntime *rt)
++{
++    return rt->malloc_state.malloc_size;
+ }
+ 
+ /* Return false if not an object or if the object has already been
+@@ -19384,6 +19412,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+             {
+                 JSValue val;
+ 
++                /* rayact: in-loop fast path for arr[i] on (typed) arrays.
++                   Same guarded helper JS_GetPropertyValue starts with, but
++                   without the call, the cur_pc store, or the atom fallback
++                   plumbing — the dominant shape in Float32Array-heavy code.
++                   The int-tagged index needs no free. */
++                if (likely(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT &&
++                           JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_INT)) {
++                    JSObject *ta_p = JS_VALUE_GET_OBJ(sp[-2]);
++                    uint32_t ta_idx = JS_VALUE_GET_INT(sp[-1]);
++                    if (js_get_fast_array_element(ctx, ta_p, ta_idx, &val)) {
++                        JS_FreeValue(ctx, sp[-2]);
++                        sp[-2] = val;
++                        sp--;
++                        /* BigInt64 lanes allocate and can fail */
++                        if (unlikely(JS_IsException(val))) {
++                            sf->cur_pc = pc;
++                            goto exception;
++                        }
++                        BREAK;
++                    }
++                }
+                 sf->cur_pc = pc;
+                 val = JS_GetPropertyValue(ctx, sp[-2], sp[-1]);
+                 JS_FreeValue(ctx, sp[-2]);
+@@ -19398,6 +19447,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+             {
+                 JSValue val;
+ 
++                /* rayact: same fast path as OP_get_array_el (obj is kept). */
++                if (likely(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_OBJECT &&
++                           JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_INT)) {
++                    JSObject *ta_p = JS_VALUE_GET_OBJ(sp[-2]);
++                    uint32_t ta_idx = JS_VALUE_GET_INT(sp[-1]);
++                    if (js_get_fast_array_element(ctx, ta_p, ta_idx, &val)) {
++                        sp[-1] = val;
++                        if (unlikely(JS_IsException(val))) {
++                            sf->cur_pc = pc;
++                            goto exception;
++                        }
++                        BREAK;
++                    }
++                }
+                 sf->cur_pc = pc;
+                 val = JS_GetPropertyValue(ctx, sp[-2], sp[-1]);
+                 sp[-1] = val;
+diff --git a/quickjs.h b/quickjs.h
+index e3a0f7b..a64c94e 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -496,6 +496,21 @@ JS_EXTERN void JS_SetDumpFlags(JSRuntime *rt, uint64_t flags);
+ JS_EXTERN uint64_t JS_GetDumpFlags(JSRuntime *rt);
+ JS_EXTERN size_t JS_GetGCThreshold(JSRuntime *rt);
+ JS_EXTERN void JS_SetGCThreshold(JSRuntime *rt, size_t gc_threshold);
++/* rayact: cumulative JS_RunGC counters (voluntary and allocation-triggered
++   collections alike), for host frame profilers. */
++typedef struct JSGCStats {
++    uint64_t count;     /* collections since runtime creation */
++    uint64_t total_ns;  /* wall time inside JS_RunGC */
++    uint64_t decref_ns; /* mark pass 1 */
++    uint64_t scan_ns;   /* mark pass 2 */
++    uint64_t free_ns;   /* cycle-free pass */
++    uint64_t last_ns;   /* duration of the most recent collection */
++    uint64_t max_ns;    /* slowest single collection observed */
++} JSGCStats;
++JS_EXTERN void JS_GetGCStats(JSRuntime *rt, JSGCStats *stats);
++/* rayact: current tracked allocation total (the value js_trigger_gc compares
++   against the GC threshold) — cheap, no heap walk. */
++JS_EXTERN size_t JS_GetMallocSize(JSRuntime *rt);
+ /* use 0 to disable maximum stack size check */
+ JS_EXTERN void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size);
+ /* should be called when changing thread to update the stack top value

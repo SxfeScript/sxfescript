@@ -1,0 +1,39 @@
+{
+  "name": "sxfescript",
+  "displayName": "SxfeScript",
+  "version": "0.1.0",
+  "publisher": "raythings",
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Programming Languages"],
+  "activationEvents": ["onLanguage:sxfe"],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [{
+      "id": "sxfe",
+      "aliases": ["SxfeScript", "sxfe"],
+      "extensions": [".sx"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "sxfe",
+      "scopeName": "source.sxfe",
+      "path": "./syntaxes/sxfe.tmLanguage.json"
+    }],
+    "snippets": [{ "language": "sxfe", "path": "./snippets/sxfe.json" }],
+    "jsonValidation": [{
+      "fileMatch": ["package.json"],
+      "url": "./schemas/package.schema.json"
+    }],
+    "configuration": {
+      "title": "SxfeScript",
+      "properties": {
+        "sxfe.sxnPath": {
+          "type": "string",
+          "default": "sxn",
+          "description": "Path to the SXN executable used for the language server."
+        }
+      }
+    }
+  }
+}
+

@@ -1,0 +1,13 @@
+{
+  "Affine struct": {
+    "prefix": "sxstruct",
+    "body": ["interface ${1:Name} {", "    ${2:value}: f32;", "}", "", "let mut ${3:value}: ${1:Name} = { ${2:value}: 0.0 };"],
+    "description": "Create a fixed-layout Sxfe struct and owner"
+  },
+  "Mutable borrow": {
+    "prefix": "sxmut",
+    "body": ["&mut ${1:value}"],
+    "description": "Create an exclusive lexical borrow"
+  }
+}
+
