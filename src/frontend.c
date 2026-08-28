@@ -155,6 +155,11 @@ int sxfe_compile(const char *source, size_t length, SxfeCompileResult *out) {
         }
         if (word_at(source, length, i, "unsafe")) { i += 6; continue; }
         if (source[i] == '&') {
+            if (i + 1 < length && source[i + 1] == '&') {
+                if (append(&result, "&&", 2)) goto oom;
+                i += 2;
+                continue;
+            }
             ++i; while (i < length && isspace((unsigned char)source[i])) ++i;
             if (word_at(source, length, i, "mut")) { i += 3; while (i < length && isspace((unsigned char)source[i])) ++i; }
             continue;
