@@ -35,6 +35,7 @@ static uint8_t *sxn_load_file(JSContext *ctx, size_t *length, const char *filena
         JS_ThrowSyntaxError(ctx, "SxfeScript compilation failed for '%s'", filename);
         return NULL;
     }
+    if (getenv("SXN_DUMP_TRANSFORM")) fprintf(stderr, "--- %s ---\n%.*s\n", filename, (int)compiled.length, compiled.javascript);
     uint8_t *result = js_malloc(ctx, compiled.length + 1);
     if (result) {
         memcpy(result, compiled.javascript, compiled.length + 1);
@@ -46,6 +47,7 @@ static uint8_t *sxn_load_file(JSContext *ctx, size_t *length, const char *filena
 
 static JSModuleDef *sxn_module_loader(JSContext *ctx, const char *name, void *opaque,
                                       JSValueConst attributes) {
+    if (!suffix(name, ".sx")) return js_module_loader(ctx, name, opaque, attributes);
     return js_module_load(ctx, name, opaque, attributes, sxn_load_file);
 }
 
@@ -58,7 +60,14 @@ static int execute_file(int argc, char **argv) {
     js_std_init_handlers(runtime);
     JSContext *context = JS_NewContext(runtime);
     if (!context) { JS_FreeRuntime(runtime); return 2; }
+    js_init_module_std(context, "qjs:std");
+    js_init_module_os(context, "qjs:os");
+    js_init_module_bjson(context, "qjs:bjson");
     js_std_add_helpers(context, argc - 1, argv + 1);
+    if (sxn_install_network(context) != 0) {
+        fputs("sxn: unable to initialize network runtime\n", stderr);
+        goto failure;
+    }
     JS_SetModuleLoaderFunc2(runtime, NULL, sxn_module_loader, js_module_check_attributes, NULL);
     JS_SetHostPromiseRejectionTracker(runtime, js_std_promise_rejection_tracker, NULL);
 
@@ -108,4 +117,3 @@ int main(int argc, char **argv) {
     }
     return execute_file(argc, argv);
 }
-

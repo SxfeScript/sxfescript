@@ -80,8 +80,10 @@ int sxfe_arena_move(void *destination, void *source, size_t size);
 int sxn_package_command(int argc, char **argv);
 int sxn_lsp_main(void);
 
+struct JSContext;
+int sxn_install_network(struct JSContext *context);
+
 #ifdef __cplusplus
 }
 #endif
 #endif
-

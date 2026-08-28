@@ -108,7 +108,14 @@ static size_t skip_declaration(const char *source, size_t length, size_t i) {
     return i;
 }
 
-static bool type_lead(char c) { return ident_start(c) || c == '&' || c == '{' || c == '[' || c == '('; }
+static bool likely_type_at(const char *source, size_t length, size_t i) {
+    if (i >= length) return false;
+    if (source[i] == '&') return true;
+    if (isupper((unsigned char)source[i])) return true;
+    const char *types[] = { "i32", "f32", "f64", "bool", "void", "string", "number", "boolean", "unknown", "any", "never" };
+    for (size_t n = 0; n < sizeof(types) / sizeof(types[0]); ++n) if (word_at(source, length, i, types[n])) return true;
+    return false;
+}
 
 static size_t skip_type(const char *source, size_t length, size_t i) {
     int angle = 0, square = 0, paren = 0, brace = 0;
@@ -170,7 +177,7 @@ int sxfe_compile(const char *source, size_t length, SxfeCompileResult *out) {
             size_t j = i + 1; while (j < length && isspace((unsigned char)source[j])) ++j;
             size_t previous = i;
             while (previous > 0 && isspace((unsigned char)source[previous - 1])) --previous;
-            bool likely_type = type_lead(j < length ? source[j] : 0) &&
+            bool likely_type = likely_type_at(source, length, j) &&
                                (paren_depth > 0 || declaration_context ||
                                 (previous > 0 && source[previous - 1] == ')'));
             if (likely_type) { i = skip_type(source, length, j); continue; }

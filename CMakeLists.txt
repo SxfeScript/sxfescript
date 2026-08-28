@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(sxn VERSION 0.1.0 LANGUAGES C)
+find_package(OpenSSL REQUIRED)
+find_package(CURL REQUIRED)
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -26,9 +28,10 @@ add_executable(sxn
   src/main.c
   src/package.c
   src/lsp.c
+  src/network.c
 )
 target_include_directories(sxn PRIVATE include third_party/quickjs)
-target_link_libraries(sxn PRIVATE sxfe qjs qjs-libc)
+target_link_libraries(sxn PRIVATE sxfe qjs qjs-libc OpenSSL::Crypto CURL::libcurl)
 if(WIN32)
   target_compile_definitions(sxn PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
 endif()

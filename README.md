@@ -30,3 +30,7 @@ opcode lowering, full control-flow ownership pass, native npm registry backend,
 and semantic LSP features are tracked in `spec/IMPLEMENTATION.md` and are not
 yet represented as complete production implementations.
 
+The runtime also includes native HTTP serving with SSE/WebSocket response modes
+and a libcurl-backed global `fetch`; see `spec/NETWORK.md`. Applications use the
+Bun-style `Sxn` namespace (`Sxn.serve`, `Sxn.file`, `Sxn.write`, and
+`Sxn.fetch`). The `qjs:*` modules remain internal compatibility modules.
