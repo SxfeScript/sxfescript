@@ -98,6 +98,7 @@ static void usage(void) {
          "Usage:\n"
          "  sxn <file.sx|file.js|file.mjs|file.cjs> [args...]\n"
          "  sxn run [script] -- [args...]\n"
+         "  sxn <script> [-- args...]\n"
          "  sxn install [--trust package]\n"
          "  sxn add [--dev] package[@range]\n"
          "  sxn remove package\n"
@@ -113,7 +114,12 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "run") || !strcmp(argv[1], "install") || !strcmp(argv[1], "add") ||
         !strcmp(argv[1], "remove") || !strcmp(argv[1], "init")) return sxn_package_command(argc, argv);
     if (!suffix(argv[1], ".sx") && !suffix(argv[1], ".js") && !suffix(argv[1], ".mjs") && !suffix(argv[1], ".cjs")) {
-        fprintf(stderr, "sxn: unsupported entrypoint '%s'\n", argv[1]); return 2;
+        char **run_argv = calloc((size_t)argc + 1, sizeof(*run_argv));
+        if (!run_argv) return 2;
+        run_argv[0] = argv[0]; run_argv[1] = "run";
+        for (int i = 1; i < argc; ++i) run_argv[i + 1] = argv[i];
+        int status = sxn_package_command(argc + 1, run_argv);
+        free(run_argv); return status;
     }
     return execute_file(argc, argv);
 }

@@ -4,6 +4,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef _WIN32
+#include <limits.h>
+#include <unistd.h>
+#endif
+
 #ifdef _WIN32
 #define SXN_NPM "npm.cmd"
 #define SXN_NULL " >NUL 2>NUL"
@@ -14,6 +19,28 @@
 
 static int npm_available(void) {
     return system(SXN_NPM " --version" SXN_NULL) == 0;
+}
+
+static int expose_sxn_to_scripts(const char *executable) {
+    if (!executable || !strchr(executable, '/')) return 0;
+#ifdef _WIN32
+    (void)executable;
+    return 0;
+#else
+    char resolved[PATH_MAX];
+    if (!realpath(executable, resolved)) return -1;
+    char *slash = strrchr(resolved, '/');
+    if (!slash) return -1;
+    *slash = 0;
+    const char *old_path = getenv("PATH");
+    size_t needed = strlen(resolved) + (old_path ? strlen(old_path) : 0) + 2;
+    char *path = malloc(needed);
+    if (!path) return -1;
+    snprintf(path, needed, "%s%s%s", resolved, old_path ? ":" : "", old_path ? old_path : "");
+    int status = setenv("PATH", path, 1);
+    free(path);
+    return status;
+#endif
 }
 
 static int append_arg(char *command, size_t capacity, const char *argument) {
@@ -45,6 +72,10 @@ static int write_initial_manifest(void) {
 
 int sxn_package_command(int argc, char **argv) {
     if (!strcmp(argv[1], "init")) return write_initial_manifest();
+    if (expose_sxn_to_scripts(argv[0])) {
+        fputs("sxn: unable to expose the current executable to package scripts\n", stderr);
+        return 2;
+    }
     if (!npm_available()) {
         fputs("sxn: this bootstrap package backend requires npm on PATH; the native registry backend is not yet enabled\n", stderr);
         return 2;
@@ -71,4 +102,3 @@ int sxn_package_command(int argc, char **argv) {
     }
     return status == 0 ? 0 : 1;
 }
-
