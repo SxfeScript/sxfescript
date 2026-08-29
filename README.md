@@ -78,6 +78,7 @@ churning 2M allocations) the worst pause is 0.099 ms here against Node's
 0.203 and Bun's 0.241 -- still ahead, but by 2-3x rather than 50x. Quote the
 smaller number.
 | Pause consistency: total time | 381 ms | **245 ms** | 281 ms | Node |
+| Parse 32k-line generated file | **0.01 s** | 0.05 s | 0.02 s | sxn |
 
 A note on the comparison: this runtime deliberately has no JIT, because iOS
 withholds JIT entitlements from third-party apps and a machine-code tier
@@ -85,6 +86,12 @@ would make it unusable there. The rows below where a JIT runtime pulls ahead
 are therefore measuring against a technique this project cannot adopt, not a
 gap awaiting optimization -- see `spec/IMPLEMENTATION.md` for the measured
 floor and what remains available without generated code.
+
+The parse row is new: parsing was quadratic in declarations per scope until
+the resolver's linear scans were indexed, and a 32k-line generated file now
+parses faster here than in either JIT runtime -- compilation speed is pure
+interpreter-side work, so it is one sustained category an interpreter can
+win outright.
 
 sxn wins the categories dominated by process startup and one-shot work,
 where there is no JIT to warm up, and has by far the tightest worst-case
