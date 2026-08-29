@@ -1501,6 +1501,7 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref);
 static bool is_valid_weakref_target(JSValueConst val);
 static void insert_weakref_record(JSValueConst target,
                                   struct JSWeakRefRecord *wr);
+static JSValue js_new_uint8array(JSContext *ctx, JSValue buffer);
 static JSValue js_array_buffer_constructor3(JSContext *ctx,
                                             JSValueConst new_target,
                                             uint64_t len, uint64_t *max_len,
@@ -5144,6 +5145,15 @@ fail:
    only need an ArrayBuffer (Buffer.from) don't pay for a Uint8Array they'd
    immediately discard -- see JS_NewUint8ArrayFromString/
    JS_NewArrayBufferFromString below, the two thin wrappers around this. */
+/* arcsx: the buffer produced here becomes an ArrayBuffer's data, and the
+   JSArrayBuffer struct was a second malloc+free per encode. Allocating
+   [struct][data] as one block removes it: the struct slot sits before the
+   returned data pointer, 16-aligned so any typed-array view over the buffer
+   stays element-aligned, and the finalizer's js_free_rt of the struct frees
+   the whole block (free_func stays NULL for the data). Measured as ~93% of
+   TextEncoder.encode being this allocation envelope rather than encoding. */
+#define JS_ABUF_EMBED_HDR (((sizeof(JSArrayBuffer)) + 15) & ~(size_t)15)
+
 static uint8_t *js_string_to_utf8_buf(JSContext *ctx, JSValueConst val1, size_t *plen)
 {
     JSValue val;
@@ -5164,11 +5174,12 @@ static uint8_t *js_string_to_utf8_buf(JSContext *ctx, JSValueConst val1, size_t 
         for (pos = 0; pos < len; pos++)
             count += src[pos] >> 7;
         alloc_len = (size_t)len + (size_t)count;
-        buf = js_malloc(ctx, alloc_len ? alloc_len : 1);
+        buf = js_malloc(ctx, JS_ABUF_EMBED_HDR + (alloc_len ? alloc_len : 1));
         if (!buf) {
             JS_FreeValue(ctx, val);
             return NULL;
         }
+        buf += JS_ABUF_EMBED_HDR;
         q = buf;
         if (count == 0) {
             /* Pure ASCII: every byte passes through unchanged, so a plain
@@ -5195,11 +5206,12 @@ static uint8_t *js_string_to_utf8_buf(JSContext *ctx, JSValueConst val1, size_t 
            code point; a surrogate pair produces 4 bytes but consumes 2
            code points, so this never underestimates. */
         alloc_len = (size_t)len * 3;
-        buf = js_malloc(ctx, alloc_len ? alloc_len : 1);
+        buf = js_malloc(ctx, JS_ABUF_EMBED_HDR + (alloc_len ? alloc_len : 1));
         if (!buf) {
             JS_FreeValue(ctx, val);
             return NULL;
         }
+        buf += JS_ABUF_EMBED_HDR;
         q = buf;
         pos = 0;
         while (pos < len) {
@@ -5236,12 +5248,38 @@ static uint8_t *js_string_to_utf8_buf(JSContext *ctx, JSValueConst val1, size_t 
        the TextEncoder hot loop ~10%). This buffer lives on as an
        ArrayBuffer backing store, so large slack is worth returning. */
     if (written < alloc_len / 2 && alloc_len - written >= 4096) {
-        uint8_t *shrunk = js_realloc(ctx, buf, written ? written : 1);
-        if (shrunk) buf = shrunk;
+        uint8_t *shrunk = js_realloc(ctx, buf - JS_ABUF_EMBED_HDR,
+                                     JS_ABUF_EMBED_HDR + (written ? written : 1));
+        if (shrunk) buf = shrunk + JS_ABUF_EMBED_HDR;
     }
     JS_FreeValue(ctx, val);
     *plen = written;
     return buf;
+}
+
+/* Builds the ArrayBuffer object over a [struct][data] block from
+   js_string_to_utf8_buf; consumes the block (frees it on failure). */
+static JSValue js_new_array_buffer_embedded(JSContext *ctx, uint8_t *data, size_t len)
+{
+    JSArrayBuffer *abuf = (JSArrayBuffer *)(data - JS_ABUF_EMBED_HDR);
+    JSValue obj;
+
+    obj = JS_NewObjectClass(ctx, JS_CLASS_ARRAY_BUFFER);
+    if (JS_IsException(obj)) {
+        js_free(ctx, (uint8_t *)abuf);
+        return obj;
+    }
+    abuf->byte_length = (int)len;
+    abuf->max_byte_length = -1;
+    abuf->data = data;
+    init_list_head(&abuf->array_list);
+    abuf->detached = false;
+    abuf->immutable = false;
+    abuf->shared = false;
+    abuf->opaque = NULL;
+    abuf->free_func = NULL; /* data lives in the struct's own block */
+    JS_SetOpaqueInternal(obj, abuf);
+    return obj;
 }
 
 JSValue JS_NewUint8ArrayFromString(JSContext *ctx, JSValueConst val1)
@@ -5249,7 +5287,7 @@ JSValue JS_NewUint8ArrayFromString(JSContext *ctx, JSValueConst val1)
     size_t len;
     uint8_t *buf = js_string_to_utf8_buf(ctx, val1, &len);
     if (!buf) return JS_EXCEPTION;
-    return JS_NewUint8Array(ctx, buf, len, js_array_buffer_free, NULL, false);
+    return js_new_uint8array(ctx, js_new_array_buffer_embedded(ctx, buf, len));
 }
 
 JSValue JS_NewArrayBufferFromString(JSContext *ctx, JSValueConst val1)
@@ -5257,7 +5295,7 @@ JSValue JS_NewArrayBufferFromString(JSContext *ctx, JSValueConst val1)
     size_t len;
     uint8_t *buf = js_string_to_utf8_buf(ctx, val1, &len);
     if (!buf) return JS_EXCEPTION;
-    return JS_NewArrayBuffer(ctx, buf, len, js_array_buffer_free, NULL, false);
+    return js_new_array_buffer_embedded(ctx, buf, len);
 }
 
 const uint16_t *JS_ToCStringLenUTF16(JSContext *ctx, size_t *plen,

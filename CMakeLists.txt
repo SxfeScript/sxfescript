@@ -165,6 +165,10 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # Compound-assignment expression values, captured-variable stores, TDZ
   # through closures -- the semantics the checked-store dup elision must keep.
   add_test(NAME sxn-capture-semantics COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/capture_semantics.mjs)
+  # ArrayBuffers whose struct and data share one allocation (the encode fast
+  # path): views, alignment for Float64, slice, transfer/detach, large
+  # buffers, and sustained churn.
+  add_test(NAME sxn-embedded-buffer COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/embedded_buffer.mjs)
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
 
