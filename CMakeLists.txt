@@ -162,6 +162,9 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # Direct-eval and with-statement scope resolution -- the pseudo-variable
   # paths that the resolver's name indexes must fall back to, never shortcut.
   add_test(NAME sxn-eval-scopes COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/eval_scopes.cjs)
+  # Compound-assignment expression values, captured-variable stores, TDZ
+  # through closures -- the semantics the checked-store dup elision must keep.
+  add_test(NAME sxn-capture-semantics COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/capture_semantics.mjs)
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
 

@@ -37795,6 +37795,34 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             {
                 /* Transformation: dup put_x(n) drop -> put_x(n) */
                 int op1, line2 = -1;
+                /* arcsx: the same elision for the TDZ-checked stores, which
+                   the rule below cannot cover because no set_x_check opcodes
+                   exist. `captured += v` in a closure compiles to
+                   ... add dup put_var_ref_check(n) [drop | return_undef], and
+                   the dup exists only to produce an expression value that is
+                   promptly discarded -- either explicitly (drop) or by frame
+                   exit (return_undef, which ignores the stack). Elide the
+                   dup in both shapes; three dispatches become one. */
+                if (code_match(&cc, pos_next, M2(OP_put_loc_check, OP_put_var_ref_check), -1, -1)) {
+                    int op_put = cc.op, put_idx = cc.idx, pos_after = cc.pos;
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    if (code_match(&cc, pos_after, OP_drop, -1)) {
+                        if (cc.line_num >= 0) line_num = cc.line_num;
+                        if (cc.col_num >= 0) col_num = cc.col_num;
+                        add_pc2line_info(s, bc_out.size, line_num, col_num);
+                        put_short_code(&bc_out, op_put, put_idx);
+                        pos_next = cc.pos;
+                        break;
+                    }
+                    if (code_match(&cc, pos_after, OP_return_undef, -1)) {
+                        add_pc2line_info(s, bc_out.size, line_num, col_num);
+                        put_short_code(&bc_out, op_put, put_idx);
+                        /* keep the return_undef itself in the stream */
+                        pos_next = pos_after;
+                        break;
+                    }
+                }
                 /* Transformation: dup put_x(n) -> set_x(n) */
                 if (code_match(&cc, pos_next, M3(OP_put_loc, OP_put_arg, OP_put_var_ref), -1, -1)) {
                     if (cc.line_num >= 0) line_num = cc.line_num;
