@@ -62,7 +62,7 @@ per-call benchmark:
 - The same floor explains EventEmitter: roughly half that benchmark is
   invoking the listener's own bytecode.
 
-Two things were ruled out by measurement along the way, and should not be
+Three things were ruled out by measurement along the way, and should not be
 retried without new evidence:
 
 - **Allocation count is not the limiting factor.** `encodeInto`, which
@@ -73,6 +73,19 @@ retried without new evidence:
   bare `{}` (58.3 ns) cost the same, so constructor and prototype machinery
   is not what is being paid for; eliding `.prototype` resolution would gain
   approximately nothing, and memoizing its slot measured ~2%.
+- **`ta.length` is not slow.** It measures ~21 ns in a clean loop, of which
+  ~11 ns is the loop itself. An earlier figure of 57 ns came from a harness
+  that ran several benchmarks back to back and was reading accumulated
+  memory pressure, not the operation. An inline fast path for the built-in
+  length getter was written, verified and reverted: it changed nothing on
+  any real benchmark. Beware benchmarks that share a process with earlier
+  ones -- measure each in isolation and take a minimum.
+
+Two further attempts were reverted for measuring *slower*: caching accessor
+properties in the property inline cache (typed-array `.length` 35.3 -> 49.7
+ns, because the extra branch on every cache hit costs more than the walk it
+saves), and a single-way per-call-site inline cache (12% slower than shape
+keying on a four-shape call site).
 
 What remains is a JIT tier, plus a generational nursery for object churn
 (freeing a small object costs ~29 ns here against Bun's ~1 ns, which is
