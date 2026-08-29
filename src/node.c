@@ -207,6 +207,53 @@ static JSValue sxn_ee_events(JSContext *ctx, JSValueConst this_val) {
     return JS_GetProperty(ctx, this_val, sxn_atom_events);
 }
 
+/* emit() resolution memo. Repeated `ee.emit("x", ...)` re-derives the same
+   answer every call: the same event-name string converts to the same atom,
+   and the same `_events` object yields the same listener array. Cache that
+   last resolution.
+
+   Validity is established without ever trusting a bare address:
+   - The `_events` object is looked up fresh on every emit (it is the
+     emitter's own property, one probe) and its pointer is *compared* to the
+     cached one. So replacing `ee._events` wholesale, or emitting on a
+     different emitter, misses -- there is no assumption that one emitter
+     owns the entry.
+   - The cache holds strong references to everything it keys on, so a cached
+     object cannot be freed and have its address reused by something else
+     while the entry still refers to it. This is the part that makes pointer
+     identity sound rather than a bet.
+   - `sxn_ee_gen` is bumped by every listener mutation (on/off/once via on,
+     removeAllListeners), so adding or removing a listener invalidates the
+     memo even though the array object may be unchanged.
+   A miss simply falls through to the full lookup. */
+static JSValue sxn_ee_memo_events = JS_UNDEFINED; /* strong ref */
+static JSValue sxn_ee_memo_typev = JS_UNDEFINED;  /* strong ref: the name string */
+static JSValue sxn_ee_memo_list = JS_UNDEFINED;   /* strong ref */
+static JSAtom sxn_ee_memo_atom = JS_ATOM_NULL;    /* strong ref */
+static uint32_t sxn_ee_memo_gen;
+static uint32_t sxn_ee_gen = 1;
+
+static void sxn_ee_memo_clear(JSContext *ctx) {
+    JS_FreeValue(ctx, sxn_ee_memo_events);
+    JS_FreeValue(ctx, sxn_ee_memo_typev);
+    JS_FreeValue(ctx, sxn_ee_memo_list);
+    JS_FreeAtom(ctx, sxn_ee_memo_atom);
+    sxn_ee_memo_events = JS_UNDEFINED;
+    sxn_ee_memo_typev = JS_UNDEFINED;
+    sxn_ee_memo_list = JS_UNDEFINED;
+    sxn_ee_memo_atom = JS_ATOM_NULL;
+}
+
+static void sxn_ee_memo_store(JSContext *ctx, JSValueConst events, JSValueConst typev,
+                              JSAtom atom, JSValueConst list) {
+    sxn_ee_memo_clear(ctx);
+    sxn_ee_memo_events = JS_DupValue(ctx, events);
+    sxn_ee_memo_typev = JS_DupValue(ctx, typev);
+    sxn_ee_memo_list = JS_DupValue(ctx, list);
+    sxn_ee_memo_atom = JS_DupAtom(ctx, atom);
+    sxn_ee_memo_gen = sxn_ee_gen;
+}
+
 static uint32_t sxn_ee_length(JSContext *ctx, JSValueConst list) {
     if (JS_IsUndefined(list)) return 0;
     uint32_t len = 0;
@@ -217,6 +264,7 @@ static uint32_t sxn_ee_length(JSContext *ctx, JSValueConst list) {
 }
 
 static JSValue js_ee_on(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    sxn_ee_gen++; /* listener set changes: invalidate the emit memo */
     if (argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_ThrowTypeError(ctx, "listener must be a function");
     JSAtom type = JS_ValueToAtom(ctx, argv[0]);
     if (type == JS_ATOM_NULL) return JS_EXCEPTION;
@@ -234,6 +282,7 @@ static JSValue js_ee_on(JSContext *ctx, JSValueConst this_val, int argc, JSValue
 }
 
 static JSValue js_ee_off(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    sxn_ee_gen++; /* listener set changes: invalidate the emit memo */
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected an event type");
     JSAtom type = JS_ValueToAtom(ctx, argv[0]);
     if (type == JS_ATOM_NULL) return JS_EXCEPTION;
@@ -263,6 +312,7 @@ static JSValue js_ee_off(JSContext *ctx, JSValueConst this_val, int argc, JSValu
 }
 
 static JSValue js_ee_remove_all_listeners(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    sxn_ee_gen++; /* listener set changes: invalidate the emit memo */
     if (argc < 1 || JS_IsUndefined(argv[0])) {
         /* Object.create(null), same null-proto shape the constructor uses --
            required so a listener type named e.g. "toString" can never
@@ -287,10 +337,28 @@ static JSValue js_ee_remove_all_listeners(JSContext *ctx, JSValueConst this_val,
 
 static JSValue js_ee_emit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     if (argc < 1) return JS_ThrowTypeError(ctx, "emit requires a type");
-    JSAtom type = JS_ValueToAtom(ctx, argv[0]);
-    if (type == JS_ATOM_NULL) return JS_EXCEPTION;
     JSValue events = sxn_ee_events(ctx, this_val);
-    JSValue list = JS_GetProperty(ctx, events, type);
+    JSAtom type;
+    JSValue list;
+    /* Memo hit: same _events object, same event-name string object, no
+       listener mutation since. Skips the atom conversion and the listener
+       array lookup; see sxn_ee_memo_store. Only heap strings are keyed by
+       identity -- anything else (a symbol, a computed string) takes the
+       full path. */
+    if (sxn_ee_memo_gen == sxn_ee_gen &&
+        JS_VALUE_GET_TAG(argv[0]) == JS_TAG_STRING &&
+        JS_VALUE_GET_PTR(argv[0]) == JS_VALUE_GET_PTR(sxn_ee_memo_typev) &&
+        JS_VALUE_GET_TAG(events) == JS_TAG_OBJECT &&
+        JS_VALUE_GET_PTR(events) == JS_VALUE_GET_PTR(sxn_ee_memo_events)) {
+        type = JS_DupAtom(ctx, sxn_ee_memo_atom);
+        list = JS_DupValue(ctx, sxn_ee_memo_list);
+    } else {
+        type = JS_ValueToAtom(ctx, argv[0]);
+        if (type == JS_ATOM_NULL) { JS_FreeValue(ctx, events); return JS_EXCEPTION; }
+        list = JS_GetProperty(ctx, events, type);
+        if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_STRING && JS_VALUE_GET_TAG(events) == JS_TAG_OBJECT)
+            sxn_ee_memo_store(ctx, events, argv[0], type, list);
+    }
     JS_FreeValue(ctx, events);
     /* Listener arrays are always plain fast arrays (built by JS_NewArray +
        integer appends), so JS_GetFastArray gives direct element access --
@@ -1018,6 +1086,7 @@ void sxn_free_node_compat(JSContext *ctx) {
        context; without this they show up as leaks under --leak-check (only
        visible in builds where the runtime's leak dumps are compiled in).
        JS_FreeAtom is a no-op for the predefined ones. */
+    sxn_ee_memo_clear(ctx);
     JS_FreeAtom(ctx, sxn_atom_events);
     JS_FreeAtom(ctx, sxn_atom_length);
     JS_FreeAtom(ctx, sxn_atom_error);
