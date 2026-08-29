@@ -38,6 +38,49 @@
   call in a loop is ~18x slower interpreted than JIT-inlined. Closing it
   in general requires a JIT tier, tracked as future work, not claimed.
 
+## Measured performance ceiling (why some gaps are not tunable)
+
+Recorded so this is not re-derived. All figures are the minimum of 4+ runs on
+macOS arm64, against Bun 1.2.17; sxn is the Release build.
+
+| Operation | sxn | Bun |
+|---|---|---|
+| Empty loop iteration | 16.3 ns | 0.4 ns |
+| `Math.max(1,2)` (bare native call) | 30.7 ns | 0.4 ns |
+| `Object.is(1,1)` | 34.0 ns | 0.4 ns |
+| `TextEncoder.encode` (36B ASCII) | 96.4 ns | 22.0 ns |
+
+The decisive line is the second: a JIT inlines `Math.max(1,2)` to a constant,
+so Bun's cost for a builtin call rounds to zero, while an interpreter must
+dispatch the opcode and push a C frame. That puts a hard floor under every
+per-call benchmark:
+
+- sxn's floor for *any* native call in a loop is ~30 ns (16 ns dispatch +
+  14 ns call). Bun's entire `TextEncoder.encode` is 22 ns. So even with an
+  encoder that took zero time, sxn could at best tie Bun on the 200k-call
+  TextEncoder benchmark. It is not reachable by optimizing the encoder.
+- The same floor explains EventEmitter: roughly half that benchmark is
+  invoking the listener's own bytecode.
+
+Two things were ruled out by measurement along the way, and should not be
+retried without new evidence:
+
+- **Allocation count is not the limiting factor.** `encodeInto`, which
+  allocates nothing, measures *slower* (130.6 ns) than `encode`, which
+  allocates a fresh array (101.3 ns). Reducing `new Uint8Array(40)` from 7
+  allocations to 5 moved the TextEncoder benchmark by ~1 ms.
+- **The object model is not the gap either.** `new Plain()` (58.7 ns) and a
+  bare `{}` (58.3 ns) cost the same, so constructor and prototype machinery
+  is not what is being paid for; eliding `.prototype` resolution would gain
+  approximately nothing, and memoizing its slot measured ~2%.
+
+What remains is a JIT tier, plus a generational nursery for object churn
+(freeing a small object costs ~29 ns here against Bun's ~1 ns, which is
+refcounting versus a nursery that reclaims dead young objects for free).
+The nursery is not a free win to adopt: the same refcounting that makes
+teardown expensive is what produces this runtime's 0.05 ms worst-case pause
+against Bun's 2.62 ms, which is its strongest measured property.
+
 ## Required production completion
 
 - Replace the conservative source transformer with QuickJS parser-mode changes
