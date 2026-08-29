@@ -18943,9 +18943,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             has_call_argc:
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
-                ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
-                                          JS_UNDEFINED, call_argc,
-                                          vc(call_argv), 0);
+                /* arcsx: a call to a plain C function goes straight to
+                   js_call_c_function, which is self-contained (it does its own
+                   stack-overflow check, frame push and realm switch). This
+                   skips JS_CallInternal's prologue -- an interrupt poll, a tag
+                   check, a class check and an indirect jump through
+                   rt->class_array -- none of which that path needs. Dropping
+                   the poll here does not affect responsiveness: every backward
+                   jump (OP_goto/goto8/goto16) polls, so any loop still does.
+                   Anything else falls through to the general path. */
+                if (likely(JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
+                           JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_C_FUNCTION))
+                    ret_val = js_call_c_function(ctx, call_argv[-1], JS_UNDEFINED,
+                                                 call_argc, vc(call_argv), 0);
+                else
+                    ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
+                                              JS_UNDEFINED, call_argc,
+                                              vc(call_argv), 0);
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
                 if (opcode == OP_tail_call)
@@ -18980,9 +18994,15 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 pc += 2;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
-                ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
-                                          JS_UNDEFINED, call_argc,
-                                          vc(call_argv), 0);
+                /* arcsx: same direct C-function dispatch as OP_call above. */
+                if (likely(JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
+                           JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_C_FUNCTION))
+                    ret_val = js_call_c_function(ctx, call_argv[-1], call_argv[-2],
+                                                 call_argc, vc(call_argv), 0);
+                else
+                    ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
+                                              JS_UNDEFINED, call_argc,
+                                              vc(call_argv), 0);
                 if (unlikely(JS_IsException(ret_val)))
                     goto exception;
                 if (opcode == OP_tail_call_method)

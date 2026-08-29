@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
 
 #ifdef _WIN32
 #define strcasecmp _stricmp
@@ -46,6 +49,22 @@ static JSModuleDef *sxn_module_loader(JSContext *ctx, const char *name, void *op
     return js_module_load(ctx, name, opaque, attributes, sxn_load_file);
 }
 
+
+/* Bytes of JS stack to allow, derived from the thread's actual stack limit.
+   Reserves 2MB for native frames beyond the interpreter's own checks, and
+   never returns less than QuickJS's 1MB default. */
+static size_t sxn_js_stack_budget(void) {
+    const size_t reserve = 2u * 1024 * 1024;
+    const size_t fallback = 1u * 1024 * 1024;
+#ifndef _WIN32
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_STACK, &rl) == 0 &&
+        rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur > reserve + fallback)
+        return (size_t)rl.rlim_cur - reserve;
+#endif
+    return fallback;
+}
+
 static int execute_file(int argc, char **argv, const char *filename,
                         bool memory_report, bool leak_check) {
     size_t length = 0;
@@ -59,6 +78,16 @@ static int execute_file(int argc, char **argv, const char *filename,
        it real headroom rather than let that budget keep shrinking as more
        builtin JS surface (node:* compat, future tasks) is added. */
     JS_SetGCThreshold(runtime, 8 * 1024 * 1024);
+    /* QuickJS defaults its JS stack budget to 1MB regardless of how much
+       stack the OS actually gave the thread, which capped recursion at ~948
+       frames here against Node's ~8900 -- deep enough to break ordinary
+       recursive code (tree walks, recursive-descent parsers, nested JSON).
+       Size it from the real limit instead, keeping a 2MB reserve so the
+       clean RangeError still fires well before the actual stack runs out:
+       native builtins can descend several C frames between the interpreter's
+       overflow checks, and overshooting that is a crash rather than an
+       exception. */
+    JS_SetMaxStackSize(runtime, sxn_js_stack_budget());
     if (leak_check) JS_SetDumpFlags(runtime, JS_ABORT_ON_LEAKS | JS_DUMP_MEM);
     if (getenv("SXN_DUMP_BYTECODE")) JS_SetDumpFlags(runtime, JS_GetDumpFlags(runtime) | JS_DUMP_BYTECODE_FINAL);
     js_std_init_handlers(runtime);
