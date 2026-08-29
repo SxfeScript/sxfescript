@@ -138,8 +138,15 @@ What remains available is everything that needs no generated code:
   rewriting opcodes in place once their operand types are observed. Pure
   interpreter bookkeeping. Note the hazard recorded below: the fork's
   existing fused i32 opcodes wrap on overflow and must stay gated on `safe`.
-- **Tail-call dispatch** of the interpreter loop (musttail + preserve_none),
-  worth ~10-15% for CPython 3.14.
+- ~~**Tail-call dispatch** of the interpreter loop (musttail + preserve_none)~~
+  -- measured and rejected. Apple clang 21 on arm64 supports both
+  `[[clang::musttail]]` and `preserve_none`, and a spike modelling both
+  dispatch styles over the same opcode mix
+  (`benchmarks/engine/dispatch_bench.c`) puts musttail **47-70% slower** than
+  the computed-goto threading quickjs already uses, repeatably at -O2 and
+  -O3. CPython's reported 10-15% was measured against a baseline that was not
+  using computed goto. This would have been a multi-week restructuring of the
+  interpreter into per-opcode functions for a large regression.
 - **A generational nursery**, which is not a JIT and would address the
   teardown cost -- but see the tradeoff below.
 
