@@ -73,6 +73,13 @@ retried without new evidence:
   bare `{}` (58.3 ns) cost the same, so constructor and prototype machinery
   is not what is being paid for; eliding `.prototype` resolution would gain
   approximately nothing, and memoizing its slot measured ~2%.
+- **Recursion depth was a real compatibility bug, not a performance one.**
+  QuickJS budgets 1MB of JS stack regardless of the thread's actual limit,
+  which capped recursion at 948 frames against Node's 8874. Sizing the budget
+  from RLIMIT_STACK with a 2MB reserve raised it to 5682. The reserve is not
+  optional: native builtins descend several C frames between the
+  interpreter's overflow checks, and overshooting the real stack is a crash
+  instead of a catchable RangeError.
 - **`ta.length` is not slow.** It measures ~21 ns in a clean loop, of which
   ~11 ns is the loop itself. An earlier figure of 57 ns came from a harness
   that ran several benchmarks back to back and was reading accumulated
@@ -100,7 +107,31 @@ ns, because the extra branch on every cache hit costs more than the walk it
 saves), and a single-way per-call-site inline cache (12% slower than shape
 keying on a four-shape call site).
 
-What remains is a JIT tier, plus a generational nursery for object churn
+### A JIT is ruled out by platform, not by effort
+
+iOS does not grant W^X/JIT entitlements to third-party apps, so a
+machine-code tier would make this runtime unusable on a target platform.
+That makes the dispatch floor above a permanent design property rather than
+a gap to be closed, and it rules out the single technique that would close
+it. Benchmarks against JIT runtimes should be read with that in mind: on
+JIT-bound microbenchmarks the comparison is against something this project
+structurally cannot do.
+
+What remains available is everything that needs no generated code:
+
+- **Direct dispatch of C-function calls** (done): calling js_call_c_function
+  straight from OP_call/OP_call_method rather than through JS_CallInternal's
+  prologue cut native-call overhead 14.5 -> 8.4 ns.
+- **Quickening / type specialization** in the CPython PEP 659 sense --
+  rewriting opcodes in place once their operand types are observed. Pure
+  interpreter bookkeeping. Note the hazard recorded below: the fork's
+  existing fused i32 opcodes wrap on overflow and must stay gated on `safe`.
+- **Tail-call dispatch** of the interpreter loop (musttail + preserve_none),
+  worth ~10-15% for CPython 3.14.
+- **A generational nursery**, which is not a JIT and would address the
+  teardown cost -- but see the tradeoff below.
+
+The remaining item is a generational nursery for object churn
 (freeing a small object costs ~29 ns here against Bun's ~1 ns, which is
 refcounting versus a nursery that reclaims dead young objects for free).
 The nursery is not a free win to adopt: the same refcounting that makes

@@ -72,6 +72,13 @@ Startup rows are the average of 20 process launches:
 | Pause consistency: worst single pause | **0.05 ms** | 0.20 ms | 2.62 ms | sxn |
 | Pause consistency: total time | 381 ms | **245 ms** | 281 ms | Node |
 
+A note on the comparison: this runtime deliberately has no JIT, because iOS
+withholds JIT entitlements from third-party apps and a machine-code tier
+would make it unusable there. The rows below where a JIT runtime pulls ahead
+are therefore measuring against a technique this project cannot adopt, not a
+gap awaiting optimization -- see `spec/IMPLEMENTATION.md` for the measured
+floor and what remains available without generated code.
+
 sxn wins the categories dominated by process startup and one-shot work,
 where there is no JIT to warm up, and has by far the tightest worst-case
 pause. On Buffer throughput it is now ahead of Bun and close behind Node. It
