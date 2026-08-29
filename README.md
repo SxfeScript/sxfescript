@@ -66,17 +66,27 @@ Startup rows are the average of 20 process launches:
 |---|---|---|---|---|
 | Real-world end-to-end task (wall clock, as invoked) | **9 ms** | 88 ms | 15 ms | sxn |
 | Cold start | **9 ms** | 45 ms | 9 ms | sxn / Bun tie |
-| Sustained throughput: TextEncoder | 19.4 ms | 38.7 ms | **6.0 ms** | Bun |
-| Sustained throughput: Buffer ops | 31.0 ms | **23.6 ms** | 26.8 ms | Node |
-| Sustained throughput: EventEmitter | 20.3 ms | **4.9 ms** | 9.0 ms | Node |
-| Pause consistency: worst single pause | **0.03 ms** | 0.18 ms | 2.60 ms | sxn |
-| Pause consistency: total time | 390 ms | **242 ms** | 280 ms | Node |
+| Sustained throughput: Buffer ops | 25.9 ms | **24.0 ms** | 27.4 ms | Node, sxn 2nd |
+| Sustained throughput: TextEncoder | 18.3 ms | 39.5 ms | **6.2 ms** | Bun |
+| Sustained throughput: EventEmitter | 20.7 ms | **5.0 ms** | 9.2 ms | Node |
+| Pause consistency: worst single pause | **0.05 ms** | 0.20 ms | 2.62 ms | sxn |
+| Pause consistency: total time | 381 ms | **245 ms** | 281 ms | Node |
 
 sxn wins the categories dominated by process startup and one-shot work,
 where there is no JIT to warm up, and has by far the tightest worst-case
-pause. It beats Node on TextEncoder throughput but not Bun, and trails both
-on the remaining hot loops: JavaScriptCore and V8 are JITs, QuickJS is an
-interpreter by design, and that gap is not closable by tuning around it.
+pause. On Buffer throughput it is now ahead of Bun and close behind Node. It
+beats Node on TextEncoder but not Bun, and trails both on EventEmitter --
+roughly half of that figure is running the listener's own bytecode, which
+nothing short of a JIT removes.
+
+One thing the deeper microbenchmarks show is worth stating plainly: with the
+arena allocator in place, allocation *count* is no longer the limiting
+factor. An escaping-allocation test puts `{}` at 29.5 ns here against Bun's
+7.5 ns and Node's 14.3 ns, while `new ArrayBuffer(40)` is 54.9 ns against
+Bun's 51.4 ns and Node's 109.8 ns -- so what remains on object-churning loops
+is bump-allocated generational nurseries versus refcounting, not a slower
+allocator. That is the same design tradeoff that produces the worst-case
+pause figure above.
 
 The throughput rows reflect a series of ArcSX/runtime optimizations (all
 tagged `arcsx:` in `third_party/quickjs`), roughly in order of payoff:
@@ -122,11 +132,16 @@ tagged `arcsx:` in `third_party/quickjs`), roughly in order of payoff:
   entry -- which is what made pointer identity safe here rather than a bet.
   Worth 12% of the events loop.
 
-Cumulatively: Buffer 102->31 ms, TextEncoder 76->19.4 ms, EventEmitter
-37->20.3 ms, with zero GC cycles during the loops throughout.
+Two later changes carried this further: skipping the per-object property
+array for property-less shapes (`new Uint8Array(40)` went from 7 allocations
+and 372 bytes to 5 and 308; `{}` from 2 allocations to 1), and dispatching
+`Buffer#toString` on an interned atom rather than a chain of string compares.
+
+Cumulatively: Buffer 102->25.9 ms, TextEncoder 76->18.3 ms, EventEmitter
+37->20.7 ms, with zero GC cycles during the loops throughout.
 
 What's left in the EventEmitter gap is the interpreted-bytecode floor
-itself: ~11.6 ms of that 20.3 ms is just invoking the listener closure 500k
+itself: ~11.6 ms of that 20.7 ms is just invoking the listener closure 500k
 times, which no amount of work outside the interpreter can remove. Closing
 that means giving ArcSX a JIT -- its own multi-month project, not a
 benchmark tuning pass.
