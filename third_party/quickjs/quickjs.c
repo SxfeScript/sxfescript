@@ -307,6 +307,10 @@ typedef struct JSArena {
 typedef struct JSArenaState {
     struct list_head arena_list[JS_ARENA_BLOCK_SIZE_COUNT];
     struct list_head free_arena_list[JS_ARENA_BLOCK_SIZE_COUNT];
+    /* arcsx: number of completely empty arenas currently retained per size
+       class; one is kept alive so a workload oscillating around an arena
+       boundary does not free and re-mmap its arena on every cycle */
+    uint8_t n_empty_arenas[JS_ARENA_BLOCK_SIZE_COUNT];
     _Alignas(JS_ARENA_ALIGN) uint8_t zero_size_block[sizeof(JSMallocBlockHeader)];
 } JSArenaState;
 
@@ -415,6 +419,11 @@ struct JSRuntime {
     /* arcsx: `prototype` slot memo for js_create_from_ctor */
     struct JSShape *ctor_proto_shape;
     uint32_t ctor_proto_gen, ctor_proto_idx;
+    /* arcsx: bounded keep-alive ring for completed transition shapes; see
+       js_shape_keepalive in add_property */
+#define JS_SHAPE_KEEPALIVE_SIZE 64
+    struct JSShape *shape_keepalive[JS_SHAPE_KEEPALIVE_SIZE];
+    uint32_t shape_keepalive_idx;
     void *user_opaque;
     void *libc_opaque;
     JSRuntimeFinalizerState *finalizers;
@@ -1574,6 +1583,7 @@ static void async_func_mark(JSRuntime *rt, JSAsyncFunctionState *s,
 static int JS_AddIntrinsicBasicObjects(JSContext *ctx);
 static void js_free_shape(JSRuntime *rt, JSShape *sh);
 static void js_free_shape_null(JSRuntime *rt, JSShape *sh);
+static void js_shape_keepalive_clear(JSRuntime *rt); /* arcsx */
 static int js_shape_prepare_update(JSContext *ctx, JSObject *p,
                                    JSShapeProperty **pprs);
 static int init_shape_hash(JSRuntime *rt);
@@ -1912,6 +1922,9 @@ static void *js_arena_malloc(JSRuntime *rt, size_t size)
         b = arena_get_block(ar, block_idx, block_size);
         ar->first_free_block = b->u.free_next;
         b->u.block_idx = block_idx;
+        if (unlikely(ar->n_used_blocks == 0) &&
+            rt->arena_state.n_empty_arenas[block_size_idx] > 0)
+            rt->arena_state.n_empty_arenas[block_size_idx]--; /* arcsx: spare back in use */
         ar->n_used_blocks++;
         if (unlikely(ar->n_used_blocks == ar->n_blocks))
             list_del(&ar->free_link);
@@ -1949,9 +1962,19 @@ static void js_arena_free(JSRuntime *rt, void *ptr)
                      &rt->arena_state.free_arena_list[block_size_idx]);
         ar->n_used_blocks--;
         if (unlikely(ar->n_used_blocks == 0)) {
-            list_del(&ar->link);
-            list_del(&ar->free_link);
-            rt->mf.js_free(rt->malloc_state.opaque, ar);
+            /* arcsx: retain one empty arena per size class instead of always
+               freeing. A loop whose live set straddles an arena boundary
+               otherwise frees the arena and immediately re-allocates it (a
+               malloc of ~64KB each way, every few dozen objects). The spare
+               stays fully linked on both lists, so keeping it needs no other
+               changes; memory cost is bounded at one arena per class. */
+            if (rt->arena_state.n_empty_arenas[block_size_idx] == 0) {
+                rt->arena_state.n_empty_arenas[block_size_idx] = 1;
+            } else {
+                list_del(&ar->link);
+                list_del(&ar->free_link);
+                rt->mf.js_free(rt->malloc_state.opaque, ar);
+            }
         }
     }
 }
@@ -2768,6 +2791,7 @@ void JS_FreeRuntime(JSRuntime *rt)
     }
     init_list_head(&rt->job_list);
 
+    js_shape_keepalive_clear(rt); /* arcsx: before the leak scan */
     JS_RunGC(rt);
 
 #ifdef ENABLE_DUMPS // JS_DUMP_LEAKS
@@ -6127,6 +6151,42 @@ static void js_free_shape_null(JSRuntime *rt, JSShape *sh)
 {
     if (sh)
         js_free_shape(rt, sh);
+}
+
+/* arcsx: the shape hash table holds no reference, so a shape dies with its
+   last object -- and the *intermediate* shapes of an object literal have no
+   holder at all: `{a: 1, b: 2}` transitions empty -> {a} -> {a,b}, and {a}
+   is created, hashed, used for one property store and freed, every time.
+   Pinning an {a:0} object from JS to keep that shape alive measured `{a,b}`
+   literal creation 24% faster, so keep the last N completed transition
+   shapes alive in a fixed ring instead.
+
+   The reference is taken only AFTER add_shape_property has finished
+   mutating the shape. Taking it earlier segfaults: the transition path
+   mutates the freshly cloned shape in place under the invariant that it is
+   unshared (see the refcount assert in add_property), and a cached
+   reference breaks exactly that invariant. Once complete, an extra
+   reference only means the next transition clones instead of mutating --
+   the ordinary shared-shape flow. */
+static void js_shape_keepalive(JSRuntime *rt, JSShape *sh)
+{
+    uint32_t i = rt->shape_keepalive_idx;
+    JSShape *old = rt->shape_keepalive[i];
+    rt->shape_keepalive[i] = js_dup_shape(sh);
+    rt->shape_keepalive_idx = (i + 1) & (JS_SHAPE_KEEPALIVE_SIZE - 1);
+    if (old)
+        js_free_shape(rt, old);
+}
+
+static void js_shape_keepalive_clear(JSRuntime *rt)
+{
+    uint32_t i;
+    for (i = 0; i < JS_SHAPE_KEEPALIVE_SIZE; i++) {
+        if (rt->shape_keepalive[i]) {
+            js_free_shape(rt, rt->shape_keepalive[i]);
+            rt->shape_keepalive[i] = NULL;
+        }
+    }
 }
 
 /* make space to hold at least 'count' properties */
@@ -10567,6 +10627,15 @@ static JSProperty *add_property(JSContext *ctx,
     assert(JS_REF_COUNT(p->shape) == 1);
     if (add_shape_property(ctx, &p->shape, p, prop, prop_flags))
         return NULL;
+    /* arcsx: transition complete; pin hashed shapes so hot literal
+       intermediates survive their last wearer (see js_shape_keepalive).
+       Small shapes only: object literals have a handful of properties, and
+       pinning every transition of a wide object (a parsed JSON config with
+       hundreds of keys) churns the ring on shapes that will never repeat --
+       measured as a consistent regression on a JSON round-trip workload
+       before this gate. */
+    if (p->shape->is_hashed && p->shape->prop_count <= 8)
+        js_shape_keepalive(ctx->rt, p->shape);
     return &p->prop[p->shape->prop_count - 1];
 }
 
