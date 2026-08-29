@@ -44957,10 +44957,30 @@ static JSValue js_array_includes(JSContext *ctx, JSValueConst this_val,
                 goto exception;
         }
         if (js_get_fast_array(ctx, obj, &arrp, &count)) {
-            for (; n < count; n++) {
-                if (js_strict_eq2(ctx, argv[0], arrp[n],
-                                  JS_EQ_SAME_VALUE_ZERO)) {
-                    goto done;
+                /* arcsx: an int needle against int elements is by far the
+                   common case and js_strict_eq2 agrees with a plain compare
+                   for it, in both eq modes. Inlining that removes a call per
+                   element from the scan; anything else (float64 elements,
+                   which must still match an int needle numerically, strings,
+                   objects, NaN) falls through to the general compare. */
+            if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT) {
+                int needle = JS_VALUE_GET_INT(argv[0]);
+                for (; n < count; n++) {
+                    JSValueConst e = arrp[n];
+                    if (JS_VALUE_GET_TAG(e) == JS_TAG_INT) {
+                        if (JS_VALUE_GET_INT(e) == needle)
+                            goto done;
+                    } else if (js_strict_eq2(ctx, argv[0], e,
+                                             JS_EQ_SAME_VALUE_ZERO)) {
+                        goto done;
+                    }
+                }
+            } else {
+                for (; n < count; n++) {
+                    if (js_strict_eq2(ctx, argv[0], arrp[n],
+                                      JS_EQ_SAME_VALUE_ZERO)) {
+                        goto done;
+                    }
                 }
             }
         }
@@ -45006,9 +45026,28 @@ static JSValue js_array_indexOf(JSContext *ctx, JSValueConst this_val,
                 goto exception;
         }
         if (js_get_fast_array(ctx, obj, &arrp, &count)) {
-            for (; n < count; n++) {
-                if (js_strict_eq2(ctx, argv[0], arrp[n], JS_EQ_STRICT)) {
-                    goto done;
+                /* arcsx: an int needle against int elements is by far the
+                   common case and js_strict_eq2 agrees with a plain compare
+                   for it, in both eq modes. Inlining that removes a call per
+                   element from the scan; anything else (float64 elements,
+                   which must still match an int needle numerically, strings,
+                   objects, NaN) falls through to the general compare. */
+            if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_INT) {
+                int needle = JS_VALUE_GET_INT(argv[0]);
+                for (; n < count; n++) {
+                    JSValueConst e = arrp[n];
+                    if (JS_VALUE_GET_TAG(e) == JS_TAG_INT) {
+                        if (JS_VALUE_GET_INT(e) == needle)
+                            goto done;
+                    } else if (js_strict_eq2(ctx, argv[0], e, JS_EQ_STRICT)) {
+                        goto done;
+                    }
+                }
+            } else {
+                for (; n < count; n++) {
+                    if (js_strict_eq2(ctx, argv[0], arrp[n], JS_EQ_STRICT)) {
+                        goto done;
+                    }
                 }
             }
         }

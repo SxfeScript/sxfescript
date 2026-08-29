@@ -1,0 +1,18 @@
+const L=[];const p=(n,v)=>L.push(n+"="+JSON.stringify(v));
+p("NaN",[[NaN].includes(NaN),[NaN].indexOf(NaN)]);
+p("mixed NaN",[[1,NaN,3].includes(NaN),[1,NaN,3].indexOf(NaN)]);
+p("zeros",[[0].includes(-0),[-0].includes(0),[0].indexOf(-0),[-0].indexOf(0)]);
+p("int vs float",[[1.0].includes(1),[1].includes(1.0),[1.0].indexOf(1),[1].indexOf(1.0)]);
+p("float elems",[[0.5,1.5].includes(1.5),[0.5,1.5].indexOf(1.5)]);
+p("large ints",[[2147483648].includes(2147483648),[2147483648].indexOf(2147483648)]);
+p("no coercion",[[1].includes("1"),[1].indexOf("1"),["1"].includes(1),[true].includes(1),[null].includes(0)]);
+p("undefined/holes",[[,,].includes(undefined),[,,].indexOf(undefined),[undefined].includes(undefined),[undefined].indexOf(undefined)]);
+p("objects",(()=>{const o={};return[[o].includes(o),[o].indexOf(o),[{}].includes({}),[o].indexOf({})]})());
+p("strings",[["a","b"].includes("b"),["a","b"].indexOf("b"),["a"].includes("A")]);
+p("bigint",[[1n].includes(1n),[1n].indexOf(1n),[1n].includes(1),[1].includes(1n)]);
+p("fromIndex",[[1,2,3,2].indexOf(2,2),[1,2,3].includes(1,1),[1,2,3].indexOf(3,-1),[1,2,3].includes(3,-1)]);
+p("empty",[[].includes(1),[].indexOf(1)]);
+p("sparse large",(()=>{const a=new Array(100);a[99]=5;return[a.includes(5),a.indexOf(5),a.includes(undefined)]})());
+p("after splice",(()=>{const a=Array.from({length:50},(_,i)=>i);a.splice(10,1);return[a.includes(49),a.indexOf(49),a.includes(10)]})());
+p("typed-ish mix",(()=>{const a=[1,2.5,"3",null,undefined,true];return[a.indexOf(2.5),a.indexOf("3"),a.indexOf(null),a.indexOf(true),a.includes(undefined)]})());
+console.log(L.join("\n"));

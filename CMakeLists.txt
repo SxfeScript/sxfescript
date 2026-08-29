@@ -148,6 +148,9 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # splice and never recovered).
   add_test(NAME sxn-splice COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/splice_conformance.mjs)
   set_tests_properties(sxn-splice PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # Array#includes / #indexOf equality semantics, which differ on NaN and
+  # must not coerce -- the inlined int fast path has to preserve both.
+  add_test(NAME sxn-array-search COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/array_search.mjs)
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
 
