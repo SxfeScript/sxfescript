@@ -511,6 +511,11 @@ JS_EXTERN void JS_GetGCStats(JSRuntime *rt, JSGCStats *stats);
 /* rayact: current tracked allocation total (the value js_trigger_gc compares
    against the GC threshold) — cheap, no heap walk. */
 JS_EXTERN size_t JS_GetMallocSize(JSRuntime *rt);
+/* arcsx: if obj is a fast array, expose its live element storage (borrowed,
+   unstable — any array write may realloc it; re-fetch after running JS) and
+   return true; false for anything else. */
+JS_EXTERN bool JS_GetFastArray(JSContext *ctx, JSValueConst obj,
+                               JSValue **arrpp, uint32_t *countp);
 /* use 0 to disable maximum stack size check */
 JS_EXTERN void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size);
 /* should be called when changing thread to update the stack top value
@@ -1108,6 +1113,18 @@ JS_EXTERN JSValue JS_NewUint8Array(JSContext *ctx, uint8_t *buf, size_t len,
 /* returns -1 if not a typed array otherwise return a JSTypedArrayEnum value */
 JS_EXTERN int JS_GetTypedArrayType(JSValueConst obj);
 JS_EXTERN JSValue JS_NewUint8ArrayCopy(JSContext *ctx, const uint8_t *buf, size_t len);
+/* UTF-8-encodes val1's string representation directly into a Uint8Array or
+   a bare ArrayBuffer, with no intermediate C-string copy (unlike
+   JS_ToCStringLen2 followed by JS_NewUint8ArrayCopy/JS_NewArrayBufferCopy,
+   which writes the bytes twice). Use the ArrayBuffer variant when the
+   caller is about to wrap the result in its own typed-array view anyway
+   (e.g. Buffer.from) -- it skips building and discarding a Uint8Array. */
+JS_EXTERN JSValue JS_NewUint8ArrayFromString(JSContext *ctx, JSValueConst val1);
+JS_EXTERN JSValue JS_NewArrayBufferFromString(JSContext *ctx, JSValueConst val1);
+/* arcsx: Uint8Array-class view over `buffer` (consumed) with an explicit
+   prototype -- lets an embedder construct instances of a JS-defined
+   Uint8Array subclass without the per-call constructor round trip. */
+JS_EXTERN JSValue JS_NewUint8ArrayWithProto(JSContext *ctx, JSValueConst proto, JSValue buffer);
 typedef struct {
     void *(*sab_alloc)(void *opaque, size_t size);
     void (*sab_free)(void *opaque, void *ptr);
