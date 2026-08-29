@@ -70,6 +70,13 @@ Startup rows are the average of 20 process launches:
 | Sustained throughput: TextEncoder | 18.3 ms | 39.5 ms | **6.2 ms** | Bun |
 | Sustained throughput: EventEmitter | 20.7 ms | **5.0 ms** | 9.2 ms | Node |
 | Pause consistency: worst single pause | **0.05 ms** | 0.20 ms | 2.62 ms | sxn |
+
+That pause row measures allocations that die immediately, which is the
+pattern most favourable to refcounting. On a workload that keeps objects
+live (`benchmarks/workload/pause_survivors.js`: 2000 survivors while
+churning 2M allocations) the worst pause is 0.099 ms here against Node's
+0.203 and Bun's 0.241 -- still ahead, but by 2-3x rather than 50x. Quote the
+smaller number.
 | Pause consistency: total time | 381 ms | **245 ms** | 281 ms | Node |
 
 A note on the comparison: this runtime deliberately has no JIT, because iOS

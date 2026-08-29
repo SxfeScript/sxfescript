@@ -153,9 +153,28 @@ What remains available is everything that needs no generated code:
 The remaining item is a generational nursery for object churn
 (freeing a small object costs ~29 ns here against Bun's ~1 ns, which is
 refcounting versus a nursery that reclaims dead young objects for free).
-The nursery is not a free win to adopt: the same refcounting that makes
-teardown expensive is what produces this runtime's 0.05 ms worst-case pause
-against Bun's 2.62 ms, which is its strongest measured property.
+On the nursery's cost, an earlier claim in this ledger was overstated and is
+corrected here. The 0.05 ms vs 2.62 ms worst-pause figure comes from
+`benchmarks/wintercg/pause.sx`, where every allocation dies immediately --
+the pattern that most flatters refcounting and most penalises a collector,
+which must still scavenge. Re-measured on `benchmarks/workload/
+pause_survivors.js`, which keeps 2000 objects live while churning 2M, the
+gap nearly closes:
+
+| worst pause | sxn | Node | Bun |
+|---|---|---|---|
+| allocations die immediately | 0.04 ms | -- | 2.53 ms |
+| 2000 live survivors | 0.099 ms | 0.203 ms | 0.241 ms |
+
+Two to three times better on the realistic pattern, not fifty. Note also
+that this runtime records far *more* small gaps (348 over 10 us against
+Bun's 51) -- refcounting spreads its cost rather than avoiding it.
+
+So a well-sized nursery would likely keep pauses in the same range while
+addressing the ~29 ns teardown cost, and is a more attractive option than
+this ledger previously suggested. It remains a large change, but the
+argument against it should not rest on a benchmark that measures one
+allocation pattern.
 
 ## Finding real defects: the complexity probe
 
