@@ -157,6 +157,41 @@ The nursery is not a free win to adopt: the same refcounting that makes
 teardown expensive is what produces this runtime's 0.05 ms worst-case pause
 against Bun's 2.62 ms, which is its strongest measured property.
 
+## Finding real defects: the complexity probe
+
+The benchmark suite measures seven workloads and missed four genuine defects
+that ordinary code hits hard. All four were found instead by probing the
+*shape* of cost curves -- per-operation cost measured at two collection sizes,
+flagging anything whose ratio suggests super-linear behaviour -- and by
+comparing per-op cost against Node, flagging anything far past the ~4x
+baseline interpreter gap. The probes are checked in:
+
+- `benchmarks/engine/complexity_probe.js` -- ratio of per-op cost at two sizes
+- `benchmarks/engine/op_probe.js` -- absolute per-op cost, wide operation mix
+- `benchmarks/engine/string_probe.js` -- string and regexp operations
+- `benchmarks/engine/dispatch_bench.c` -- interpreter dispatch styles
+
+What they found, all since fixed: Map/Set lookup was O(n) for integer keys
+and again for object keys (degenerate hashes; 4096 keys in 8 and 64 buckets
+respectively), `Array#splice` permanently converted any array it removed
+from into a slow array (~85x on the next splice, and it never recovered),
+and `Array#includes`/`#indexOf` called a generic comparison per element.
+
+They also cleared a good deal, which is worth as much: string append is
+correctly amortized O(1), object property reads, array indexing, push/pop
+and string slicing all scale flat, and global regexp replace is linear in
+match count (~250 ns/match against Node's ~25 -- a constant factor from the
+pre-rewrite regexp engine, not a defect; upstream's register-based engine
+was skipped in the cherry-pick and remains available).
+
+Two probe flags were the probe's own fault and are not defects:
+`String#indexOf` and `JSON.stringify` genuinely scale with input size.
+
+The lesson worth carrying: a fixed benchmark suite measures what it was
+written to measure. Sweeping for anomalous *shapes* found in one sitting
+several defects that mattered more to real programs than any benchmark row
+in the suite.
+
 ## Required production completion
 
 - Replace the conservative source transformer with QuickJS parser-mode changes
