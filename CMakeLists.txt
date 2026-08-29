@@ -151,6 +151,10 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # Array#includes / #indexOf equality semantics, which differ on NaN and
   # must not coerce -- the inlined int fast path has to preserve both.
   add_test(NAME sxn-array-search COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/array_search.mjs)
+  # Declaration and scoping rules, which the parser's hash-table lookups must
+  # not change: redeclaration errors, block shadowing, TDZ, closure capture
+  # per iteration, and the same over 300 declarations so the hashed path runs.
+  add_test(NAME sxn-declaration-scoping COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/declaration_scoping.mjs)
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
 

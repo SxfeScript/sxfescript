@@ -192,6 +192,28 @@ written to measure. Sweeping for anomalous *shapes* found in one sitting
 several defects that mattered more to real programs than any benchmark row
 in the suite.
 
+## Known: parsing is still quadratic in declarations per scope
+
+Parsing a file with many declarations in one scope is O(N^2). A 32k-line
+file of top-level `let`s takes ~0.73 s against Node's 0.06 s, and the cost
+grows quadratically -- large bundles and generated code pay it, and it
+undercuts the cold-start advantage that is this runtime's main strength.
+
+The cause is a set of linear scans on the declaration path, each called once
+per declaration. Two are fixed (`find_var_in_child_scope` and
+`find_global_var`, the latter given the same open-addressed index that
+`find_var` already had), worth ~29%: 1.03 -> 0.73 s at 32k lines. At least
+one more remains -- `js_parse_var`/`define_var` still dominates a profile --
+and `find_lexical_decl`'s scope-chain walk is quadratic by construction for
+declarations sharing a scope, short-circuited here only for names absent
+from the function entirely.
+
+Reproducer: `benchmarks/engine/parse_scale.js` (32k declarations); generate
+other sizes to confirm the curve. Any fix must keep
+`tests/fixtures/declaration_scoping.mjs` passing -- redeclaration errors,
+block shadowing, TDZ and per-iteration closure capture all depend on these
+lookups being exact.
+
 ## Required production completion
 
 - Replace the conservative source transformer with QuickJS parser-mode changes
