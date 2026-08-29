@@ -5941,6 +5941,54 @@ static JSValue JS_ConcatString2(JSContext *ctx, JSValue op1, JSValue op2)
     return ret;
 }
 
+/* arcsx: `str + int`. Converting the number with JS_ToString allocates a
+   JSString only to copy its digits into the result and free it again, so
+   format the digits straight in. Mirrors JS_ConcatString2: append in place
+   when op1 is uniquely referenced and has slack, otherwise allocate once.
+   Consumes op1. */
+static JSValue JS_ConcatStringInt(JSContext *ctx, JSValue op1, int32_t n)
+{
+    char buf[16];
+    size_t dlen = i64toa(buf, n);
+    JSString *p1 = JS_VALUE_GET_STRING(op1);
+    uint32_t len = p1->len + (uint32_t)dlen;
+    JSString *p;
+    size_t i;
+
+    if (unlikely(len > JS_STRING_LEN_MAX)) {
+        JS_FreeValue(ctx, op1);
+        return JS_ThrowRangeError(ctx, "invalid string length");
+    }
+    if (JS_REF_COUNT(p1) == 1
+    &&  js_malloc_usable_size(ctx, p1) >= sizeof(*p1) + ((size_t)len << p1->is_wide_char) + 1 - p1->is_wide_char) {
+        if (p1->is_wide_char) {
+            for (i = 0; i < dlen; i++)
+                str16(p1)[p1->len + i] = (uint8_t)buf[i];
+        } else {
+            memcpy(str8(p1) + p1->len, buf, dlen);
+            str8(p1)[len] = '\0';
+        }
+        p1->len = len;
+        return op1;
+    }
+    p = js_alloc_string(ctx, len, p1->is_wide_char);
+    if (!p) {
+        JS_FreeValue(ctx, op1);
+        return JS_EXCEPTION;
+    }
+    if (p1->is_wide_char) {
+        memcpy(str16(p), str16(p1), (size_t)p1->len << 1);
+        for (i = 0; i < dlen; i++)
+            str16(p)[p1->len + i] = (uint8_t)buf[i];
+    } else {
+        memcpy(str8(p), str8(p1), p1->len);
+        memcpy(str8(p) + p1->len, buf, dlen);
+        str8(p)[len] = '\0';
+    }
+    JS_FreeValue(ctx, op1);
+    return JS_MKPTR(JS_TAG_STRING, p);
+}
+
 /* op1 and op2 are converted to strings. For convenience, op1 or op2 =
    JS_EXCEPTION are accepted and return JS_EXCEPTION.  */
 static JSValue JS_ConcatString(JSContext *ctx, JSValue op1, JSValue op2)
@@ -5954,6 +6002,9 @@ static JSValue JS_ConcatString(JSContext *ctx, JSValue op1, JSValue op2)
             return JS_EXCEPTION;
         }
     }
+    if (JS_VALUE_GET_TAG(op1) == JS_TAG_STRING &&
+        JS_VALUE_GET_TAG(op2) == JS_TAG_INT)
+        return JS_ConcatStringInt(ctx, op1, JS_VALUE_GET_INT(op2));
     if (unlikely(!tag_is_string(JS_VALUE_GET_TAG(op2)))) {
         op2 = JS_ToStringFree(ctx, op2);
         if (JS_IsException(op2)) {

@@ -173,6 +173,10 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # Template literals compile to OP_concat rather than "".concat(...): ToString
   # order, valueOf-vs-toString, throwing parts, symbols, tagged templates.
   add_test(NAME sxn-template-literals COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/template_literals.mjs)
+  # `str + int` formats digits straight into the result: aliasing (a shared
+  # left operand must not be appended to in place), wide strings, -0, floats,
+  # int bounds, and repeated += appends.
+  add_test(NAME sxn-string-number-concat COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/string_number_concat.mjs)
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
 
