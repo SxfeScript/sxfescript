@@ -797,6 +797,11 @@ static JSValue js_buffer_alloc_unsafe(JSContext *ctx, JSValueConst this_val, int
     return buf;
 }
 
+/* Encoding names, interned once; compared by identity on the Buffer
+   fast paths below instead of via JS_ToCString + strcmp. */
+static JSAtom sxn_atom_utf8, sxn_atom_utf8_dash, sxn_atom_hex;
+static JSAtom sxn_atom_base64, sxn_atom_base64url, sxn_atom_toHex, sxn_atom_toBase64;
+
 /* Buffer.from fast path: intercepts only the (string, utf-8-or-absent)
    shape -- the hot one -- and builds the instance natively: one-pass UTF-8
    encode into a bare ArrayBuffer (JS_NewArrayBufferFromString), then a
@@ -815,15 +820,16 @@ static JSValue js_buffer_from_fast(JSContext *ctx, JSValueConst this_val, int ar
         bool utf8 = false;
         if (argc < 2 || JS_IsUndefined(argv[1])) {
             utf8 = true;
-        } else if (JS_IsString(argv[1])) {
+        } else if (JS_VALUE_GET_TAG(argv[1]) == JS_TAG_STRING) {
             /* Exact-lowercase check only (matching node_compat.js's own fast
                path); "UTF-8" etc. falls through to the JS implementation's
-               toLowerCase handling. JS_ToCString on an ASCII literal is
-               zero-copy. */
-            const char *enc = JS_ToCString(ctx, argv[1]);
-            if (!enc) return JS_EXCEPTION;
-            utf8 = !strcmp(enc, "utf-8") || !strcmp(enc, "utf8");
-            JS_FreeCString(ctx, enc);
+               toLowerCase handling. Compared by atom identity rather than
+               JS_ToCString + strcmp, so a literal encoding argument costs two
+               pointer compares. */
+            JSAtom a = JS_ValueToAtom(ctx, argv[1]);
+            if (a == JS_ATOM_NULL) return JS_EXCEPTION;
+            utf8 = (a == sxn_atom_utf8_dash || a == sxn_atom_utf8);
+            JS_FreeAtom(ctx, a);
         }
         if (utf8) {
             JSValue ab = JS_NewArrayBufferFromString(ctx, argv[0]);
@@ -860,9 +866,6 @@ static JSValue js_buffer_from_fast(JSContext *ctx, JSValueConst this_val, int ar
    Only the encodings with a native implementation are handled here; latin1,
    ascii, mixed case and anything unknown fall through to the original JS
    method in func_data[1], which keeps its normalization and its TypeError. */
-static JSAtom sxn_atom_utf8, sxn_atom_utf8_dash, sxn_atom_hex;
-static JSAtom sxn_atom_base64, sxn_atom_base64url, sxn_atom_toHex, sxn_atom_toBase64;
-
 static JSValue js_buffer_to_string(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
                                     int magic, JSValueConst *func_data) {
     (void)magic;
@@ -935,16 +938,19 @@ static void sxn_install_buffer_natives(JSContext *ctx) {
         JSValueConst from_data[2] = { proto, orig_from };
         JS_SetPropertyStr(ctx, ctor, "from", JS_NewCFunctionData(ctx, js_buffer_from_fast, 2, 0, 2, from_data));
     }
+    /* Encoding-name atoms, used by both the Buffer.from fast path and the
+       toString dispatch below, so they are interned before either is
+       installed. */
+    if (sxn_atom_utf8 == JS_ATOM_NULL) {
+        sxn_atom_utf8 = JS_NewAtom(ctx, "utf8");
+        sxn_atom_utf8_dash = JS_NewAtom(ctx, "utf-8");
+        sxn_atom_hex = JS_NewAtom(ctx, "hex");
+        sxn_atom_base64 = JS_NewAtom(ctx, "base64");
+        sxn_atom_base64url = JS_NewAtom(ctx, "base64url");
+        sxn_atom_toHex = JS_NewAtom(ctx, "toHex");
+        sxn_atom_toBase64 = JS_NewAtom(ctx, "toBase64");
+    }
     if (!JS_IsUndefined(proto)) {
-        if (sxn_atom_utf8 == JS_ATOM_NULL) {
-            sxn_atom_utf8 = JS_NewAtom(ctx, "utf8");
-            sxn_atom_utf8_dash = JS_NewAtom(ctx, "utf-8");
-            sxn_atom_hex = JS_NewAtom(ctx, "hex");
-            sxn_atom_base64 = JS_NewAtom(ctx, "base64");
-            sxn_atom_base64url = JS_NewAtom(ctx, "base64url");
-            sxn_atom_toHex = JS_NewAtom(ctx, "toHex");
-            sxn_atom_toBase64 = JS_NewAtom(ctx, "toBase64");
-        }
         JSValue global2 = JS_GetGlobalObject(ctx);
         JSValue decode_text = JS_GetPropertyStr(ctx, global2, "__sxnUtf8DecodeText");
         JSValue orig_to_string = JS_GetPropertyStr(ctx, proto, "toString");
