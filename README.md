@@ -53,15 +53,15 @@ Median of 5+ runs, macOS 26.6.2 (arm64), Node v25.2.1:
 |---|---|---|---|
 | Real-world end-to-end task (wall clock, as invoked) | 26 ms | 92 ms | sxn, ~3.5x |
 | Cold start | 9 ms | 42 ms | sxn, ~4.7x |
-| Sustained throughput: TextEncoder | 23.5 ms | 38 ms | **sxn, ~1.6x** |
-| Sustained throughput: Buffer ops | 36 ms | 23.5 ms | Node, ~1.5x |
+| Sustained throughput: TextEncoder | 19.5 ms | 38 ms | **sxn, ~2x** |
+| Sustained throughput: Buffer ops | 31 ms | 24 ms | Node, ~1.3x |
 | Sustained throughput: EventEmitter | 24 ms | 5.0 ms | Node, ~4.8x |
 | Pause consistency: worst single pause | 0.05-0.06 ms | 0.20-0.57 ms | sxn |
-| Pause consistency: total time | 0.41 s | 0.24 s | Node, ~1.7x |
+| Pause consistency: total time | 0.40 s | 0.24 s | Node, ~1.7x |
 
 sxn wins tasks dominated by process startup and one-shot work, where there's
-no JIT to warm up, and now wins TextEncoder throughput outright. Node's V8
-still wins the remaining hot loops, where its JIT has time to kick in --
+no JIT to warm up, and now wins TextEncoder throughput outright by 2x. Node's
+V8 still wins the remaining hot loops, where its JIT has time to kick in --
 QuickJS is an interpreter, not a JIT, by design.
 
 The throughput rows reflect a series of ArcSX/runtime optimizations (all
@@ -73,6 +73,13 @@ tagged `arcsx:` in `third_party/quickjs`), roughly in order of payoff:
   pass allocated 7-8 blocks; recycling them is what took Buffer 83->36 ms
   and TextEncoder 65->23.5 ms in a single change, and cut the pause
   benchmark's total time from 1.1 s to 0.41 s.
+- **Pinned core-type shapes.** QuickJS interns the empty shape behind
+  `new Foo()` in a runtime-wide table, but nothing holds a reference to it,
+  so a loop that allocates and drops one object per iteration destroys the
+  shape with the last object and rebuilds it on the next -- and every shape
+  free also flushes the property cache below. Keeping one throwaway Buffer,
+  Uint8Array and ArrayBuffer alive per context pins those shapes; worth ~14%
+  of the Buffer loop on its own.
 - **Typed-array property fast path**: property names that provably can't be
   numeric indices (`.toString`, `.toHex`) stay on the interpreter's inline
   lookup path instead of bailing to the generic exotic-object path.
@@ -90,7 +97,7 @@ tagged `arcsx:` in `third_party/quickjs`), roughly in order of payoff:
   directly to its C primitive, and atom-identity event-type lookup plus
   direct fast-array listener access in `EventEmitter` (`JS_GetFastArray`).
 
-Cumulatively: Buffer 102->36 ms, TextEncoder 76->23.5 ms, EventEmitter
+Cumulatively: Buffer 102->31 ms, TextEncoder 76->19.5 ms, EventEmitter
 37->24 ms, with zero GC cycles during the loops throughout.
 
 What's left in the EventEmitter gap is the interpreted-bytecode floor
