@@ -37,32 +37,39 @@ and a libcurl-backed global `fetch`; see `spec/NETWORK.md`. Applications use the
 Bun-style `Sxn` namespace (`Sxn.serve`, `Sxn.file`, `Sxn.write`, and
 `Sxn.fetch`). The `qjs:*` modules remain internal compatibility modules.
 
-## Benchmarks: sxn vs Node
+## Benchmarks: sxn vs Node vs Bun
 
-`benchmarks/wintercg/run.sh` runs matched WinterCG-style `.sx`/`.js` pairs
-against `sxn` and Node side by side, across four categories. No category is
-hidden -- Node wins the ones you'd expect it to.
+`benchmarks/wintercg/run.sh` runs matched WinterCG-style workloads against
+`sxn`, Node and Bun side by side, across four categories. No category is
+hidden -- the others win the ones you'd expect them to. Each runtime runs the
+same workload with the same iteration counts, written in that runtime's
+idiomatic form (`Bun.serve`/`Bun.env` for Bun, `Sxn.serve` for sxn); Buffer,
+TextEncoder and EventEmitter are the APIs under test and are the same in all
+three. Bun is optional -- its rows are skipped with a note if it isn't
+installed.
 
 ```sh
 sh benchmarks/wintercg/run.sh
 ```
 
-Median of 5+ runs, macOS 26.6.2 (arm64), Node v25.2.1:
+Minimum of 5+ runs, macOS 26.6.2 (arm64), Node v25.2.1, Bun 1.2.17.
+Startup rows are the average of 20 process launches:
 
-| Category | sxn | Node | Winner |
-|---|---|---|---|
-| Real-world end-to-end task (wall clock, as invoked) | 26 ms | 92 ms | sxn, ~3.5x |
-| Cold start | 9 ms | 42 ms | sxn, ~4.7x |
-| Sustained throughput: TextEncoder | 19.5 ms | 38 ms | **sxn, ~2x** |
-| Sustained throughput: Buffer ops | 31 ms | 24 ms | Node, ~1.3x |
-| Sustained throughput: EventEmitter | 24 ms | 5.0 ms | Node, ~4.8x |
-| Pause consistency: worst single pause | 0.05-0.06 ms | 0.20-0.57 ms | sxn |
-| Pause consistency: total time | 0.40 s | 0.24 s | Node, ~1.7x |
+| Category | sxn | Node | Bun | Winner |
+|---|---|---|---|---|
+| Real-world end-to-end task (wall clock, as invoked) | **9 ms** | 88 ms | 15 ms | sxn |
+| Cold start | **9 ms** | 45 ms | 9 ms | sxn / Bun tie |
+| Sustained throughput: TextEncoder | 19.4 ms | 38.7 ms | **6.0 ms** | Bun |
+| Sustained throughput: Buffer ops | 31.0 ms | **23.6 ms** | 26.8 ms | Node |
+| Sustained throughput: EventEmitter | 20.3 ms | **4.9 ms** | 9.0 ms | Node |
+| Pause consistency: worst single pause | **0.03 ms** | 0.18 ms | 2.60 ms | sxn |
+| Pause consistency: total time | 390 ms | **242 ms** | 280 ms | Node |
 
-sxn wins tasks dominated by process startup and one-shot work, where there's
-no JIT to warm up, and now wins TextEncoder throughput outright by 2x. Node's
-V8 still wins the remaining hot loops, where its JIT has time to kick in --
-QuickJS is an interpreter, not a JIT, by design.
+sxn wins the categories dominated by process startup and one-shot work,
+where there is no JIT to warm up, and has by far the tightest worst-case
+pause. It beats Node on TextEncoder throughput but not Bun, and trails both
+on the remaining hot loops: JavaScriptCore and V8 are JITs, QuickJS is an
+interpreter by design, and that gap is not closable by tuning around it.
 
 The throughput rows reflect a series of ArcSX/runtime optimizations (all
 tagged `arcsx:` in `third_party/quickjs`), roughly in order of payoff:
@@ -101,12 +108,18 @@ tagged `arcsx:` in `third_party/quickjs`), roughly in order of payoff:
   trip (`JS_NewUint8ArrayWithProto`), `TextEncoder.prototype.encode` bound
   directly to its C primitive, and atom-identity event-type lookup plus
   direct fast-array listener access in `EventEmitter` (`JS_GetFastArray`).
+- **A memo for `emit()`'s listener resolution**, valid only while the
+  `_events` object, the event-name string object and a listener-mutation
+  counter all still match. It holds strong references to what it keys on, so
+  a cached object cannot be freed and have its address reused underneath the
+  entry -- which is what made pointer identity safe here rather than a bet.
+  Worth 12% of the events loop.
 
-Cumulatively: Buffer 102->31 ms, TextEncoder 76->19.5 ms, EventEmitter
-37->24 ms, with zero GC cycles during the loops throughout.
+Cumulatively: Buffer 102->31 ms, TextEncoder 76->19.4 ms, EventEmitter
+37->20.3 ms, with zero GC cycles during the loops throughout.
 
 What's left in the EventEmitter gap is the interpreted-bytecode floor
-itself: ~11.6 ms of that 24 ms is just invoking the listener closure 500k
+itself: ~11.6 ms of that 20.3 ms is just invoking the listener closure 500k
 times, which no amount of work outside the interpreter can remove. Closing
 that means giving ArcSX a JIT -- its own multi-month project, not a
 benchmark tuning pass.
