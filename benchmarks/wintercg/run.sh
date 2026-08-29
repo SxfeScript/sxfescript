@@ -8,6 +8,7 @@
 set -e
 SXN="${SXN:-$(dirname "$0")/../../build/release/sxn}"
 DIR="$(dirname "$0")"
+RUNS="${RUNS:-1000}"
 if command -v bun >/dev/null 2>&1; then HAVE_BUN=1; else HAVE_BUN=0; echo "(bun not installed -- skipping its rows)"; fi
 
 echo "== real-world end-to-end task (wall clock, as actually invoked) =="
@@ -24,9 +25,25 @@ echo "-- node --"; time node "$DIR/coldstart.js"
 [ "$HAVE_BUN" = 1 ] && { echo "-- bun --"; time bun "$DIR/coldstart.bun.js"; }
 echo
 echo "== sustained throughput =="
-echo "-- sxn --";  "$SXN" "$DIR/throughput.sx"
-echo "-- node --"; node "$DIR/throughput.js"
-[ "$HAVE_BUN" = 1 ] && { echo "-- bun --"; bun "$DIR/throughput.bun.js"; }
+echo "(runs: $RUNS; set RUNS=N to override; 1000 is intended for stable aggregate samples)"
+median() {
+  awk '{v[NR]=$1} END { if (NR % 2) print v[(NR + 1) / 2]; else print (v[NR / 2] + v[NR / 2 + 1]) / 2 }'
+}
+measure_throughput() {
+  label="$1"; script="$2"; shift 2
+  tmp="$(mktemp -t sxn-throughput.XXXXXX)"
+  i=0
+  while [ "$i" -lt "$RUNS" ]; do "$@" "$script" >>"$tmp"; i=$((i + 1)); done
+  printf -- "-- %s (median) --\n" "$label"
+  for metric in buffer textencoder events; do
+    value="$(awk -v metric="$metric" '$1 == metric ":" { print $2 }' "$tmp" | sort -n | median)"
+    printf "%s: %s ms\n" "$metric" "$value"
+  done
+  rm -f "$tmp"
+}
+measure_throughput sxn "$DIR/throughput.sx" "$SXN"
+measure_throughput node "$DIR/throughput.js" node
+[ "$HAVE_BUN" = 1 ] && measure_throughput bun "$DIR/throughput.bun.js" bun
 echo
 echo "== pause consistency =="
 echo "-- sxn --";  "$SXN" "$DIR/pause.sx"

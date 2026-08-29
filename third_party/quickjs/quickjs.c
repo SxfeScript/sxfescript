@@ -891,7 +891,10 @@ typedef struct JSFunctionBytecode {
     uint8_t arguments_allowed : 1;
     uint8_t backtrace_barrier : 1; /* stop backtrace on this function */
     uint8_t gc_free_candidate : 1; /* no potentially allocating bytecodes */
-    /* XXX: 4 bits available */
+    /* 0=unknown, 1=the immutable captured-add callback shape, 2=not it. */
+    uint8_t fast_captured_add : 2;
+    /* Closure cell used by the cached captured-add shape. */
+    uint16_t fast_captured_add_ref;
     uint8_t *byte_code_buf; /* (self pointer) */
     int byte_code_len;
     JSAtom func_name;
@@ -1502,6 +1505,9 @@ static bool is_valid_weakref_target(JSValueConst val);
 static void insert_weakref_record(JSValueConst target,
                                   struct JSWeakRefRecord *wr);
 static JSValue js_new_uint8array(JSContext *ctx, JSValue buffer);
+static JSValue js_new_uint8array_embedded_state(JSContext *ctx, JSValue buffer);
+static JSValue JS_NewObjectProtoClassExtra(JSContext *ctx, JSValueConst proto_val,
+                                            JSClassID class_id, size_t extra_size);
 static JSValue js_array_buffer_constructor3(JSContext *ctx,
                                             JSValueConst new_target,
                                             uint64_t len, uint64_t *max_len,
@@ -4910,6 +4916,47 @@ static JSValue string_buffer_end(StringBuffer *s)
     return JS_MKPTR(JS_TAG_STRING, str);
 }
 
+/* arcsx: concatenate n values into one string, ToString'ing each in place,
+   left to right. Backs OP_concat (template literals). String.prototype.concat
+   falls back to a chain of JS_ConcatString, allocating an intermediate per
+   part; this sizes the buffer from the parts that are already strings and
+   fills it in a single pass. Values are borrowed -- the caller frees them. */
+static JSValue js_concat_values(JSContext *ctx, int n, JSValueConst *vals)
+{
+    StringBuffer b_s, *b = &b_s;
+    int i, size = 0, is_wide = 0;
+
+    for (i = 0; i < n; i++) {
+        if (JS_VALUE_GET_TAG(vals[i]) == JS_TAG_STRING) {
+            JSString *p = JS_VALUE_GET_STRING(vals[i]);
+            size += p->len;
+            is_wide |= p->is_wide_char;
+        } else {
+            size += 8; /* rough room for a number; the buffer still grows */
+        }
+    }
+    if (string_buffer_init2(ctx, b, size, is_wide))
+        return JS_EXCEPTION;
+    for (i = 0; i < n; i++) {
+        int err;
+        /* Integers are the common substitution after strings, and going
+           through JS_ToString for one allocates a JSString only to copy it in
+           and free it again. Format straight into the buffer instead. */
+        if (JS_VALUE_GET_TAG(vals[i]) == JS_TAG_INT) {
+            char buf[16];
+            size_t l = i64toa(buf, JS_VALUE_GET_INT(vals[i]));
+            err = string_buffer_write8(b, (const uint8_t *)buf, (int)l);
+        } else {
+            err = string_buffer_concat_value(b, vals[i]);
+        }
+        if (err) {
+            string_buffer_free(b);
+            return JS_EXCEPTION;
+        }
+    }
+    return string_buffer_end(b);
+}
+
 /* create a string from a UTF-8 buffer */
 JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
 {
@@ -5153,81 +5200,84 @@ fail:
    the whole block (free_func stays NULL for the data). Measured as ~93% of
    TextEncoder.encode being this allocation envelope rather than encoding. */
 #define JS_ABUF_EMBED_HDR (((sizeof(JSArrayBuffer)) + 15) & ~(size_t)15)
+/* Layout for TextEncoder's fully co-allocated result:
+   [ JSObject ][ JSArrayBuffer ][ alignment ][ UTF-8 bytes ]. */
+#define JS_ABUF_OBJECT_DATA_OFF \
+    (((sizeof(JSObject) + sizeof(JSArrayBuffer)) + 15) & ~(size_t)15)
 
-static uint8_t *js_string_to_utf8_buf(JSContext *ctx, JSValueConst val1, size_t *plen)
+/* arcsx: sizing pass. Returns an upper bound on the UTF-8 length; *exact is
+   true when the bound is the exact length (narrow strings, where non-ASCII
+   bytes are counted directly). */
+static size_t js_string_utf8_bound(JSString *str, bool *exact)
 {
-    JSValue val;
-    JSString *str;
-    int pos, len, c, c1;
-    uint8_t *buf, *q;
-    size_t alloc_len, written;
-
-    *plen = 0;
-    val = js_force_tostring(ctx, val1);
-    if (JS_IsException(val))
-        return NULL;
-    str = JS_VALUE_GET_STRING(val);
-    len = str->len;
+    int len = str->len, pos;
     if (!str->is_wide_char) {
         const uint8_t *src = str8(str);
         int count = 0;
         for (pos = 0; pos < len; pos++)
             count += src[pos] >> 7;
-        alloc_len = (size_t)len + (size_t)count;
-        buf = js_malloc(ctx, JS_ABUF_EMBED_HDR + (alloc_len ? alloc_len : 1));
-        if (!buf) {
-            JS_FreeValue(ctx, val);
-            return NULL;
-        }
-        buf += JS_ABUF_EMBED_HDR;
-        q = buf;
-        if (count == 0) {
-            /* Pure ASCII: every byte passes through unchanged, so a plain
-               memcpy (optimized/vectorized by the C library) beats a
-               manual per-byte copy loop -- the branch-per-byte version
-               below can't prove to the compiler that its else-branch is
-               dead here. */
+        *exact = true;
+        return (size_t)len + (size_t)count;
+    }
+    /* 3 bytes per 16-bit code point; a surrogate pair produces 4 bytes but
+       consumes 2 code points, so this never underestimates, and an unpaired
+       surrogate becomes the 3-byte U+FFFD. */
+    *exact = false;
+    return (size_t)len * 3;
+}
+
+/* arcsx: encode pass; dst must hold js_string_utf8_bound() bytes. Unpaired
+   surrogates encode as U+FFFD per the WHATWG encoding standard -- this
+   feeds TextEncoder.encode and Buffer.from(str,"utf-8"), and both Node and
+   Bun substitute here (JS_ToCStringLen2 keeps raw surrogates for its own
+   callers; that is a separate path and deliberately differs). */
+static size_t js_string_utf8_write(JSString *str, uint8_t *dst, bool narrow_ascii)
+{
+    int len = str->len, pos, c, c1;
+    uint8_t *q = dst;
+    if (!str->is_wide_char) {
+        const uint8_t *src = str8(str);
+        if (narrow_ascii) {
+            /* The sizing pass already proved this is pure ASCII.  Reuse
+               that result rather than scanning the string a second time. */
             memcpy(q, src, len);
-            q += len;
-        } else {
-            for (pos = 0; pos < len; pos++) {
-                c = src[pos];
-                if (c < 0x80) {
-                    *q++ = c;
-                } else {
-                    *q++ = (c >> 6) | 0xc0;
-                    *q++ = (c & 0x3f) | 0x80;
-                }
+            return (size_t)len;
+        }
+        for (pos = 0; pos < len; pos++) {
+            c = src[pos];
+            if (c < 0x80) {
+                *q++ = c;
+            } else {
+                *q++ = (c >> 6) | 0xc0;
+                *q++ = (c & 0x3f) | 0x80;
             }
         }
-    } else {
+        return (size_t)(q - dst);
+    }
+    {
         const uint16_t *src = str16(str);
-        /* Same worst-case sizing as JS_ToCStringLen2: 3 bytes per 16-bit
-           code point; a surrogate pair produces 4 bytes but consumes 2
-           code points, so this never underestimates. */
-        alloc_len = (size_t)len * 3;
-        buf = js_malloc(ctx, JS_ABUF_EMBED_HDR + (alloc_len ? alloc_len : 1));
-        if (!buf) {
-            JS_FreeValue(ctx, val);
-            return NULL;
-        }
-        buf += JS_ABUF_EMBED_HDR;
-        q = buf;
         pos = 0;
         while (pos < len) {
+            /* Mixed-Unicode strings (the common TextEncoder workload) often
+               contain long ASCII runs around one emoji or accented codepoint.
+               Copy four proven-ASCII code units at once; the scalar path below
+               still handles all surrogates and non-ASCII values exactly. */
+            while (pos + 4 <= len && src[pos] < 0x80 && src[pos + 1] < 0x80 &&
+                   src[pos + 2] < 0x80 && src[pos + 3] < 0x80) {
+                q[0] = (uint8_t)src[pos];
+                q[1] = (uint8_t)src[pos + 1];
+                q[2] = (uint8_t)src[pos + 2];
+                q[3] = (uint8_t)src[pos + 3];
+                q += 4;
+                pos += 4;
+            }
+            if (pos >= len)
+                break;
             c = src[pos++];
             if (c < 0x80) {
                 *q++ = c;
             } else {
                 if (is_surrogate(c)) {
-                    /* arcsx: an unpaired surrogate encodes as U+FFFD, per the
-                       WHATWG encoding standard -- this buffer feeds
-                       TextEncoder.encode and Buffer.from(str,"utf-8"), and
-                       both Node and Bun substitute here. (JS_ToCStringLen2
-                       keeps raw surrogates for its own callers; this is a
-                       separate path and deliberately differs.) U+FFFD is
-                       three bytes, the same as the raw surrogate would have
-                       been, so the len*3 sizing above still bounds it. */
                     if (is_hi_surrogate(c) && pos < len && is_lo_surrogate(src[pos])) {
                         c1 = src[pos++];
                         c = from_surrogate(c, c1);
@@ -5239,7 +5289,31 @@ static uint8_t *js_string_to_utf8_buf(JSContext *ctx, JSValueConst val1, size_t 
             }
         }
     }
-    written = (size_t)(q - buf);
+    return (size_t)(q - dst);
+}
+
+static uint8_t *js_string_to_utf8_buf(JSContext *ctx, JSValueConst val1, size_t *plen)
+{
+    JSValue val;
+    JSString *str;
+    uint8_t *buf;
+    size_t alloc_len, written;
+    bool exact;
+
+    *plen = 0;
+    val = js_force_tostring(ctx, val1);
+    if (JS_IsException(val))
+        return NULL;
+    str = JS_VALUE_GET_STRING(val);
+    alloc_len = js_string_utf8_bound(str, &exact);
+    buf = js_malloc(ctx, JS_ABUF_EMBED_HDR + (alloc_len ? alloc_len : 1));
+    if (!buf) {
+        JS_FreeValue(ctx, val);
+        return NULL;
+    }
+    buf += JS_ABUF_EMBED_HDR;
+    written = js_string_utf8_write(str, buf,
+                                   exact && alloc_len == (size_t)str->len);
     /* The wide-char path sizes for the 3-bytes-per-code-point worst case;
        mostly-ASCII wide strings write far less. Hand back the slack when
        it's both a meaningful fraction and a meaningful absolute amount --
@@ -5284,10 +5358,47 @@ static JSValue js_new_array_buffer_embedded(JSContext *ctx, uint8_t *data, size_
 
 JSValue JS_NewUint8ArrayFromString(JSContext *ctx, JSValueConst val1)
 {
-    size_t len;
-    uint8_t *buf = js_string_to_utf8_buf(ctx, val1, &len);
-    if (!buf) return JS_EXCEPTION;
-    return js_new_uint8array(ctx, js_new_array_buffer_embedded(ctx, buf, len));
+    JSValue val, buffer, result;
+    JSString *str;
+    JSObject *p;
+    JSArrayBuffer *abuf;
+    size_t alloc_len, written;
+    bool exact;
+
+    val = js_force_tostring(ctx, val1);
+    if (JS_IsException(val))
+        return JS_EXCEPTION;
+    str = JS_VALUE_GET_STRING(val);
+    alloc_len = js_string_utf8_bound(str, &exact);
+    /* The JSObject owns the extra ArrayBuffer header and bytes, so an encode
+       result needs only the ArrayBuffer object allocation and the (separate)
+       Uint8Array object allocation. */
+    buffer = JS_NewObjectProtoClassExtra(ctx, ctx->class_proto[JS_CLASS_ARRAY_BUFFER],
+                                         JS_CLASS_ARRAY_BUFFER,
+                                         JS_ABUF_OBJECT_DATA_OFF - sizeof(JSObject) +
+                                         (alloc_len ? alloc_len : 1));
+    if (JS_IsException(buffer)) {
+        JS_FreeValue(ctx, val);
+        return JS_EXCEPTION;
+    }
+    p = JS_VALUE_GET_OBJ(buffer);
+    abuf = (JSArrayBuffer *)((uint8_t *)p + sizeof(*p));
+    abuf->byte_length = (int)alloc_len;
+    abuf->max_byte_length = -1;
+    abuf->data = (uint8_t *)p + JS_ABUF_OBJECT_DATA_OFF;
+    init_list_head(&abuf->array_list);
+    abuf->detached = false;
+    abuf->immutable = false;
+    abuf->shared = false;
+    abuf->opaque = NULL;
+    abuf->free_func = NULL;
+    p->u.array_buffer = abuf;
+    written = js_string_utf8_write(str, abuf->data,
+                                   exact && alloc_len == (size_t)str->len);
+    abuf->byte_length = (int)written;
+    JS_FreeValue(ctx, val);
+    result = js_new_uint8array_embedded_state(ctx, buffer);
+    return result;
 }
 
 JSValue JS_NewArrayBufferFromString(JSContext *ctx, JSValueConst val1)
@@ -6521,14 +6632,16 @@ static __maybe_unused void JS_DumpShapes(JSRuntime *rt)
 
 /* 'props[]' is used to initialized the object properties. The number
    of elements depends on the shape. */
-static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID class_id,
-                                     JSProperty *props)
+static JSValue JS_NewObjectFromShapeAllocExtra(JSContext *ctx, JSShape *sh,
+                                               JSClassID class_id,
+                                               JSProperty *props,
+                                               size_t extra_size)
 {
     JSObject *p;
     int i;
 
-    js_trigger_gc(ctx->rt, sizeof(JSObject));
-    p = js_malloc(ctx, sizeof(JSObject));
+    js_trigger_gc(ctx->rt, sizeof(JSObject) + extra_size);
+    p = js_malloc(ctx, sizeof(JSObject) + extra_size);
     if (unlikely(!p))
         goto fail;
     p->class_id = class_id;
@@ -6649,6 +6762,12 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     return JS_MKPTR(JS_TAG_OBJECT, p);
 }
 
+static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID class_id,
+                                     JSProperty *props)
+{
+    return JS_NewObjectFromShapeAllocExtra(ctx, sh, class_id, props, 0);
+}
+
 /* WARNING: proto must be an object or JS_NULL */
 JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto_val,
                                JSClassID class_id)
@@ -6666,6 +6785,27 @@ JSValue JS_NewObjectProtoClass(JSContext *ctx, JSValueConst proto_val,
             return JS_EXCEPTION;
     }
     return JS_NewObjectFromShape(ctx, sh, class_id, NULL);
+}
+
+/* Internal counterpart used by allocation-sensitive builtins whose private
+   state has a fixed size. The object remains an ordinary JSObject; the extra
+   bytes merely share its arena allocation and are released with it. */
+static JSValue JS_NewObjectProtoClassExtra(JSContext *ctx, JSValueConst proto_val,
+                                            JSClassID class_id, size_t extra_size)
+{
+    JSShape *sh;
+    JSObject *proto;
+
+    proto = object_or_null(proto_val);
+    sh = find_hashed_shape_proto(ctx->rt, proto);
+    if (likely(sh)) {
+        sh = js_dup_shape(sh);
+    } else {
+        sh = js_new_shape(ctx, proto);
+        if (!sh)
+            return JS_EXCEPTION;
+    }
+    return JS_NewObjectFromShapeAllocExtra(ctx, sh, class_id, NULL, extra_size);
 }
 
 /* WARNING: the shape is not hashed. It is used for objects where
@@ -6870,6 +7010,94 @@ static JSFunctionBytecode *JS_GetFunctionBytecode(JSValueConst val)
     if (!js_class_has_bytecode(p->class_id))
         return NULL;
     return p->u.func.function_bytecode;
+}
+
+/* A small tierless inline-cache target for native callback dispatch. The
+   compiler's captured-add fusion produces exactly:
+
+       get_arg0; add_loc(var_count + captured_index); return_undef
+
+   (with optional source-location records). When both operands are primitive
+   numbers this has no observable call-frame effect: the body neither reads
+   `this` nor `arguments`, calls no user code, and returns undefined. Native
+   users such as EventEmitter can therefore perform it directly; every other
+   shape or value type falls back to JS_Call. */
+int JS_TryFastCapturedAddCall(JSContext *ctx, JSValueConst func,
+                              JSValueConst arg)
+{
+    JSObject *p;
+    JSFunctionBytecode *b;
+    JSVarRef **refs;
+    const uint8_t *pc, *end;
+    int encoded, idx;
+    JSValue *pv;
+
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(func);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return 0;
+    b = p->u.func.function_bytecode;
+    if (b->arg_count != 1 || b->var_count > 255 || !p->u.func.var_refs)
+        return 0;
+    if (b->fast_captured_add == 2)
+        return 0;
+    if (b->fast_captured_add == 1) {
+        idx = b->fast_captured_add_ref;
+        goto captured_add;
+    }
+    pc = b->byte_code_buf;
+    end = pc + b->byte_code_len;
+#define SKIP_FAST_ADD_SOURCE_LOCS() \
+    do { while (pc < end && *pc == OP_source_loc) pc += 9; } while (0)
+    SKIP_FAST_ADD_SOURCE_LOCS();
+    if (pc >= end || *pc++ != OP_get_arg0)
+        goto not_captured_add;
+    SKIP_FAST_ADD_SOURCE_LOCS();
+    if (pc + 2 > end || *pc++ != OP_add_loc)
+        goto not_captured_add;
+    encoded = *pc++;
+    if (encoded < b->var_count)
+        goto not_captured_add;
+    idx = encoded - b->var_count;
+    if (idx >= b->closure_var_count)
+        goto not_captured_add;
+    SKIP_FAST_ADD_SOURCE_LOCS();
+    if (pc >= end || *pc++ != OP_return_undef)
+        goto not_captured_add;
+    SKIP_FAST_ADD_SOURCE_LOCS();
+    if (pc != end)
+        goto not_captured_add;
+#undef SKIP_FAST_ADD_SOURCE_LOCS
+    b->fast_captured_add = 1;
+    b->fast_captured_add_ref = idx;
+
+captured_add:
+    refs = p->u.func.var_refs;
+    pv = refs[idx]->pvalue;
+    if (likely(JS_VALUE_IS_BOTH_INT(*pv, arg))) {
+        int64_t sum = (int64_t)JS_VALUE_GET_INT(*pv) + JS_VALUE_GET_INT(arg);
+        *pv = (sum < INT32_MIN || sum > INT32_MAX) ?
+            js_float64((double)sum) : js_int32(sum);
+        return 1;
+    }
+    if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(*pv)) &&
+        (JS_VALUE_GET_TAG(arg) == JS_TAG_INT || JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(arg)))) {
+        double right = JS_VALUE_GET_TAG(arg) == JS_TAG_INT ?
+            (double)JS_VALUE_GET_INT(arg) : JS_VALUE_GET_FLOAT64(arg);
+        *pv = js_float64(JS_VALUE_GET_FLOAT64(*pv) + right);
+        return 1;
+    }
+    if (JS_VALUE_GET_TAG(*pv) == JS_TAG_INT && JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(arg))) {
+        *pv = js_float64((double)JS_VALUE_GET_INT(*pv) + JS_VALUE_GET_FLOAT64(arg));
+        return 1;
+    }
+    return 0;
+
+not_captured_add:
+#undef SKIP_FAST_ADD_SOURCE_LOCS
+    b->fast_captured_add = 2;
+    return 0;
 }
 
 static void js_method_set_home_object(JSContext *ctx, JSValue func_obj,
@@ -9750,6 +9978,49 @@ static JSValue JS_GetPropertyInternal(JSContext *ctx, JSValueConst obj,
 JSValue JS_GetProperty(JSContext *ctx, JSValueConst this_obj, JSAtom prop)
 {
     return JS_GetPropertyInternal(ctx, this_obj, prop, this_obj, false);
+}
+
+bool JS_TryGetOwnDataPropertyCached(JSValueConst this_obj, JSAtom prop,
+                                    JSOwnDataPropertyCache *cache,
+                                    JSValueConst *value)
+{
+    JSObject *p;
+    JSShapeProperty *prs;
+    JSProperty *pr;
+
+    if (likely(JS_VALUE_GET_TAG(this_obj) == JS_TAG_OBJECT)) {
+        p = JS_VALUE_GET_OBJ(this_obj);
+        /* A cache hit is valid only for the exact shape and the exact plain
+           data slot. Replacing/deleting/redefining the property changes the
+           shape or flags and falls back to ordinary [[Get]]. */
+        if (likely(!p->is_exotic && cache->shape == p->shape &&
+                   cache->index < p->shape->prop_count)) {
+            prs = &get_shape_prop(p->shape)[cache->index];
+            if (likely(prs->atom == prop &&
+                       (prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL)) {
+                pr = &p->prop[cache->index];
+                *value = pr->u.value;
+                return true;
+            }
+        }
+        if (!p->is_exotic && (prs = find_own_property(&pr, p, prop)) &&
+            (prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL) {
+            cache->shape = p->shape;
+            cache->index = (uint32_t)(prs - get_shape_prop(p->shape));
+            *value = pr->u.value;
+            return true;
+        }
+    }
+    return false;
+}
+
+JSValue JS_GetOwnDataPropertyCached(JSContext *ctx, JSValueConst this_obj,
+                                    JSAtom prop, JSOwnDataPropertyCache *cache)
+{
+    JSValueConst value;
+    if (JS_TryGetOwnDataPropertyCached(this_obj, prop, cache, &value))
+        return js_dup(value);
+    return JS_GetProperty(ctx, this_obj, prop);
 }
 
 static JSValue JS_ThrowTypeErrorPrivateNotFound(JSContext *ctx, JSAtom atom)
@@ -18599,8 +18870,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
 #define DEF(id, size, n_pop, n_push, f) && case_OP_ ## id,
 #define def(id, size, n_pop, n_push, f)
 #include "quickjs-opcode.h"
-        [ OP_COUNT ... 255 ] = &&case_default
     };
+    /* arcsx: the table above used to pad [OP_COUNT ... 255] with case_default.
+       The opcode space is now exactly full, and an empty designator range is a
+       hard error, so the padding is gone. If an opcode is ever removed, this
+       assert fires and the padding has to come back. */
+    static_assert(OP_COUNT == 256, "opcode table must fill the dispatch table");
 #define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
 #define CASE(op)        case_ ## op
 #define DEFAULT         case_default
@@ -19140,6 +19415,27 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 *sp++ = ret_val;
             }
             BREAK;
+        CASE(OP_concat):
+            {
+                /* arcsx: template literal. The values are [literal, part...]
+                   with the leading literal always a string, so this is the
+                   fast path of String.prototype.concat without the prototype
+                   lookup or the call frame. ToString on a part can run user
+                   code, so publish the pc first. */
+                int n = get_u16(pc);
+                pc += 2;
+                call_argv = sp - n;
+                sf->cur_pc = pc;
+                ret_val = js_concat_values(ctx, n, vc(call_argv));
+                if (unlikely(JS_IsException(ret_val)))
+                    goto exception;
+                for (int i = 0; i < n; i++)
+                    JS_FreeValue(ctx, call_argv[i]);
+                sp -= n;
+                *sp++ = ret_val;
+            }
+            BREAK;
+
         CASE(OP_array_from):
             {
                 call_argc = get_u16(pc);
@@ -20747,11 +21043,22 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_add_loc):
             {
                 JSValue *pv;
-                int idx;
-                idx = *pc;
+                int idx, encoded_idx;
+                bool is_var_ref;
+                encoded_idx = *pc;
                 pc += 1;
-
-                pv = &var_buf[idx];
+                /* Normal compiler output always names a local slot in
+                   [0, var_count). The unused tail of this one-byte operand
+                   encodes a closure slot as var_count + ref_index. This keeps
+                   the bytecode set within its 256-opcode limit while letting
+                   the optimizer fuse `captured += rhs` into this fast path. */
+                is_var_ref = encoded_idx >= b->var_count;
+                idx = is_var_ref ? encoded_idx - b->var_count : encoded_idx;
+                if (unlikely(is_var_ref && idx >= b->closure_var_count)) {
+                    JS_ThrowInternalError(caller_ctx, "invalid captured add operand");
+                    goto exception;
+                }
+                pv = is_var_ref ? var_refs[idx]->pvalue : &var_buf[idx];
                 /* arcsx: this opcode is now also emitted for `let`/`const`
                    locals (see the peephole), where the slot can still be in
                    the temporal dead zone. One tag compare preserves the
@@ -20759,7 +21066,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    raised; for `var` locals, which cannot be uninitialized, it
                    never fires. */
                 if (unlikely(JS_IsUninitialized(*pv))) {
-                    JS_ThrowReferenceErrorUninitialized2(caller_ctx, b, idx, false);
+                    JS_ThrowReferenceErrorUninitialized2(caller_ctx, b, idx, is_var_ref);
                     goto exception;
                 }
                 if (likely(JS_VALUE_IS_BOTH_INT(*pv, sp[-1]))) {
@@ -25752,8 +26059,8 @@ static __exception int js_parse_template(JSParseState *s, int call, int *argc)
                 if (depth == 0) {
                     if (s->token.u.str.sep == '`')
                         goto done1;
-                    emit_op(s, OP_get_field2);
-                    emit_atom(s, JS_ATOM_concat);
+                    /* arcsx: no `get_field2 concat` -- OP_concat below
+                       consumes the parts straight off the stack. */
                 }
                 depth++;
             } else {
@@ -25789,8 +26096,8 @@ static __exception int js_parse_template(JSParseState *s, int call, int *argc)
         seal_template_obj(ctx, template_object);
         *argc = depth + 1;
     } else {
-        emit_op(s, OP_call_method);
-        emit_u16(s, depth - 1);
+        emit_op(s, OP_concat);
+        emit_u16(s, depth);
     }
  done1:
     return next_token(s);
@@ -38063,8 +38370,41 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                 put_short_code(&bc_out, op, idx);
             }
             break;
-        case OP_get_arg:
         case OP_get_var_ref:
+        case OP_get_var_ref_check:
+            {
+                int idx;
+                idx = get_u16(bc_buf + pos + 1);
+                /* `captured += arg` is especially common in callbacks. The
+                   unfused form reads and refcounts the closure cell, performs
+                   a generic add, then stores it back.  Keep the right-hand
+                   expression bytecode, but make the cell update one opcode.
+                   A checked lexical uses the checked store too, so its TDZ
+                   semantics are retained by the encoded OP_add_loc form. */
+                if (idx < s->closure_var_count && idx + s->var_count < 256 &&
+                    code_match(&cc, pos_next,
+                               M3(OP_get_loc, OP_get_arg, OP_get_var_ref), -1,
+                               OP_add, OP_dup,
+                               op == OP_get_var_ref_check ? OP_put_var_ref_check : OP_put_var_ref,
+                               idx, M2(OP_drop, OP_return_undef), -1)) {
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    /* Later alternative matches overwrite cc.op/cc.idx, so
+                       read the right-hand load directly from its known
+                       position immediately after the captured load. */
+                    put_short_code(&bc_out, bc_buf[pos_next],
+                                   get_u16(bc_buf + pos_next + 1));
+                    dbuf_putc(&bc_out, OP_add_loc);
+                    dbuf_putc(&bc_out, s->var_count + idx);
+                    pos_next = cc.pos;
+                    break;
+                }
+                add_pc2line_info(s, bc_out.size, line_num, col_num);
+                put_short_code(&bc_out, op, idx);
+            }
+            break;
+        case OP_get_arg:
             {
                 int idx;
                 idx = get_u16(bc_buf + pos + 1);
@@ -60667,7 +61007,10 @@ static void js_array_buffer_finalizer(JSRuntime *rt, JSValueConst val)
             if (abuf->free_func)
                 abuf->free_func(rt, abuf->opaque, abuf->data);
         }
-        js_free_rt(rt, abuf);
+        /* TextEncoder's result stores the header and its byte payload after
+           this JSObject. The ordinary object finalizer frees that one block. */
+        if ((uint8_t *)abuf != (uint8_t *)p + sizeof(*p))
+            js_free_rt(rt, abuf);
     }
 }
 
@@ -63215,7 +63558,10 @@ static void js_typed_array_finalizer(JSRuntime *rt, JSValueConst val)
             list_del(&ta->link);
         }
         JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_OBJECT, ta->buffer));
-        js_free_rt(rt, ta);
+        /* JS_NewUint8ArrayFromString keeps this fixed record immediately
+           after its JSObject, so the object's final free owns both blocks. */
+        if ((uint8_t *)ta != (uint8_t *)p + sizeof(*p))
+            js_free_rt(rt, ta);
     }
 }
 
@@ -63635,6 +63981,42 @@ static JSValue js_new_uint8array(JSContext *ctx, JSValue buffer)
         JS_FreeValue(ctx, obj);
         return JS_EXCEPTION;
     }
+    return obj;
+}
+
+/* TextEncoder.encode() creates a short-lived Uint8Array on every call. Its
+   backing ArrayBuffer and bytes are already one allocation; place the fixed
+   JSTypedArray record directly after the JSObject as well, rather than making
+   typed_array_init allocate it separately. This changes no ownership or view
+   semantics: the record still links to, and strongly owns, the same buffer. */
+static JSValue js_new_uint8array_embedded_state(JSContext *ctx, JSValue buffer)
+{
+    JSValue obj;
+    JSObject *p, *pbuffer;
+    JSArrayBuffer *abuf;
+    JSTypedArray *ta;
+
+    if (JS_IsException(buffer))
+        return JS_EXCEPTION;
+    obj = JS_NewObjectProtoClassExtra(ctx, ctx->class_proto[JS_CLASS_UINT8_ARRAY],
+                                      JS_CLASS_UINT8_ARRAY, sizeof(JSTypedArray));
+    if (JS_IsException(obj)) {
+        JS_FreeValue(ctx, buffer);
+        return JS_EXCEPTION;
+    }
+    p = JS_VALUE_GET_OBJ(obj);
+    pbuffer = JS_VALUE_GET_OBJ(buffer);
+    abuf = pbuffer->u.array_buffer;
+    ta = (JSTypedArray *)((uint8_t *)p + sizeof(*p));
+    ta->obj = p;
+    ta->buffer = pbuffer;
+    ta->offset = 0;
+    ta->length = abuf->byte_length;
+    ta->track_rab = false;
+    list_add_tail(&ta->link, &abuf->array_list);
+    p->u.typed_array = ta;
+    p->u.array.count = abuf->byte_length;
+    p->u.array.u.ptr = abuf->data;
     return obj;
 }
 
@@ -65894,6 +66276,11 @@ static JSValue js_uint8array_to_hex(JSContext *ctx, JSValueConst this_val,
     u8a_hex_encode(data, len, (char *)str8(ostr));
     str8(ostr)[out_len] = '\0';
     return JS_MKPTR(JS_TAG_STRING, ostr);
+}
+
+JSValue JS_Uint8ArrayToHex(JSContext *ctx, JSValueConst value)
+{
+    return js_uint8array_to_hex(ctx, value, 0, NULL);
 }
 
 /* Uint8Array.fromBase64(string[, options]) */

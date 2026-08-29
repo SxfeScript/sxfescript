@@ -190,6 +190,12 @@ DEF(      nip_catch, 1, 2, 1, none) /* catch ... a -> a */
 DEF(   check_object, 1, 1, 1, none)
 DEF(      to_object, 1, 1, 1, none)
 //DEF(      to_string, 1, 1, 1, none)
+/* arcsx: template literals. Concatenates the N stack values below into one
+   string with String.prototype.concat semantics (ToString each, left to
+   right). Replaces the `get_field2 concat` + `call_method` pair the template
+   emitter used to produce, which paid a prototype lookup and a generic method
+   call per template. */
+DEF(         concat, 3, 0, 1, npop)
 DEF(     to_propkey, 1, 1, 1, none)
 DEF(    to_propkey2, 1, 2, 2, none)
 

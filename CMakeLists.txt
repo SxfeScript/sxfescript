@@ -106,6 +106,7 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # Buffer#toString across every encoding, including the mixed-case and
   # latin1/ascii paths that fall through the native dispatch to JS.
   add_test(NAME sxn-buffer-tostring COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/buffer_tostring.mjs)
+  add_test(NAME sxn-events-singleton COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/events_singleton.mjs)
   # Constructor prototype resolution, including the memoized slot path:
   # reassignment, interleaved constructors, subclassed builtins,
   # Reflect.construct with an explicit newTarget, Proxy get traps, bound
@@ -169,6 +170,9 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # path): views, alignment for Float64, slice, transfer/detach, large
   # buffers, and sustained churn.
   add_test(NAME sxn-embedded-buffer COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/embedded_buffer.mjs)
+  # Template literals compile to OP_concat rather than "".concat(...): ToString
+  # order, valueOf-vs-toString, throwing parts, symbols, tagged templates.
+  add_test(NAME sxn-template-literals COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/template_literals.mjs)
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
 

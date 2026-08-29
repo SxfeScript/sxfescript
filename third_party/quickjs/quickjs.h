@@ -448,6 +448,7 @@ typedef JSValue JSCFunctionMagic(JSContext *ctx, JSValueConst this_val, int argc
 typedef JSValue JSCFunctionData(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValueConst *func_data);
 typedef JSValue JSCClosure(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, void *opaque);
 
+
 typedef struct JSMallocFunctions {
     void *(*js_calloc)(void *opaque, size_t count, size_t size);
     void *(*js_malloc)(void *opaque, size_t size);
@@ -975,6 +976,21 @@ JS_EXTERN JSValue JS_NewDate(JSContext *ctx, double epoch_ms);
 JS_EXTERN bool JS_IsDate(JSValueConst v);
 
 JS_EXTERN JSValue JS_GetProperty(JSContext *ctx, JSValueConst this_obj, JSAtom prop);
+/* Shape-keyed cache for a plain own data property. Calls fall back to normal
+   [[Get]] semantics whenever the receiver/property is not a matching plain
+   object, so it is safe for embedder hot paths. */
+typedef struct JSOwnDataPropertyCache {
+    const void *shape;
+    uint32_t index;
+} JSOwnDataPropertyCache;
+JS_EXTERN JSValue JS_GetOwnDataPropertyCached(JSContext *ctx, JSValueConst this_obj,
+                                              JSAtom prop,
+                                              JSOwnDataPropertyCache *cache);
+/* On success, stores a borrowed property value that remains valid while
+   `this_obj` is rooted and no JavaScript is re-entered. */
+JS_EXTERN bool JS_TryGetOwnDataPropertyCached(JSValueConst this_obj, JSAtom prop,
+                                              JSOwnDataPropertyCache *cache,
+                                              JSValueConst *value);
 JS_EXTERN JSValue JS_GetPropertyUint32(JSContext *ctx, JSValueConst this_obj,
                                        uint32_t idx);
 JS_EXTERN JSValue JS_GetPropertyInt64(JSContext *ctx, JSValueConst this_obj,
@@ -1125,6 +1141,15 @@ JS_EXTERN JSValue JS_NewArrayBufferFromString(JSContext *ctx, JSValueConst val1)
    prototype -- lets an embedder construct instances of a JS-defined
    Uint8Array subclass without the per-call constructor round trip. */
 JS_EXTERN JSValue JS_NewUint8ArrayWithProto(JSContext *ctx, JSValueConst proto, JSValue buffer);
+/* arcsx: direct native equivalent of Uint8Array.prototype.toHex().  Embedders
+   that have already dispatched an API such as Buffer#toString("hex") can use
+   this without re-entering property lookup and the JS call machinery. */
+JS_EXTERN JSValue JS_Uint8ArrayToHex(JSContext *ctx, JSValueConst value);
+/* Executes a bytecode callback directly only when it is exactly the
+   side-effect-free numeric shape `captured += argument`. Returns 1 when the
+   update was performed, 0 when callers must use JS_Call, and -1 on error. */
+JS_EXTERN int JS_TryFastCapturedAddCall(JSContext *ctx, JSValueConst func,
+                                        JSValueConst arg);
 typedef struct {
     void *(*sab_alloc)(void *opaque, size_t size);
     void (*sab_free)(void *opaque, void *ptr);

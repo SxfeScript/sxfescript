@@ -9,7 +9,8 @@
   // on/off/emit/listenerCount/listeners/removeAllListeners are native (see
   // js_ee_* in src/node.c, registered as globals above) -- phase 3 of
   // replacing node_compat.js with native C. Listener storage is still the
-  // plain `this._events` object/arrays the native side reads and writes
+  // plain `this._events` object with Node's function-for-one-listener and
+  // array-for-many representation; the native side reads and writes it
   // directly. `once` stays JS: its self-removing wrapper has no natural
   // native shape (it needs to reference itself to call `self.off(type,
   // wrapped)`), and it's not a hot path the way emit() is.

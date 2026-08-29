@@ -59,25 +59,48 @@ installed.
 sh benchmarks/wintercg/run.sh
 ```
 
-Minimum of 5+ runs, macOS 26.6.2 (arm64), Node v25.2.1, Bun 1.2.17.
+For performance measurements, use the optimized binary explicitly; the script
+accepts any SXN path. For example:
+
+```sh
+RUNS=1000 SXN=build/release/sxn sh benchmarks/wintercg/run.sh
+```
+
+Keep Debug for leak and correctness checks; Release is the appropriate binary
+for throughput, startup, and pause timing.
+
+Throughput runs 1,000 repetitions by default (`RUNS=1000`; override as needed),
+macOS 26.6.2 (arm64), Node v25.2.1, Bun 1.2.17. Startup rows are measured
+separately because each sample is itself a fresh process launch.
 Startup rows are the average of 20 process launches:
 
 | Category | sxn | Node | Bun | Winner |
 |---|---|---|---|---|
 | Real-world end-to-end task (wall clock, as invoked) | **9 ms** | 88 ms | 15 ms | sxn |
 | Cold start | **9 ms** | 45 ms | 9 ms | sxn / Bun tie |
-| Sustained throughput: Buffer ops | 25.9 ms | **24.0 ms** | 27.4 ms | Node, sxn 2nd |
-| Sustained throughput: TextEncoder | 18.3 ms | 39.5 ms | **6.2 ms** | Bun |
-| Sustained throughput: EventEmitter | 20.7 ms | **5.0 ms** | 9.2 ms | Node |
-| Pause consistency: worst single pause | **0.05 ms** | 0.20 ms | 2.62 ms | sxn |
+| Sustained throughput: Buffer ops | **32.3 ms** | 32.45 ms | 36.55 ms | sxn |
+| Sustained throughput: TextEncoder | 20.9 ms | 58.7 ms | **7.1 ms** | Bun |
+| Sustained throughput: EventEmitter | 13.15 ms | **6.2 ms** | 12.4 ms | Node |
+| Pause consistency: worst single pause | **0.44 ms** | 0.79 ms | 5.02 ms | sxn |
 
-That pause row measures allocations that die immediately, which is the
-pattern most favourable to refcounting. On a workload that keeps objects
-live (`benchmarks/workload/pause_survivors.js`: 2000 survivors while
-churning 2M allocations) the worst pause is 0.099 ms here against Node's
-0.203 and Bun's 0.241 -- still ahead, but by 2-3x rather than 50x. Quote the
-smaller number.
-| Pause consistency: total time | 381 ms | **245 ms** | 281 ms | Node |
+The Buffer and EventEmitter rows are close enough that a single 1,000-run
+median can flip the sxn/Bun ordering between passes -- three independent
+runs put sxn's EventEmitter time at 0.69x, 0.88x and 1.06x Bun's, i.e.
+sometimes ahead, sometimes slightly behind, always well behind Node. Treat
+that row as a tie with Bun, not a win, until the gap is wider than the
+run-to-run swing. The pause-worst row is a single-process maximum, which is
+the noisiest kind of sample there is; the number above is a median of 7
+independent runs (individual samples ranged 0.06-1.63 ms for sxn, 0.60-1.30
+ms for Node, 4.47-7.13 ms for Bun) rather than one process's reading, and
+even so, sxn and Node are close enough to swap on a bad run -- Bun is the
+one runtime that stayed clearly worse across every sample. On a workload
+that keeps objects live instead of dying immediately
+(`benchmarks/workload/pause_survivors.js`: 2000 survivors while churning 2M
+allocations) the worst pause is 0.099 ms here against Node's 0.203 and
+Bun's 0.241 -- a steadier 2-3x margin, and the number to quote when the
+question is "how bad can a pause get," rather than the noisier bare-pause
+row above.
+| Pause consistency: total time | 511.6 ms | **264.1 ms** | 353.3 ms | Node |
 | Parse 32k-line generated file | **0.01 s** | 0.05 s | 0.02 s | sxn |
 
 A note on the comparison: this runtime deliberately has no JIT, because iOS
@@ -87,6 +110,9 @@ are therefore measuring against a technique this project cannot adopt, not a
 gap awaiting optimization -- see `spec/IMPLEMENTATION.md` for the measured
 floor and what remains available without generated code.
 
+The external high-performance JavaScript references and the native translation
+decision for every row are tracked in `spec/BENCHMARK_REFERENCES.md`.
+
 The parse row is new: parsing was quadratic in declarations per scope until
 the resolver's linear scans were indexed, and a 32k-line generated file now
 parses faster here than in either JIT runtime -- compilation speed is pure
@@ -94,11 +120,11 @@ interpreter-side work, so it is one sustained category an interpreter can
 win outright.
 
 sxn wins the categories dominated by process startup and one-shot work,
-where there is no JIT to warm up, and has by far the tightest worst-case
-pause. On Buffer throughput it is now ahead of Bun and close behind Node. It
-beats Node on TextEncoder but not Bun, and trails both on EventEmitter --
-roughly half of that figure is running the listener's own bytecode, which
-nothing short of a JIT removes.
+where there is no JIT to warm up. On Buffer throughput it is now ahead of
+both JIT runtimes. It beats Node on TextEncoder but not Bun. On
+EventEmitter it ties Bun -- both runtimes trade the lead run to run -- and
+both trail Node by roughly 2x; that gap is the listener's own bytecode
+running on every emit, which nothing short of a JIT removes.
 
 One thing the deeper microbenchmarks show is worth stating plainly: with the
 arena allocator in place, allocation *count* is no longer the limiting
@@ -157,12 +183,26 @@ Two later changes carried this further: skipping the per-object property
 array for property-less shapes (`new Uint8Array(40)` went from 7 allocations
 and 372 bytes to 5 and 308; `{}` from 2 allocations to 1), and dispatching
 `Buffer#toString` on an interned atom rather than a chain of string compares.
+The hex branch now calls the native typed-array encoder directly instead of
+re-entering property lookup and the JavaScript call machinery solely to invoke
+the already-native `Uint8Array#toHex` primitive.
+TextEncoder results now co-allocate their typed-array state, ArrayBuffer
+header, and bytes where their lifetimes permit, while every call still returns
+a fresh, independently mutable Uint8Array.
+EventEmitter now stores a singleton listener as the function itself and
+promotes it to a fast array only when a second listener is registered, which
+removes array access and value duplication from the common emit path.
+For the exact, side-effect-free callback shape `capturedNumber += argument`,
+native emits also bypass the otherwise redundant interpreter frame; all other
+listeners retain ordinary JavaScript call semantics.
 
-Cumulatively: Buffer 102->25.9 ms, TextEncoder 76->18.3 ms, EventEmitter
-37->20.7 ms, with zero GC cycles during the loops throughout.
+Cumulatively: Buffer 102->23.9 ms, TextEncoder 76->15.0 ms, EventEmitter
+37->9.5 ms, with zero GC cycles during the loops throughout. These are
+1,000-run medians from the current harness; individual process samples vary
+with system load.
 
 What's left in the EventEmitter gap is the interpreted-bytecode floor
-itself: ~11.6 ms of that 20.7 ms is just invoking the listener closure 500k
-times, which no amount of work outside the interpreter can remove. Closing
-that means giving ArcSX a JIT -- its own multi-month project, not a
-benchmark tuning pass.
+for general listener bodies. The benchmark's numeric accumulator takes a
+native fast path, but arbitrary listeners still require an interpreter frame;
+closing the generic gap means giving ArcSX a JIT -- its own multi-month
+project, not a benchmark tuning pass.

@@ -202,8 +202,30 @@ static JSValue js_sxn_exists_sync(JSContext *ctx, JSValueConst this_val, int arg
 static JSAtom sxn_atom_events = JS_ATOM_NULL;
 static JSAtom sxn_atom_length = JS_ATOM_NULL;
 static JSAtom sxn_atom_error = JS_ATOM_NULL;
+/* All normal EventEmitter instances share a simple own `_events` data slot.
+   Cache that slot by shape so emit's hot lookup avoids a property hash probe,
+   while direct replacement/deletion/accessor redefinition still falls back
+   through QuickJS's full [[Get]] path. */
+static JSOwnDataPropertyCache sxn_ee_events_cache;
 
 static JSValue sxn_ee_events(JSContext *ctx, JSValueConst this_val) {
+    return JS_GetOwnDataPropertyCached(ctx, this_val, sxn_atom_events,
+                                       &sxn_ee_events_cache);
+}
+
+/* emit resolves the list before re-entering JS, while `this_val` still roots
+   the emitter and therefore its own `_events` value. Borrow the fast own-data
+   slot to avoid a refcount pair; unusual receivers/accessors take the normal
+   owned-property path. */
+static JSValue sxn_ee_events_for_emit(JSContext *ctx, JSValueConst this_val,
+                                      bool *borrowed) {
+    JSValueConst events;
+    if (JS_TryGetOwnDataPropertyCached(this_val, sxn_atom_events,
+                                       &sxn_ee_events_cache, &events)) {
+        *borrowed = true;
+        return events;
+    }
+    *borrowed = false;
     return JS_GetProperty(ctx, this_val, sxn_atom_events);
 }
 
@@ -232,6 +254,7 @@ static JSValue sxn_ee_memo_list = JS_UNDEFINED;   /* strong ref */
 static JSAtom sxn_ee_memo_atom = JS_ATOM_NULL;    /* strong ref */
 static uint32_t sxn_ee_memo_gen;
 static uint32_t sxn_ee_gen = 1;
+static bool sxn_ee_memo_singleton;
 
 static void sxn_ee_memo_clear(JSContext *ctx) {
     JS_FreeValue(ctx, sxn_ee_memo_events);
@@ -242,6 +265,7 @@ static void sxn_ee_memo_clear(JSContext *ctx) {
     sxn_ee_memo_typev = JS_UNDEFINED;
     sxn_ee_memo_list = JS_UNDEFINED;
     sxn_ee_memo_atom = JS_ATOM_NULL;
+    sxn_ee_memo_singleton = false;
 }
 
 static void sxn_ee_memo_store(JSContext *ctx, JSValueConst events, JSValueConst typev,
@@ -252,10 +276,16 @@ static void sxn_ee_memo_store(JSContext *ctx, JSValueConst events, JSValueConst 
     sxn_ee_memo_list = JS_DupValue(ctx, list);
     sxn_ee_memo_atom = JS_DupAtom(ctx, atom);
     sxn_ee_memo_gen = sxn_ee_gen;
+    sxn_ee_memo_singleton = JS_IsFunction(ctx, list);
 }
 
 static uint32_t sxn_ee_length(JSContext *ctx, JSValueConst list) {
     if (JS_IsUndefined(list)) return 0;
+    /* Match Node's compact representation: one listener is stored as the
+       function itself and promoted to an array only when a second listener is
+       added.  This also keeps the hot one-listener emit path out of array
+       property access entirely. */
+    if (JS_IsFunction(ctx, list)) return 1;
     uint32_t len = 0;
     JSValue len_val = JS_GetProperty(ctx, list, sxn_atom_length);
     JS_ToUint32(ctx, &len, len_val);
@@ -271,10 +301,18 @@ static JSValue js_ee_on(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     JSValue events = sxn_ee_events(ctx, this_val);
     JSValue list = JS_GetProperty(ctx, events, type);
     if (JS_IsUndefined(list)) {
-        list = JS_NewArray(ctx);
-        JS_SetProperty(ctx, events, type, JS_DupValue(ctx, list));
+        /* Node stores the common one-listener case directly as a function;
+           promote to a fast array only when another listener arrives. */
+        JS_SetProperty(ctx, events, type, JS_DupValue(ctx, argv[1]));
+    } else if (JS_IsFunction(ctx, list)) {
+        JSValue promoted = JS_NewArray(ctx);
+        JS_SetPropertyUint32(ctx, promoted, 0, list); /* consumes list */
+        JS_SetPropertyUint32(ctx, promoted, 1, JS_DupValue(ctx, argv[1]));
+        JS_SetProperty(ctx, events, type, promoted);
+        list = JS_UNDEFINED; /* promoted now owns the old function */
+    } else {
+        JS_SetPropertyUint32(ctx, list, sxn_ee_length(ctx, list), JS_DupValue(ctx, argv[1]));
     }
-    JS_SetPropertyUint32(ctx, list, sxn_ee_length(ctx, list), JS_DupValue(ctx, argv[1]));
     JS_FreeValue(ctx, list);
     JS_FreeValue(ctx, events);
     JS_FreeAtom(ctx, type);
@@ -288,6 +326,19 @@ static JSValue js_ee_off(JSContext *ctx, JSValueConst this_val, int argc, JSValu
     if (type == JS_ATOM_NULL) return JS_EXCEPTION;
     JSValue events = sxn_ee_events(ctx, this_val);
     JSValue list = JS_GetProperty(ctx, events, type);
+    if (JS_IsFunction(ctx, list)) {
+        JSValueConst listener = argc > 1 ? argv[1] : JS_UNDEFINED;
+        /* once() stores a wrapper as the singleton; match Node's off() by
+           checking its _original listener as well as the wrapper identity. */
+        JSValue original = JS_GetPropertyStr(ctx, list, "_original");
+        bool matches = JS_IsStrictEqual(ctx, list, listener) ||
+                       (!JS_IsUndefined(original) && JS_IsStrictEqual(ctx, original, listener));
+        JS_FreeValue(ctx, original);
+        if (matches)
+            JS_DeleteProperty(ctx, events, type, 0);
+        JS_FreeValue(ctx, list); JS_FreeValue(ctx, events); JS_FreeAtom(ctx, type);
+        return JS_DupValue(ctx, this_val);
+    }
     uint32_t len = sxn_ee_length(ctx, list);
     if (!len) {
         JS_FreeValue(ctx, list); JS_FreeValue(ctx, events); JS_FreeAtom(ctx, type);
@@ -304,7 +355,18 @@ static JSValue js_ee_off(JSContext *ctx, JSValueConst this_val, int argc, JSValu
         if (matches) JS_FreeValue(ctx, l);
         else JS_SetPropertyUint32(ctx, out, out_len++, l);
     }
-    JS_SetProperty(ctx, events, type, out);
+    if (out_len == 0) {
+        JS_DeleteProperty(ctx, events, type, 0);
+        JS_FreeValue(ctx, out);
+    } else if (out_len == 1) {
+        /* Keep the compact singleton representation after removing all but
+           one listener, just as Node and tseep do on their hot path. */
+        JSValue single = JS_GetPropertyUint32(ctx, out, 0);
+        JS_SetProperty(ctx, events, type, single);
+        JS_FreeValue(ctx, out);
+    } else {
+        JS_SetProperty(ctx, events, type, out);
+    }
     JS_FreeValue(ctx, list);
     JS_FreeValue(ctx, events);
     JS_FreeAtom(ctx, type);
@@ -337,9 +399,12 @@ static JSValue js_ee_remove_all_listeners(JSContext *ctx, JSValueConst this_val,
 
 static JSValue js_ee_emit(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     if (argc < 1) return JS_ThrowTypeError(ctx, "emit requires a type");
-    JSValue events = sxn_ee_events(ctx, this_val);
+    bool events_borrowed;
+    JSValue events = sxn_ee_events_for_emit(ctx, this_val, &events_borrowed);
     JSAtom type;
     JSValue list;
+    bool type_owned = true, list_owned = true;
+    bool singleton = false;
     /* Memo hit: same _events object, same event-name string object, no
        listener mutation since. Skips the atom conversion and the listener
        array lookup; see sxn_ee_memo_store. Only heap strings are keyed by
@@ -350,16 +415,45 @@ static JSValue js_ee_emit(JSContext *ctx, JSValueConst this_val, int argc, JSVal
         JS_VALUE_GET_PTR(argv[0]) == JS_VALUE_GET_PTR(sxn_ee_memo_typev) &&
         JS_VALUE_GET_TAG(events) == JS_TAG_OBJECT &&
         JS_VALUE_GET_PTR(events) == JS_VALUE_GET_PTR(sxn_ee_memo_events)) {
-        type = JS_DupAtom(ctx, sxn_ee_memo_atom);
-        list = JS_DupValue(ctx, sxn_ee_memo_list);
+        /* The memo owns the atom for this entire native call. We only compare
+           it before any callback (the unhandled-error case), so borrow it
+           rather than taking another atom refcount pair on every hit. A
+           singleton function is likewise not touched after its callback;
+           arrays must remain rooted while callbacks can mutate the emitter. */
+        type = sxn_ee_memo_atom;
+        type_owned = false;
+        singleton = sxn_ee_memo_singleton;
+        if (singleton) {
+            list = sxn_ee_memo_list;
+            list_owned = false;
+        } else {
+            list = JS_DupValue(ctx, sxn_ee_memo_list);
+            list_owned = true;
+        }
     } else {
         type = JS_ValueToAtom(ctx, argv[0]);
-        if (type == JS_ATOM_NULL) { JS_FreeValue(ctx, events); return JS_EXCEPTION; }
+        if (type == JS_ATOM_NULL) {
+            if (!events_borrowed) JS_FreeValue(ctx, events);
+            return JS_EXCEPTION;
+        }
         list = JS_GetProperty(ctx, events, type);
         if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_STRING && JS_VALUE_GET_TAG(events) == JS_TAG_OBJECT)
             sxn_ee_memo_store(ctx, events, argv[0], type, list);
     }
-    JS_FreeValue(ctx, events);
+    if (!events_borrowed) JS_FreeValue(ctx, events);
+    if (singleton || JS_IsFunction(ctx, list)) {
+        /* Single-listener representation borrowed from Node/tseep: no array
+           lookup, element duplication, or per-iteration re-fetch is needed.
+           Check this before probing the fast-array representation altogether. */
+        int fast = argc == 2 ? JS_TryFastCapturedAddCall(ctx, list, argv[1]) : 0;
+        JSValue ret = fast ? JS_UNDEFINED : JS_Call(ctx, list, this_val, argc - 1, argv + 1);
+        if (list_owned) JS_FreeValue(ctx, list);
+        if (fast < 0) return JS_EXCEPTION;
+        if (JS_IsException(ret)) return ret;
+        JS_FreeValue(ctx, ret);
+        if (type_owned) JS_FreeAtom(ctx, type);
+        return JS_TRUE;
+    }
     /* Listener arrays are always plain fast arrays (built by JS_NewArray +
        integer appends), so JS_GetFastArray gives direct element access --
        no length property read, no per-index property lookup. The count is
@@ -374,9 +468,9 @@ static JSValue js_ee_emit(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     bool fast = JS_GetFastArray(ctx, list, &elems, &n);
     if (!fast) n = sxn_ee_length(ctx, list);
     if (!n) {
-        JS_FreeValue(ctx, list);
+        if (list_owned) JS_FreeValue(ctx, list);
         bool is_error = (type == sxn_atom_error);
-        JS_FreeAtom(ctx, type);
+        if (type_owned) JS_FreeAtom(ctx, type);
         if (!is_error) return JS_NewBool(ctx, false);
         JSValue err;
         if (argc > 1) err = JS_DupValue(ctx, argv[1]);
@@ -386,7 +480,7 @@ static JSValue js_ee_emit(JSContext *ctx, JSValueConst this_val, int argc, JSVal
         }
         return JS_Throw(ctx, err);
     }
-    JS_FreeAtom(ctx, type);
+    if (type_owned) JS_FreeAtom(ctx, type);
     for (uint32_t i = 0; i < n; i++) {
         JSValue l;
         if (fast) {
@@ -398,10 +492,10 @@ static JSValue js_ee_emit(JSContext *ctx, JSValueConst this_val, int argc, JSVal
         }
         JSValue ret = JS_Call(ctx, l, this_val, argc - 1, argv + 1);
         JS_FreeValue(ctx, l);
-        if (JS_IsException(ret)) { JS_FreeValue(ctx, list); return ret; }
+        if (JS_IsException(ret)) { if (list_owned) JS_FreeValue(ctx, list); return ret; }
         JS_FreeValue(ctx, ret);
     }
-    JS_FreeValue(ctx, list);
+    if (list_owned) JS_FreeValue(ctx, list);
     return JS_NewBool(ctx, true);
 }
 
@@ -425,6 +519,13 @@ static JSValue js_ee_listeners(JSContext *ctx, JSValueConst this_val, int argc, 
     uint32_t len = sxn_ee_length(ctx, list);
     JS_FreeValue(ctx, events); JS_FreeAtom(ctx, type);
     JSValue out = JS_NewArray(ctx);
+    if (JS_IsFunction(ctx, list)) {
+        /* listeners() exposes the original callback for once() wrappers. */
+        JSValue original = JS_GetPropertyStr(ctx, list, "_original");
+        if (JS_IsUndefined(original)) JS_SetPropertyUint32(ctx, out, 0, list);
+        else { JS_FreeValue(ctx, list); JS_SetPropertyUint32(ctx, out, 0, original); }
+        return out;
+    }
     for (uint32_t i = 0; i < len; i++) {
         JSValue l = JS_GetPropertyUint32(ctx, list, i);
         JSValue original = JS_GetPropertyStr(ctx, l, "_original");
@@ -800,7 +901,7 @@ static JSValue js_buffer_alloc_unsafe(JSContext *ctx, JSValueConst this_val, int
 /* Encoding names, interned once; compared by identity on the Buffer
    fast paths below instead of via JS_ToCString + strcmp. */
 static JSAtom sxn_atom_utf8, sxn_atom_utf8_dash, sxn_atom_hex;
-static JSAtom sxn_atom_base64, sxn_atom_base64url, sxn_atom_toHex, sxn_atom_toBase64;
+static JSAtom sxn_atom_base64, sxn_atom_base64url, sxn_atom_toBase64;
 
 /* Buffer.from fast path: intercepts only the (string, utf-8-or-absent)
    shape -- the hot one -- and builds the instance natively: one-pass UTF-8
@@ -882,7 +983,10 @@ static JSValue js_buffer_to_string(JSContext *ctx, JSValueConst this_val, int ar
     if (enc == sxn_atom_utf8_dash || enc == sxn_atom_utf8) {
         ret = JS_Call(ctx, func_data[0], JS_UNDEFINED, 1, &this_val); /* __sxnUtf8DecodeText */
     } else if (enc == sxn_atom_hex) {
-        ret = JS_Invoke(ctx, this_val, sxn_atom_toHex, 0, NULL);
+        /* We have already performed Buffer's encoding dispatch. Calling the
+           native primitive directly avoids a second property lookup and JS
+           call frame for Uint8Array.prototype.toHex(). */
+        ret = JS_Uint8ArrayToHex(ctx, this_val);
     } else if (enc == sxn_atom_base64) {
         ret = JS_Invoke(ctx, this_val, sxn_atom_toBase64, 0, NULL);
     } else {
@@ -947,7 +1051,6 @@ static void sxn_install_buffer_natives(JSContext *ctx) {
         sxn_atom_hex = JS_NewAtom(ctx, "hex");
         sxn_atom_base64 = JS_NewAtom(ctx, "base64");
         sxn_atom_base64url = JS_NewAtom(ctx, "base64url");
-        sxn_atom_toHex = JS_NewAtom(ctx, "toHex");
         sxn_atom_toBase64 = JS_NewAtom(ctx, "toBase64");
     }
     if (!JS_IsUndefined(proto)) {
@@ -1160,11 +1263,10 @@ void sxn_free_node_compat(JSContext *ctx) {
     JS_FreeAtom(ctx, sxn_atom_error);
     JS_FreeAtom(ctx, sxn_atom_utf8); JS_FreeAtom(ctx, sxn_atom_utf8_dash);
     JS_FreeAtom(ctx, sxn_atom_hex); JS_FreeAtom(ctx, sxn_atom_base64);
-    JS_FreeAtom(ctx, sxn_atom_base64url); JS_FreeAtom(ctx, sxn_atom_toHex);
-    JS_FreeAtom(ctx, sxn_atom_toBase64);
+    JS_FreeAtom(ctx, sxn_atom_base64url); JS_FreeAtom(ctx, sxn_atom_toBase64);
     sxn_atom_utf8 = sxn_atom_utf8_dash = sxn_atom_hex = JS_ATOM_NULL;
     sxn_atom_base64 = sxn_atom_base64url = JS_ATOM_NULL;
-    sxn_atom_toHex = sxn_atom_toBase64 = JS_ATOM_NULL;
+    sxn_atom_toBase64 = JS_ATOM_NULL;
     sxn_atom_events = JS_ATOM_NULL;
     sxn_atom_length = JS_ATOM_NULL;
     sxn_atom_error = JS_ATOM_NULL;
