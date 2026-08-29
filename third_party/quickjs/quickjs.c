@@ -412,6 +412,9 @@ struct JSRuntime {
     /* arcsx: property lookup cache, see js_prop_cache_lookup */
     struct JSPropCacheEntry *prop_cache;
     uint32_t prop_cache_gen;
+    /* arcsx: `prototype` slot memo for js_create_from_ctor */
+    struct JSShape *ctor_proto_shape;
+    uint32_t ctor_proto_gen, ctor_proto_idx;
     void *user_opaque;
     void *libc_opaque;
     JSRuntimeFinalizerState *finalizers;
@@ -21548,6 +21551,39 @@ static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
     return realm;
 }
 
+/* arcsx: `new Foo(...)` reads Foo.prototype on every construction, which for
+   an allocation loop is a generic property lookup per object -- ~12% of the
+   cost of `new Uint8Array(n)` in a profile. Which *slot* holds `prototype`
+   is fixed by the constructor's shape, so the slot index is memoized and the
+   value is read fresh from the constructor each time. Reading fresh means a
+   reassigned `F.prototype` is still seen correctly; the shape compare covers
+   the property moving, and the property-cache generation covers it being
+   added, deleted or redefined. Accessor and autoinit slots are excluded and
+   fall through to the generic path. Two constructors sharing a shape share
+   the entry safely, since the value comes from the actual object. */
+static JSValue js_get_ctor_prototype(JSContext *ctx, JSValueConst ctor)
+{
+    JSRuntime *rt = ctx->rt;
+    JSObject *p;
+    JSShapeProperty *prs;
+    JSProperty *pr;
+
+    if (likely(JS_VALUE_GET_TAG(ctor) == JS_TAG_OBJECT)) {
+        p = JS_VALUE_GET_OBJ(ctor);
+        if (likely(rt->ctor_proto_shape == p->shape &&
+                   rt->ctor_proto_gen == rt->prop_cache_gen))
+            return js_dup(p->prop[rt->ctor_proto_idx].u.value);
+        prs = find_own_property(&pr, p, JS_ATOM_prototype);
+        if (prs && !(prs->flags & JS_PROP_TMASK)) {
+            rt->ctor_proto_shape = p->shape;
+            rt->ctor_proto_gen = rt->prop_cache_gen;
+            rt->ctor_proto_idx = (uint32_t)(prs - get_shape_prop(p->shape));
+            return js_dup(pr->u.value);
+        }
+    }
+    return JS_GetProperty(ctx, ctor, JS_ATOM_prototype);
+}
+
 static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor,
                                    int class_id)
 {
@@ -21557,7 +21593,7 @@ static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor,
     if (JS_IsUndefined(ctor)) {
         proto = js_dup(ctx->class_proto[class_id]);
     } else {
-        proto = JS_GetProperty(ctx, ctor, JS_ATOM_prototype);
+        proto = js_get_ctor_prototype(ctx, ctor);
         if (JS_IsException(proto))
             return proto;
         if (!JS_IsObject(proto)) {

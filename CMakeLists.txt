@@ -106,6 +106,14 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # Buffer#toString across every encoding, including the mixed-case and
   # latin1/ascii paths that fall through the native dispatch to JS.
   add_test(NAME sxn-buffer-tostring COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/buffer_tostring.mjs)
+  # Constructor prototype resolution, including the memoized slot path:
+  # reassignment, interleaved constructors, subclassed builtins,
+  # Reflect.construct with an explicit newTarget, Proxy get traps, bound
+  # functions and non-object prototypes.
+  add_test(NAME sxn-ctor-proto COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/ctor_proto.mjs)
+  # Accessor semantics: receivers, redefinition, getter<->data transitions,
+  # throwing getters, shadowing, frozen objects.
+  add_test(NAME sxn-getter-semantics COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/getter_semantics.mjs)
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
 
