@@ -139,6 +139,10 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # Mixed int/float arithmetic on the inlined paths: overflow promotion,
   # -0/NaN/Infinity, float+string, and precision at 2^53.
   add_test(NAME sxn-float-math COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/float_math.mjs)
+  # Map/Set lookup must stay sublinear, and SameValueZero must survive any
+  # change to the key hash. Asserts the shape of the cost curve, not a time.
+  add_test(NAME sxn-map-set-hash COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/map_set_hash.mjs)
+  set_tests_properties(sxn-map-set-hash PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
 

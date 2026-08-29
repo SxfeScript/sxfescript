@@ -54238,7 +54238,24 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
             d = NAN;
     hash_float64:
         u.d = d;
-        h = (u.u32[0] ^ u.u32[1]) * 3163;
+        /* arcsx: mix the whole 64-bit pattern rather than xor-folding the
+           halves. For a small integer key the double's low word is all zero
+           and the high word varies only in its upper bits, so
+           (u32[0]^u32[1])*3163 left the low bits -- the ones the bucket index
+           is taken from -- nearly constant: 4096 consecutive integers landed
+           in 8 buckets with a longest chain of 1280, making Map/Set lookup
+           O(n). This is the murmur3 64-bit finalizer; it keeps equal numeric
+           values hashing equally (int and float64 both arrive here through
+           the same canonical double), which SameValueZero requires. */
+        {
+            uint64_t x = u.u64;
+            x ^= x >> 33;
+            x *= (uint64_t)0xff51afd7ed558ccdULL;
+            x ^= x >> 33;
+            x *= (uint64_t)0xc4ceb9fe1a85ec53ULL;
+            x ^= x >> 33;
+            h = (uint32_t)x;
+        }
         tag = JS_TAG_FLOAT64;
         break;
     default:
