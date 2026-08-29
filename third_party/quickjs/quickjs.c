@@ -45570,9 +45570,28 @@ static JSValue js_array_slice(JSContext *ctx, JSValueConst this_val,
                                 item_count <= del_count ? +1 : -1) < 0)
                 goto exception;
 
-            for (k = len; k-- > new_len; ) {
-                if (JS_DeletePropertyInt64(ctx, obj, k, JS_PROP_THROW) < 0)
-                    goto exception;
+            /* arcsx: for a fast array the tail is truncated by the
+               `length` assignment below, which frees exactly these
+               elements. Deleting them individually first is redundant --
+               and worse, JS_DeletePropertyInt64 converts the array to a
+               slow one, permanently. That made every removing splice
+               deoptimize its array forever: a later splice on the same
+               array measured ~85x slower, and plain element reads ~45%
+               slower, with no way back. Only fast arrays whose elements
+               are all present take this shortcut; anything exotic, holey
+               or proxied keeps the per-index deletes and their semantics
+               (including the JS_PROP_THROW behaviour). */
+            bool fast_tail = false;
+            if (JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT) {
+                JSObject *pa = JS_VALUE_GET_OBJ(obj);
+                fast_tail = pa->class_id == JS_CLASS_ARRAY && pa->fast_array &&
+                            (int64_t)pa->u.array.count == len;
+            }
+            if (!fast_tail) {
+                for (k = len; k-- > new_len; ) {
+                    if (JS_DeletePropertyInt64(ctx, obj, k, JS_PROP_THROW) < 0)
+                        goto exception;
+                }
             }
         }
         for (i = 0; i < item_count; i++) {

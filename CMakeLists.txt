@@ -143,6 +143,11 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # change to the key hash. Asserts the shape of the cost curve, not a time.
   add_test(NAME sxn-map-set-hash COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/map_set_hash.mjs)
   set_tests_properties(sxn-map-set-hash PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # Array#splice semantics, plus a guard that a removing splice does not
+  # convert the array to a slow array (which used to cost ~85x on the next
+  # splice and never recovered).
+  add_test(NAME sxn-splice COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/splice_conformance.mjs)
+  set_tests_properties(sxn-splice PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
 
