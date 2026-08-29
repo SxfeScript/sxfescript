@@ -96,6 +96,10 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # Regression coverage: SX's contextual `interface` grammar hook must not
   # leak into ordinary .cjs execution (see update_token_ident in quickjs.c).
   add_test(NAME sxn-interface-ident COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/interface-ident.cjs)
+  # TextEncoder.encodeInto spec conformance: fails the run (non-zero exit) if
+  # any case deviates, so encoding regressions surface in ctest.
+  add_test(NAME sxn-encode-into COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/encodeinto_spec.mjs)
+  set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
 
 install(TARGETS sxn RUNTIME DESTINATION bin)

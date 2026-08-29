@@ -5165,13 +5165,20 @@ static uint8_t *js_string_to_utf8_buf(JSContext *ctx, JSValueConst val1, size_t 
             if (c < 0x80) {
                 *q++ = c;
             } else {
-                if (is_hi_surrogate(c)) {
-                    if (pos < len) {
-                        c1 = src[pos];
-                        if (is_lo_surrogate(c1)) {
-                            pos++;
-                            c = from_surrogate(c, c1);
-                        }
+                if (is_surrogate(c)) {
+                    /* arcsx: an unpaired surrogate encodes as U+FFFD, per the
+                       WHATWG encoding standard -- this buffer feeds
+                       TextEncoder.encode and Buffer.from(str,"utf-8"), and
+                       both Node and Bun substitute here. (JS_ToCStringLen2
+                       keeps raw surrogates for its own callers; this is a
+                       separate path and deliberately differs.) U+FFFD is
+                       three bytes, the same as the raw surrogate would have
+                       been, so the len*3 sizing above still bounds it. */
+                    if (is_hi_surrogate(c) && pos < len && is_lo_surrogate(src[pos])) {
+                        c1 = src[pos++];
+                        c = from_surrogate(c, c1);
+                    } else {
+                        c = 0xfffd;
                     }
                 }
                 q += utf8_encode(q, c);

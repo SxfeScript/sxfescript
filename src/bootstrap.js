@@ -20,12 +20,9 @@
   // handling moved into __sxnUtf8Encode itself (src/network.c), so encode()
   // costs zero interpreted frames per call.
   TextEncoder.prototype.encode = __sxnUtf8Encode;
-  TextEncoder.prototype.encodeInto = function (input, dest) {
-    var enc = this.encode(input);
-    var n = Math.min(enc.length, dest.length);
-    dest.set(enc.subarray(0, n));
-    return { read: input.length, written: n };
-  };
+  // Native: writes straight into `dest` with no intermediate allocation, and
+  // reports the code units actually consumed rather than assuming all of them.
+  TextEncoder.prototype.encodeInto = __sxnUtf8EncodeInto;
   globalThis.TextEncoder = TextEncoder;
 
   function TextDecoder(label, options) {

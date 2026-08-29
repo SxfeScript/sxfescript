@@ -1228,6 +1228,63 @@ static JSValue sxn_utf8_encode(JSContext *ctx, JSValueConst this_val, int argc, 
     return JS_NewUint8ArrayFromString(ctx, argv[0]);
 }
 
+/* TextEncoder.encodeInto() native primitive. The JS version allocated a whole
+   encoded copy via encode(), then a subarray view, then copied into the
+   destination -- the exact allocation encodeInto exists to avoid. This writes
+   straight into the caller's buffer.
+
+   It also fixes two spec bugs in that version: `read` must be the number of
+   UTF-16 code units actually consumed (not the whole input length) when the
+   destination fills up, and a partial UTF-8 sequence must never be written --
+   encoding stops at the last code point that fits whole. */
+static JSValue sxn_utf8_encode_into(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 2) return JS_ThrowTypeError(ctx, "encodeInto(source, destination) requires two arguments");
+    size_t dest_len = 0;
+    uint8_t *dest = JS_GetUint8Array(ctx, &dest_len, argv[1]);
+    if (!dest) return JS_EXCEPTION;
+    size_t src_len = 0;
+    const uint16_t *src = JS_ToCStringLenUTF16(ctx, &src_len, argv[0]);
+    if (!src) return JS_EXCEPTION;
+
+    size_t read = 0, written = 0;
+    while (read < src_len) {
+        uint32_t c = src[read];
+        size_t consumed = 1, need;
+        if (c < 0x80) need = 1;
+        else if (c < 0x800) need = 2;
+        else if (c >= 0xd800 && c <= 0xdbff && read + 1 < src_len &&
+                 src[read + 1] >= 0xdc00 && src[read + 1] <= 0xdfff) {
+            c = 0x10000 + ((c - 0xd800) << 10) + (src[read + 1] - 0xdc00);
+            consumed = 2; need = 4;
+        } else {
+            /* Unpaired surrogate -> U+FFFD, matching encode() and the WHATWG
+               encoding standard. */
+            if (c >= 0xd800 && c <= 0xdfff) c = 0xfffd;
+            need = 3;
+        }
+        if (written + need > dest_len) break; /* never split a code point */
+        switch (need) {
+        case 1: dest[written++] = (uint8_t)c; break;
+        case 2: dest[written++] = (uint8_t)(0xc0 | (c >> 6));
+                dest[written++] = (uint8_t)(0x80 | (c & 0x3f)); break;
+        case 3: dest[written++] = (uint8_t)(0xe0 | (c >> 12));
+                dest[written++] = (uint8_t)(0x80 | ((c >> 6) & 0x3f));
+                dest[written++] = (uint8_t)(0x80 | (c & 0x3f)); break;
+        default: dest[written++] = (uint8_t)(0xf0 | (c >> 18));
+                dest[written++] = (uint8_t)(0x80 | ((c >> 12) & 0x3f));
+                dest[written++] = (uint8_t)(0x80 | ((c >> 6) & 0x3f));
+                dest[written++] = (uint8_t)(0x80 | (c & 0x3f)); break;
+        }
+        read += consumed;
+    }
+    JS_FreeCStringUTF16(ctx, src);
+    JSValue res = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, res, "read", JS_NewUint32(ctx, (uint32_t)read));
+    JS_SetPropertyStr(ctx, res, "written", JS_NewUint32(ctx, (uint32_t)written));
+    return res;
+}
+
 /* Buffer.from(string, "utf-8") primitive: same one-pass encode as
    sxn_utf8_encode, but goes straight to the bare ArrayBuffer via
    JS_NewArrayBufferFromString instead of building (and discarding) a
@@ -1573,6 +1630,7 @@ int sxn_install_network(JSContext *ctx) {
     JS_SetPropertyStr(ctx, global, "__sxnDigest", JS_NewCFunction(ctx, sxn_digest, "__sxnDigest", 2));
     /* Consumed only by bootstrap.js's TextEncoder/TextDecoder. */
     JS_SetPropertyStr(ctx, global, "__sxnUtf8Encode", JS_NewCFunction(ctx, sxn_utf8_encode, "__sxnUtf8Encode", 1));
+    JS_SetPropertyStr(ctx, global, "__sxnUtf8EncodeInto", JS_NewCFunction(ctx, sxn_utf8_encode_into, "__sxnUtf8EncodeInto", 2));
     JS_SetPropertyStr(ctx, global, "__sxnUtf8Decode", JS_NewCFunction(ctx, sxn_utf8_decode, "__sxnUtf8Decode", 3));
     /* Consumed only by node_compat.js's Buffer.from(string, "utf-8"). */
     JS_SetPropertyStr(ctx, global, "__sxnUtf8EncodeArrayBuffer", JS_NewCFunction(ctx, sxn_utf8_encode_buffer, "__sxnUtf8EncodeArrayBuffer", 1));
