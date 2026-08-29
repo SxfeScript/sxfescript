@@ -119,6 +119,13 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # guards the boundary: it must stay gated on `safe` locals and never be
   # applied to plain JS/TS accumulators.
   add_test(NAME sxn-js-overflow COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/js_overflow.mjs)
+  # Broad standard-JS/TS surface: destructuring, spread, optional chaining,
+  # generators, classes (private fields, static blocks), Proxy/Reflect,
+  # typed arrays, BigInt, regexp named groups, Map/Set/WeakMap, and the
+  # Array/String/Object/Number/JSON builtins. Output is byte-identical to
+  # Node; this is the backstop against engine optimizations regressing
+  # ordinary JavaScript.
+  add_test(NAME sxn-js-conformance COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/js_conformance.mjs)
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
 
