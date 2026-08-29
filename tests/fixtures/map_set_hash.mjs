@@ -21,6 +21,24 @@ const ratio = large / small;
 const ok = ratio < 4;
 console.log(ok ? "PASS" : "FAIL",
             "small=" + small.toFixed(1) + "ns large=" + large.toFixed(1) + "ns ratio=" + ratio.toFixed(2));
+// Object-identity keys hash the pointer, which is aligned and (with arena
+// allocation) regularly spaced -- the same degeneracy as the numeric case.
+function perOpObj(n) {
+  const keep = [], s = new Set(), w = new WeakMap();
+  for (let i = 0; i < n; i++) { const o = { i }; keep.push(o); s.add(o); w.set(o, i); }
+  const ITER = 50000;
+  let c = 0;
+  const t = performance.now();
+  for (let i = 0; i < ITER; i++) { const o = keep[i % n]; if (s.has(o)) c++; c += w.get(o) & 1; }
+  return { ns: ((performance.now() - t) / ITER) * 1e6, c };
+}
+perOpObj(64);
+const osmall = perOpObj(64).ns, olarge = perOpObj(8192).ns;
+const oratio = olarge / osmall;
+const ook = oratio < 4;
+console.log(ook ? "PASS" : "FAIL",
+            "obj small=" + osmall.toFixed(1) + "ns large=" + olarge.toFixed(1) + "ns ratio=" + oratio.toFixed(2));
+
 // SameValueZero must survive any hash change.
 const checks = [
   new Set([0]).has(-0), new Set([-0]).has(0), new Set([NaN]).has(NaN),
@@ -28,4 +46,4 @@ const checks = [
   new Map([[0, "a"]]).get(-0) === "a",
 ];
 console.log(checks.every(Boolean) ? "PASS samevaluezero" : "FAIL samevaluezero " + JSON.stringify(checks));
-if (!ok || !checks.every(Boolean)) throw new Error("map/set hash regression");
+if (!ok || !ook || !checks.every(Boolean)) throw new Error("map/set hash regression");

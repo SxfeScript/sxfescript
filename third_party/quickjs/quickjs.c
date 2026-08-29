@@ -54219,7 +54219,21 @@ static uint32_t map_hash_key(JSContext *ctx, JSValueConst key)
         break;
     case JS_TAG_OBJECT:
     case JS_TAG_SYMBOL:
-        h = (uintptr_t)JS_VALUE_GET_PTR(key) * 3163;
+        /* arcsx: same degeneracy as the numeric case below. Pointers are
+           aligned, so their low bits are always zero, and multiplying by an
+           odd constant keeps them zero -- the bucket index is taken from
+           exactly those bits. With arena allocation the spacing is regular
+           too: modelling 4096 objects at a 64-byte stride put them in 64 of
+           4096 buckets, longest chain 64. Mix the pointer instead. */
+        {
+            uint64_t x = (uint64_t)(uintptr_t)JS_VALUE_GET_PTR(key);
+            x ^= x >> 33;
+            x *= (uint64_t)0xff51afd7ed558ccdULL;
+            x ^= x >> 33;
+            x *= (uint64_t)0xc4ceb9fe1a85ec53ULL;
+            x ^= x >> 33;
+            h = (uint32_t)x;
+        }
         break;
     case JS_TAG_INT:
         d = JS_VALUE_GET_INT(key);
