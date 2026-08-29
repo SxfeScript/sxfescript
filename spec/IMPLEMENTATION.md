@@ -170,11 +170,29 @@ Two to three times better on the realistic pattern, not fifty. Note also
 that this runtime records far *more* small gaps (348 over 10 us against
 Bun's 51) -- refcounting spreads its cost rather than avoiding it.
 
-So a well-sized nursery would likely keep pauses in the same range while
-addressing the ~29 ns teardown cost, and is a more attractive option than
-this ledger previously suggested. It remains a large change, but the
-argument against it should not rest on a benchmark that measures one
-allocation pattern.
+So the pause argument against a nursery is much weaker than this ledger
+first claimed. The argument that remains is scope, and it is a different
+one: a nursery is not a bounded change for this engine.
+
+An empty `{}` costs 76 ns to create and destroy here against Node's 3.8 ns,
+and it has no properties, so refcount *cascades* are not the cost. What is
+left is the per-object lifecycle itself -- allocation, linking into the GC
+object list, taking and releasing a shape reference, arena free -- spread
+across the design rather than sitting in one hotspot. Reaching a few
+nanoseconds means not doing that work per object, which means bump
+allocation and reclaiming young objects without individual frees.
+
+That is incompatible with how QuickJS works in two ways that matter. A
+*moving* nursery cannot be added while raw JSValues live on the C stack and
+in embedder variables; there is no handle layer to update. A *non-moving*
+young generation still has to determine liveness without refcounts, and
+refcounting is not an implementation detail here -- JS_FreeValue is in the
+public C API, so every embedder depends on it.
+
+The accurate framing is therefore not "a multi-week project we have not
+scheduled" but "a different engine". Recorded so the option is neither
+dismissed for the wrong reason (pause latency, which was overstated) nor
+adopted under the wrong assumption (that it is incremental work).
 
 ## Finding real defects: the complexity probe
 
