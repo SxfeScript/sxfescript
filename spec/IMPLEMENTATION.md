@@ -211,6 +211,33 @@ written to measure. Sweeping for anomalous *shapes* found in one sitting
 several defects that mattered more to real programs than any benchmark row
 in the suite.
 
+## Known: object literals rebuild their intermediate shapes
+
+Building `{a: 1, b: 2}` transitions empty -> {a} -> {a,b}. The shape hash
+table holds no reference, so a shape dies with its last object -- and the
+intermediate {a} has no holder at all. It is created, hashed, used for one
+property store, then freed, on every literal.
+
+Measured with `benchmarks/engine/shape_churn_probe.js`, which keeps an
+`{a:0}` object alive from JS for no reason other than to pin that shape:
+`{a,b}` literal creation goes 103.1 -> 78.7 ns, about 24%, on one of the
+most common operations in any program. Node builds the same literal in
+~4 ns.
+
+An attempt to fix this with a bounded keep-alive ring of recently hashed
+shapes **segfaults**, and the reason is worth recording. In add_property's
+transition path the freshly cloned shape is used under
+`assert(JS_REF_COUNT(p->shape) == 1)`: add_shape_property mutates it in
+place precisely because it is known to be unshared. Taking a reference for a
+cache makes it shared, and the in-place mutation then corrupts a shape other
+objects can reach. Any fix has to take its reference *after* the shape is
+complete, or make the table an owner and let the cycle collector reclaim
+shape->proto->shape cycles -- not simply pin the shape mid-transition.
+
+The ad-hoc pinning of Buffer/Uint8Array/ArrayBuffer shapes in
+`sxn_pin_core_shapes` (src/node.c) is the same problem solved narrowly for
+three known types; a general fix would subsume it.
+
 ## Known: parsing is still quadratic in declarations per scope
 
 Parsing a file with many declarations in one scope is O(N^2). A 32k-line
