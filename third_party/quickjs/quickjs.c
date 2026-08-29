@@ -1128,13 +1128,21 @@ struct JSShape {
     uint32_t hash_table[]; /* prop_hash_mask + 1 elements, then prop[prop_size] */
 };
 
-/* arcsx: global property lookup cache. Maps (receiver shape, atom) to the
-   number of prototype hops to the holder and the property's index within
-   the holder, turning a repeated named lookup (`buf.toString`, `ee.emit`)
-   into pointer derefs instead of a hash probe per level.
+/* arcsx: polymorphic inline cache for property reads. Each entry belongs to
+   one call site -- keyed by the bytecode address of the read's atom operand,
+   which uniquely identifies that read and pins the atom, so the atom needs
+   no comparing -- and remembers up to JS_IC_WAYS receiver shapes it has
+   seen, each with the number of prototype hops to the holder and the
+   property's index there. A repeated read costs a shape compare and pointer
+   derefs instead of a hash probe per prototype level.
+
+   Multi-way matters: a monomorphic site wants the cheapest possible hit,
+   but a site that sees several shapes (`objs[i].m()` over a mixed array)
+   would thrash a single-way cache and end up slower than no cache at all.
+   Ways are filled round-robin, so a site settles on its hot shapes.
 
    Safety rests on three points:
-   - Entries are validated by an exact (shape, atom) compare *and* a global
+   - A hit requires an exact (pc, shape) match *and* a matching global
      generation stamp, so a stale entry can never be used.
    - `gen` is bumped by js_prop_cache_invalidate() at every point that can
      change where a property lives: adding, deleting, resizing, compacting,
@@ -1143,23 +1151,25 @@ struct JSShape {
    - Only the *location* is cached, never a value, so ordinary writes to an
      existing slot need no invalidation: the value is always read fresh.
    Walking `depth` prototypes from a live receiver is safe because
-   JSShape.proto is a strong reference (see js_free_shape0). */
-#define JS_PROP_CACHE_BITS 12
+   JSShape.proto is a strong reference (see js_free_shape0). Two call sites
+   that collide in the table simply evict each other: a miss, never a wrong
+   answer. */
+#define JS_PROP_CACHE_BITS 10
 #define JS_PROP_CACHE_SIZE (1 << JS_PROP_CACHE_BITS)
+#define JS_IC_WAYS 4
 
 typedef struct JSPropCacheEntry {
-    JSShape *shape;   /* receiver's shape; never dereferenced on a miss */
-    JSAtom atom;
+    const uint8_t *pc; /* call site: the bytecode address of its atom operand */
     uint32_t gen;
-    uint32_t depth;   /* prototype hops from receiver to the holder */
-    uint32_t prop_idx; /* index into holder->prop[] / shape prop table */
+    uint32_t next_way; /* round-robin victim */
+    JSShape *shape[JS_IC_WAYS];    /* never dereferenced, only compared */
+    uint32_t depth[JS_IC_WAYS];    /* prototype hops from receiver to holder */
+    uint32_t prop_idx[JS_IC_WAYS]; /* index into holder->prop[] */
 } JSPropCacheEntry;
 
-static inline uint32_t js_prop_cache_hash(JSShape *sh, JSAtom atom)
+static inline uint32_t js_prop_cache_hash(const uint8_t *pc)
 {
-    uintptr_t h = (uintptr_t)sh;
-    h = (h >> 4) ^ (h >> 16) ^ ((uintptr_t)atom * 0x9e3779b1u);
-    return (uint32_t)h & (JS_PROP_CACHE_SIZE - 1);
+    return (uint32_t)(((uintptr_t)pc >> 2) * 0x9e3779b1u) & (JS_PROP_CACHE_SIZE - 1);
 }
 
 /* Any change to where properties live invalidates every entry at once. On
@@ -7117,40 +7127,61 @@ static inline JSShapeProperty *find_own_property(JSProperty **ppr,
    chain alive) and returns the holder plus the property's slot. The caller
    still checks the slot's flags, so getters/setters and other special
    properties take their normal path. */
-static inline bool js_prop_cache_lookup(JSRuntime *rt, JSObject *p, JSAtom atom,
+static inline bool js_prop_cache_lookup(JSRuntime *rt, const uint8_t *pc, JSObject *p,
                                               JSObject **pholder, uint32_t *pidx)
 {
     JSPropCacheEntry *e;
     JSShape *sh = p->shape;
-    uint32_t d;
+    uint32_t w, d;
 
     if (unlikely(!rt->prop_cache))
         return false;
-    e = &rt->prop_cache[js_prop_cache_hash(sh, atom)];
-    if (e->shape != sh || e->atom != atom || e->gen != rt->prop_cache_gen)
+    e = &rt->prop_cache[js_prop_cache_hash(pc)];
+    if (e->pc != pc || e->gen != rt->prop_cache_gen)
         return false;
-    for (d = e->depth; d != 0; d--) {
-        p = p->shape->proto;
-        if (unlikely(!p))
-            return false; /* cannot happen while the entry is valid; stay defensive */
+    for (w = 0; w < JS_IC_WAYS; w++) {
+        if (e->shape[w] != sh)
+            continue;
+        for (d = e->depth[w]; d != 0; d--) {
+            p = p->shape->proto;
+            if (unlikely(!p))
+                return false; /* unreachable while the entry is valid; stay defensive */
+        }
+        *pholder = p;
+        *pidx = e->prop_idx[w];
+        return true;
     }
-    *pholder = p;
-    *pidx = e->prop_idx;
-    return true;
+    return false;
 }
 
-static inline void js_prop_cache_fill(JSRuntime *rt, JSShape *sh, JSAtom atom,
+static inline void js_prop_cache_fill(JSRuntime *rt, const uint8_t *pc, JSShape *sh,
                                             uint32_t depth, uint32_t prop_idx)
 {
     JSPropCacheEntry *e;
+    uint32_t w;
+
     if (unlikely(!rt->prop_cache))
         return;
-    e = &rt->prop_cache[js_prop_cache_hash(sh, atom)];
-    e->shape = sh;
-    e->atom = atom;
-    e->gen = rt->prop_cache_gen;
-    e->depth = depth;
-    e->prop_idx = prop_idx;
+    e = &rt->prop_cache[js_prop_cache_hash(pc)];
+    if (e->pc != pc || e->gen != rt->prop_cache_gen) {
+        /* Entry belongs to another site, or predates an invalidation: take
+           it over and start its way list from scratch. */
+        memset(e, 0, sizeof(*e));
+        e->pc = pc;
+        e->gen = rt->prop_cache_gen;
+        w = 0;
+    } else {
+        for (w = 0; w < JS_IC_WAYS; w++)
+            if (e->shape[w] == sh)
+                break;              /* refresh the way this shape already owns */
+        if (w == JS_IC_WAYS) {
+            w = e->next_way;
+            e->next_way = (w + 1) & (JS_IC_WAYS - 1);
+        }
+    }
+    e->shape[w] = sh;
+    e->depth[w] = depth;
+    e->prop_idx[w] = prop_idx;
 }
 
 /* Release a counted reference an open var_ref held on the coroutine
@@ -19876,6 +19907,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSProperty *pr;
                 JSShapeProperty *prs;
 
+                const uint8_t *ic_pc = pc; /* arcsx: identifies this call site */
                 atom = get_u32(pc);
                 pc += 4;
 
@@ -19887,7 +19919,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* arcsx: cached (shape, atom) -> holder location. The
                        slot's flags are still checked, so accessors and other
                        special properties take their normal path. */
-                    if (js_prop_cache_lookup(rt, p, atom, &holder, &cidx)) {
+                    if (js_prop_cache_lookup(rt, ic_pc, p, &holder, &cidx)) {
                         prs = &get_shape_prop(holder->shape)[cidx];
                         if (likely(!(prs->flags & JS_PROP_TMASK))) {
                             val = js_dup(holder->prop[cidx].u.value);
@@ -19908,7 +19940,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 obj = JS_MKPTR(JS_TAG_OBJECT, p);
                                 goto get_field_slow_path;
                             }
-                            js_prop_cache_fill(rt, JS_VALUE_GET_OBJ(sp[-1])->shape, atom,
+                            js_prop_cache_fill(rt, ic_pc, JS_VALUE_GET_OBJ(sp[-1])->shape,
                                                depth, (uint32_t)(prs - get_shape_prop(p->shape)));
                             val = js_dup(pr->u.value);
                             break;
@@ -19956,6 +19988,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 JSProperty *pr;
                 JSShapeProperty *prs;
 
+                const uint8_t *ic_pc = pc; /* arcsx: identifies this call site */
                 atom = get_u32(pc);
                 pc += 4;
 
@@ -19967,7 +20000,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     /* arcsx: cached (shape, atom) -> holder location. The
                        slot's flags are still checked, so accessors and other
                        special properties take their normal path. */
-                    if (js_prop_cache_lookup(rt, p, atom, &holder, &cidx)) {
+                    if (js_prop_cache_lookup(rt, ic_pc, p, &holder, &cidx)) {
                         prs = &get_shape_prop(holder->shape)[cidx];
                         if (likely(!(prs->flags & JS_PROP_TMASK))) {
                             val = js_dup(holder->prop[cidx].u.value);
@@ -19985,7 +20018,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 obj = JS_MKPTR(JS_TAG_OBJECT, p);
                                 goto get_field2_slow_path;
                             }
-                            js_prop_cache_fill(rt, JS_VALUE_GET_OBJ(sp[-1])->shape, atom,
+                            js_prop_cache_fill(rt, ic_pc, JS_VALUE_GET_OBJ(sp[-1])->shape,
                                                depth, (uint32_t)(prs - get_shape_prop(p->shape)));
                             val = js_dup(pr->u.value);
                             break;

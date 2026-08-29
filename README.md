@@ -83,13 +83,18 @@ tagged `arcsx:` in `third_party/quickjs`), roughly in order of payoff:
 - **Typed-array property fast path**: property names that provably can't be
   numeric indices (`.toString`, `.toHex`) stay on the interpreter's inline
   lookup path instead of bailing to the generic exotic-object path.
-- **Property lookup cache**: a generation-stamped `(shape, atom)` table
-  mapping a lookup to its holder's prototype depth and slot index, so a
-  repeated named lookup costs pointer derefs instead of a hash probe per
-  prototype level. Worth ~20% on deep prototype chains (idiomatic class
-  code) and ~5% here. Only the *location* is cached, never a value, and the
-  generation is bumped at every point that can move a property, so a stale
-  entry can't be read.
+- **Polymorphic inline caches** for property reads. Each entry belongs to
+  one call site -- keyed by the bytecode address of the read's atom operand,
+  which pins the atom, so only the receiver's shape is compared -- and
+  remembers up to four shapes it has seen, each with the prototype depth and
+  slot index of the holder. A repeated read costs a shape compare and
+  pointer derefs instead of a hash probe per prototype level. Worth ~20% on
+  deep prototype chains (idiomatic class code) and ~5% on the loops above.
+  Multi-way is what makes it safe to use: a single-way, per-site cache
+  measured 12% *slower* than no per-site keying at all on a four-shape call
+  site, because the site thrashed one slot. Only the *location* is cached,
+  never a value, and the generation stamp is bumped at every point that can
+  move a property, so a stale entry can't be read.
 - **One-pass UTF-8 encoding** straight into the final buffer
   (`JS_NewUint8ArrayFromString` / `JS_NewArrayBufferFromString`), a native
   `Buffer.from(str, "utf-8")` that skips the JS subclass-constructor round
