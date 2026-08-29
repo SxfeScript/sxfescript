@@ -5998,8 +5998,13 @@ static no_inline JSShape *js_new_shape2(JSContext *ctx, JSObject *proto,
 
 static JSShape *js_new_shape(JSContext *ctx, JSObject *proto)
 {
-    return js_new_shape2(ctx, proto, JS_PROP_INITIAL_HASH_SIZE,
-                         JS_PROP_INITIAL_SIZE);
+    /* arcsx: 0 property slots, not JS_PROP_INITIAL_SIZE. An object wearing a
+       property-less shape -- every ArrayBuffer, every typed array, every
+       `{}` -- then needs no per-object property array at all (see
+       JS_NewObjectFromShape). The first property added grows straight to
+       JS_PROP_INITIAL_SIZE via resize_properties' floor, so objects that do
+       gain properties allocate exactly as before. */
+    return js_new_shape2(ctx, proto, JS_PROP_INITIAL_HASH_SIZE, 0);
 }
 
 static JSObject *object_or_null(JSValueConst val)
@@ -6118,7 +6123,7 @@ static no_inline int resize_properties(JSContext *ctx, JSShape **psh,
     intptr_t h;
 
     sh = *psh;
-    new_size = max_int(count, sh->prop_size * 3 / 2);
+    new_size = max_int(count, max_int(sh->prop_size * 3 / 2, JS_PROP_INITIAL_SIZE));
     /* Reallocate prop array first to avoid crash or size inconsistency
        in case of memory allocation failure */
     if (p) {
@@ -6423,8 +6428,14 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
     p->first_weak_ref = NULL;
     p->u.opaque = NULL;
     p->shape = sh;
-    p->prop = js_malloc(ctx, sizeof(JSProperty) * sh->prop_size);
-    if (unlikely(!p->prop)) {
+    /* arcsx: a property-less shape needs no property array; p->prop stays
+       NULL until resize_properties allocates one. Every read of p->prop is
+       indexed by a property that exists, so none of them run for an object
+       with no properties. */
+    p->prop = NULL;
+    if (sh->prop_size != 0)
+        p->prop = js_malloc(ctx, sizeof(JSProperty) * sh->prop_size);
+    if (unlikely(!p->prop && sh->prop_size != 0)) {
         js_free(ctx, p);
     fail:
         if (props) {
@@ -6465,7 +6476,11 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
         }
         break;
     case JS_CLASS_C_FUNCTION:
-        p->prop[0].u.value = JS_UNDEFINED;
+        /* arcsx: slot 0 only needs clearing if the shape actually reserved
+           one; a property-less shape has no array to initialize (see
+           js_new_shape). */
+        if (p->prop)
+            p->prop[0].u.value = JS_UNDEFINED;
         break;
     case JS_CLASS_ARGUMENTS:
     case JS_CLASS_MAPPED_ARGUMENTS:

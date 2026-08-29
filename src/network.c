@@ -146,6 +146,7 @@ static JSValue sxn_memory_usage(JSContext *ctx, JSValueConst this_val,
 #define MEM_FIELD(name, value) \
     JS_SetPropertyStr(ctx, result, name, JS_NewInt64(ctx, (int64_t)(value)))
     MEM_FIELD("mallocSize", mem.malloc_size);
+    MEM_FIELD("mallocCount", mem.malloc_count);
     MEM_FIELD("memoryUsed", mem.memory_used_size);
     MEM_FIELD("objects", mem.obj_count);
     MEM_FIELD("strings", mem.str_count);
