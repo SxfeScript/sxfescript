@@ -177,6 +177,10 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # left operand must not be appended to in place), wide strings, -0, floats,
   # int bounds, and repeated += appends.
   add_test(NAME sxn-string-number-concat COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/string_number_concat.mjs)
+  # performance.now bound straight to its C primitive: name, arity,
+  # monotonicity, sub-ms resolution, and this-independence.
+  add_test(NAME sxn-performance-now COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/performance_now.mjs)
+  set_tests_properties(sxn-performance-now PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
 

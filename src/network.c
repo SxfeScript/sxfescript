@@ -1638,7 +1638,9 @@ int sxn_install_network(JSContext *ctx) {
        crypto); bootstrap.js builds the spec-shaped globals on top of them
        and installs fetch/TextEncoder/URL/Headers/etc. on `global` itself. */
     JS_SetPropertyStr(ctx, global, "__sxnFetchRaw", JS_NewCFunction(ctx, js_sxn_fetch_raw, "__sxnFetchRaw", 4));
-    JS_SetPropertyStr(ctx, global, "__sxnNow", JS_NewCFunction(ctx, sxn_now, "__sxnNow", 0));
+    /* Named "now" because bootstrap.js binds this straight onto performance
+       rather than wrapping it, so this is the function user code sees. */
+    JS_SetPropertyStr(ctx, global, "__sxnNow", JS_NewCFunction(ctx, sxn_now, "now", 0));
     JS_SetPropertyStr(ctx, global, "__sxnRandomBytes", JS_NewCFunction(ctx, sxn_random_bytes, "__sxnRandomBytes", 1));
     JS_SetPropertyStr(ctx, global, "__sxnDigest", JS_NewCFunction(ctx, sxn_digest, "__sxnDigest", 2));
     /* Consumed only by bootstrap.js's TextEncoder/TextDecoder. */
