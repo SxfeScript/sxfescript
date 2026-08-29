@@ -101,6 +101,18 @@ inference to plain-JS accumulators would silently corrupt arithmetic.
 any case ~11 ns against per-iteration benchmark costs of 90-100 ns, so
 halving it would return roughly 5%.
 
+A pattern worth naming, because it cost several attempts: at this level the
+sampling profiler's self-time attribution is not a reliable guide. Four
+changes that profiled as 5-13% of a loop measured *neutral* once A/B'd
+interleaved on a settled machine -- caching accessors in the property IC, an
+inline fast path for the built-in typed-array length getter, memoizing the
+`prototype` slot (~2%, kept anyway as it is small and correct), and
+memoizing find_hashed_shape_proto's (prototype -> empty shape) lookup. What
+did pay was always something the profile named as *real work* rather than
+overhead: the mixed int/float arithmetic falling through to js_add_slow, and
+the missing let/const compound-assignment fusion. Profile to find candidates,
+but only an interleaved minimum-of-N A/B decides.
+
 Two further attempts were reverted for measuring *slower*: caching accessor
 properties in the property inline cache (typed-array `.length` 35.3 -> 49.7
 ns, because the extra branch on every cache hit costs more than the walk it
