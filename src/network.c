@@ -1377,6 +1377,18 @@ static JSValue sxn_utf8_decode(JSContext *ctx, JSValueConst this_val, int argc, 
     return result;
 }
 
+/* Non-streaming decode that returns the string directly. sxn_utf8_decode
+   returns {text, pending} because TextDecoder needs the partial-sequence
+   tail; Buffer#toString("utf-8") never does, and was allocating a result
+   object per call only to read .text back off it. */
+static JSValue sxn_utf8_decode_text(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    JSValue r = sxn_utf8_decode(ctx, this_val, argc, argv);
+    if (JS_IsException(r)) return r;
+    JSValue text = JS_GetPropertyStr(ctx, r, "text");
+    JS_FreeValue(ctx, r);
+    return text;
+}
+
 /* Sxn.file(path).text() reads via libuv's thread pool (uv_fs_open/read/close)
    and resolves a real Promise from the completion callback, so the caller's
    synchronous code keeps running while the read happens off-thread. This is
@@ -1633,6 +1645,7 @@ int sxn_install_network(JSContext *ctx) {
     JS_SetPropertyStr(ctx, global, "__sxnUtf8Encode", JS_NewCFunction(ctx, sxn_utf8_encode, "__sxnUtf8Encode", 1));
     JS_SetPropertyStr(ctx, global, "__sxnUtf8EncodeInto", JS_NewCFunction(ctx, sxn_utf8_encode_into, "__sxnUtf8EncodeInto", 2));
     JS_SetPropertyStr(ctx, global, "__sxnUtf8Decode", JS_NewCFunction(ctx, sxn_utf8_decode, "__sxnUtf8Decode", 3));
+    JS_SetPropertyStr(ctx, global, "__sxnUtf8DecodeText", JS_NewCFunction(ctx, sxn_utf8_decode_text, "__sxnUtf8DecodeText", 1));
     /* Consumed only by node_compat.js's Buffer.from(string, "utf-8"). */
     JS_SetPropertyStr(ctx, global, "__sxnUtf8EncodeArrayBuffer", JS_NewCFunction(ctx, sxn_utf8_encode_buffer, "__sxnUtf8EncodeArrayBuffer", 1));
     /* Consumed only by node_compat.js's fs/promises.writeFile (Task 5). */

@@ -68,16 +68,22 @@
       if (encoding === undefined || encoding === "utf-8" || encoding === "utf8") return __sxnUtf8Decode(this, false, false).text; // skip a TextDecoder allocation per call
       if (encoding === "hex") return this.toHex();
       if (encoding === "base64") return this.toBase64();
-      if (encoding === "base64url") return this.toBase64({ alphabet: "base64url" });
+      if (encoding === "base64url") return this.toBase64({ alphabet: "base64url", omitPadding: true }); // Node emits base64url unpadded
       encoding = String(encoding).toLowerCase();
       if (encoding === "utf-8" || encoding === "utf8") return __sxnUtf8Decode(this, false, false).text;
       if (encoding === "hex") return this.toHex();
       if (encoding === "base64") return this.toBase64();
-      if (encoding === "base64url") return this.toBase64({ alphabet: "base64url" });
-      if (encoding === "latin1" || encoding === "binary" || encoding === "ascii") {
+      if (encoding === "base64url") return this.toBase64({ alphabet: "base64url", omitPadding: true }); // Node emits base64url unpadded
+      if (encoding === "latin1" || encoding === "binary") {
         var out = "";
         for (var i = 0; i < this.length; i++) out += String.fromCharCode(this[i]);
         return out;
+      }
+      if (encoding === "ascii") {
+        // Node's "ascii" is 7-bit: the high bit is stripped, unlike latin1.
+        var a = "";
+        for (var j = 0; j < this.length; j++) a += String.fromCharCode(this[j] & 0x7f);
+        return a;
       }
       throw new TypeError("Unknown encoding: " + encoding);
     }

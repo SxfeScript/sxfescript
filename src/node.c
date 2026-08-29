@@ -850,6 +850,46 @@ static JSValue js_buffer_from_fast(JSContext *ctx, JSValueConst this_val, int ar
    classes permanently. The instances are parked on a non-enumerable global
    so they are released with the global object at teardown (keeping
    --leak-check clean) rather than leaked outright. */
+/* Buffer.prototype.toString fast path. The JS version dispatched on the
+   encoding with a chain of `===` comparisons -- for toString("hex") that is
+   three failed string compares before the match, each a full
+   js_strict_eq2/js_strict_eq_slow round trip, which a profile put at ~7% of
+   the Buffer benchmark. Resolving the encoding to an atom once and switching
+   on identity replaces all of them with pointer compares.
+
+   Only the encodings with a native implementation are handled here; latin1,
+   ascii, mixed case and anything unknown fall through to the original JS
+   method in func_data[1], which keeps its normalization and its TypeError. */
+static JSAtom sxn_atom_utf8, sxn_atom_utf8_dash, sxn_atom_hex;
+static JSAtom sxn_atom_base64, sxn_atom_base64url, sxn_atom_toHex, sxn_atom_toBase64;
+
+static JSValue js_buffer_to_string(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
+                                    int magic, JSValueConst *func_data) {
+    (void)magic;
+    JSAtom enc;
+    if (argc < 1 || JS_IsUndefined(argv[0])) {
+        enc = JS_DupAtom(ctx, sxn_atom_utf8_dash);
+    } else if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_STRING) {
+        enc = JS_ValueToAtom(ctx, argv[0]);
+        if (enc == JS_ATOM_NULL) return JS_EXCEPTION;
+    } else {
+        return JS_Call(ctx, func_data[1], this_val, argc, argv);
+    }
+    JSValue ret;
+    if (enc == sxn_atom_utf8_dash || enc == sxn_atom_utf8) {
+        ret = JS_Call(ctx, func_data[0], JS_UNDEFINED, 1, &this_val); /* __sxnUtf8DecodeText */
+    } else if (enc == sxn_atom_hex) {
+        ret = JS_Invoke(ctx, this_val, sxn_atom_toHex, 0, NULL);
+    } else if (enc == sxn_atom_base64) {
+        ret = JS_Invoke(ctx, this_val, sxn_atom_toBase64, 0, NULL);
+    } else {
+        JS_FreeAtom(ctx, enc);
+        return JS_Call(ctx, func_data[1], this_val, argc, argv);
+    }
+    JS_FreeAtom(ctx, enc);
+    return ret;
+}
+
 static void sxn_pin_core_shapes(JSContext *ctx) {
     JSValue global = JS_GetGlobalObject(ctx);
     JSValue pins = JS_NewArray(ctx);
@@ -894,6 +934,28 @@ static void sxn_install_buffer_natives(JSContext *ctx) {
     if (!JS_IsUndefined(proto) && JS_IsFunction(ctx, orig_from)) {
         JSValueConst from_data[2] = { proto, orig_from };
         JS_SetPropertyStr(ctx, ctor, "from", JS_NewCFunctionData(ctx, js_buffer_from_fast, 2, 0, 2, from_data));
+    }
+    if (!JS_IsUndefined(proto)) {
+        if (sxn_atom_utf8 == JS_ATOM_NULL) {
+            sxn_atom_utf8 = JS_NewAtom(ctx, "utf8");
+            sxn_atom_utf8_dash = JS_NewAtom(ctx, "utf-8");
+            sxn_atom_hex = JS_NewAtom(ctx, "hex");
+            sxn_atom_base64 = JS_NewAtom(ctx, "base64");
+            sxn_atom_base64url = JS_NewAtom(ctx, "base64url");
+            sxn_atom_toHex = JS_NewAtom(ctx, "toHex");
+            sxn_atom_toBase64 = JS_NewAtom(ctx, "toBase64");
+        }
+        JSValue global2 = JS_GetGlobalObject(ctx);
+        JSValue decode_text = JS_GetPropertyStr(ctx, global2, "__sxnUtf8DecodeText");
+        JSValue orig_to_string = JS_GetPropertyStr(ctx, proto, "toString");
+        if (JS_IsFunction(ctx, decode_text) && JS_IsFunction(ctx, orig_to_string)) {
+            JSValueConst ts_data[2] = { decode_text, orig_to_string };
+            JS_SetPropertyStr(ctx, proto, "toString",
+                              JS_NewCFunctionData(ctx, js_buffer_to_string, 1, 0, 2, ts_data));
+        }
+        JS_FreeValue(ctx, decode_text);
+        JS_FreeValue(ctx, orig_to_string);
+        JS_FreeValue(ctx, global2);
     }
     JS_FreeValue(ctx, proto);
     JS_FreeValue(ctx, orig_from);
@@ -1090,6 +1152,13 @@ void sxn_free_node_compat(JSContext *ctx) {
     JS_FreeAtom(ctx, sxn_atom_events);
     JS_FreeAtom(ctx, sxn_atom_length);
     JS_FreeAtom(ctx, sxn_atom_error);
+    JS_FreeAtom(ctx, sxn_atom_utf8); JS_FreeAtom(ctx, sxn_atom_utf8_dash);
+    JS_FreeAtom(ctx, sxn_atom_hex); JS_FreeAtom(ctx, sxn_atom_base64);
+    JS_FreeAtom(ctx, sxn_atom_base64url); JS_FreeAtom(ctx, sxn_atom_toHex);
+    JS_FreeAtom(ctx, sxn_atom_toBase64);
+    sxn_atom_utf8 = sxn_atom_utf8_dash = sxn_atom_hex = JS_ATOM_NULL;
+    sxn_atom_base64 = sxn_atom_base64url = JS_ATOM_NULL;
+    sxn_atom_toHex = sxn_atom_toBase64 = JS_ATOM_NULL;
     sxn_atom_events = JS_ATOM_NULL;
     sxn_atom_length = JS_ATOM_NULL;
     sxn_atom_error = JS_ATOM_NULL;
