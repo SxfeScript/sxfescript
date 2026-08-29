@@ -23,6 +23,13 @@ Run the example:
 ./build/debug/sxn examples/velocity.sx
 ```
 
+**Run the tests against a Debug build.** QuickJS gates its leak tracking on
+`#ifndef NDEBUG` (`ENABLE_DUMPS` in `third_party/quickjs/quickjs.c`), so in a
+Release build the `sxn-leak-check` test still runs but has nothing to detect
+and always passes. A Debug build is what actually catches a leaked atom,
+object or string -- an atom leak in the `node:*` layer sat unnoticed behind a
+green Release run until it aborted the first Debug one.
+
 ## Current implementation status
 
 The repository contains a working QuickJS-backed CLI, an in-memory `.sx`
