@@ -136,6 +136,9 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # opcodes, and those opcodes must keep exact JS arithmetic (int overflow
   # promotes to double, BigInt and string accumulation still work).
   add_test(NAME sxn-tdz-fusion COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tdz_fusion.mjs)
+  # Mixed int/float arithmetic on the inlined paths: overflow promotion,
+  # -0/NaN/Infinity, float+string, and precision at 2^53.
+  add_test(NAME sxn-float-math COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/float_math.mjs)
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
 

@@ -1690,6 +1690,21 @@ static JSValue js_number(double d)
         return js_float64(d);
 }
 
+/* If v is a number (int or float64), store it as a double and return true.
+   Used by the interpreter arithmetic fast paths to handle mixed int/float
+   operands inline instead of falling back to the slow path. */
+static inline bool js_arith_to_float64(JSValue v, double *pd)
+{
+    uint32_t tag = JS_VALUE_GET_TAG(v);
+    if (JS_TAG_IS_FLOAT64(tag))
+        *pd = JS_VALUE_GET_FLOAT64(v);
+    else if (tag == JS_TAG_INT)
+        *pd = JS_VALUE_GET_INT(v);
+    else
+        return false;
+    return true;
+}
+
 static JSValue __JS_NewShortBigInt(JSContext *ctx, int32_t d)
 {
     (void)&ctx;
@@ -20597,7 +20612,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                         JS_VALUE_GET_FLOAT64(op2));
                     JS_X87_FPCW_RESTORE(fpcw);
                     sp--;
+                } else if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op1)) ||
+                           JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op2))) {
+                    /* mixed int/float; the BOTH_FLOAT fast path above is unchanged */
+                    double d1, d2;
+                    if (!js_arith_to_float64(op1, &d1) ||
+                        !js_arith_to_float64(op2, &d2))
+                        goto add_slow_case;
+                    JS_X87_FPCW_SAVE_AND_ADJUST(fpcw);
+                    sp[-2] = js_float64(d1 + d2);
+                    JS_X87_FPCW_RESTORE(fpcw);
+                    sp--;
                 } else {
+                add_slow_case:
                     sf->cur_pc = pc;
                     if (js_add_slow(ctx, sp))
                         goto exception;
@@ -20631,6 +20658,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                         *pv = __JS_NewFloat64((double)r);
                     else
                         *pv = js_int32(r);
+                    sp--;
+                } else if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(*pv)) &&
+                           (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(sp[-1])) ||
+                            JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_INT)) {
+                    /* arcsx: an accumulator that has grown past int32 is a
+                       double, and `x += <int>` on it fell all the way to
+                       js_add_slow -- 13% of the EventEmitter profile. Mirrors
+                       the mixed int/float inlining OP_add already has. */
+                    double d = JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_INT
+                                   ? (double)JS_VALUE_GET_INT(sp[-1])
+                                   : JS_VALUE_GET_FLOAT64(sp[-1]);
+                    *pv = js_float64(JS_VALUE_GET_FLOAT64(*pv) + d);
+                    sp--;
+                } else if (JS_VALUE_GET_TAG(*pv) == JS_TAG_INT &&
+                           JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(sp[-1]))) {
+                    *pv = js_float64((double)JS_VALUE_GET_INT(*pv) +
+                                     JS_VALUE_GET_FLOAT64(sp[-1]));
                     sp--;
                 } else if (JS_VALUE_GET_TAG(*pv) == JS_TAG_STRING) {
                     JSValue op1;
@@ -20690,6 +20734,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                         JS_VALUE_GET_FLOAT64(op2));
                     JS_X87_FPCW_RESTORE(fpcw);
                     sp--;
+                } else if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op1)) ||
+                           JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op2))) {
+                    /* mixed int/float; the BOTH_FLOAT fast path above is unchanged */
+                    double d1, d2;
+                    if (!js_arith_to_float64(op1, &d1) ||
+                        !js_arith_to_float64(op2, &d2))
+                        goto binary_arith_slow;
+                    JS_X87_FPCW_SAVE_AND_ADJUST(fpcw);
+                    sp[-2] = js_float64(d1 - d2);
+                    JS_X87_FPCW_RESTORE(fpcw);
+                    sp--;
                 } else {
                     goto binary_arith_slow;
                 }
@@ -20725,6 +20780,17 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 mul_fp_res:
                     sp[-2] = js_float64(d);
                     sp--;
+                } else if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op1)) ||
+                           JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op2))) {
+                    /* mixed int/float; the BOTH_FLOAT fast path above is unchanged */
+                    double d1, d2;
+                    if (!js_arith_to_float64(op1, &d1) ||
+                        !js_arith_to_float64(op2, &d2))
+                        goto binary_arith_slow;
+                    JS_X87_FPCW_SAVE_AND_ADJUST(fpcw);
+                    d = d1 * d2;
+                    JS_X87_FPCW_RESTORE(fpcw);
+                    goto mul_fp_res;
                 } else {
                     goto binary_arith_slow;
                 }
@@ -20740,6 +20806,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     v1 = JS_VALUE_GET_INT(op1);
                     v2 = JS_VALUE_GET_INT(op2);
                     sp[-2] = js_number((double)v1 / (double)v2);
+                    sp--;
+                } else if (JS_VALUE_IS_BOTH_FLOAT(op1, op2)) {
+                    JS_X87_FPCW_SAVE_AND_ADJUST(fpcw);
+                    sp[-2] = js_number(JS_VALUE_GET_FLOAT64(op1) /
+                                       JS_VALUE_GET_FLOAT64(op2));
+                    JS_X87_FPCW_RESTORE(fpcw);
+                    sp--;
+                } else if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op1)) ||
+                           JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(op2))) {
+                    /* mixed int/float; the BOTH_FLOAT fast path above is unchanged */
+                    double d1, d2;
+                    if (!js_arith_to_float64(op1, &d1) ||
+                        !js_arith_to_float64(op2, &d2))
+                        goto binary_arith_slow;
+                    JS_X87_FPCW_SAVE_AND_ADJUST(fpcw);
+                    sp[-2] = js_number(d1 / d2);
+                    JS_X87_FPCW_RESTORE(fpcw);
                     sp--;
                 } else {
                     goto binary_arith_slow;

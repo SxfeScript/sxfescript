@@ -1,0 +1,16 @@
+const L=[];const p=(n,v)=>L.push(n+"="+JSON.stringify(v));
+p("int->float accum",(()=>{let x=0;for(let i=0;i<5;i++)x+=1e18;return x})());
+p("float+int",(()=>{let x=1.5;x+=2;return x})());
+p("int+float",(()=>{let x=2;x+=1.5;return x})());
+p("float+float",(()=>{let x=0.1;x+=0.2;return x})());
+p("neg zero",(()=>{let x=-0;x+=0;return Object.is(x,0)})());
+p("NaN",(()=>{let x=NaN;x+=1;return Number.isNaN(x)})());
+p("Infinity",(()=>{let x=Infinity;x+=1;return x===Infinity})());
+p("-Infinity",(()=>{let x=-Infinity;x+=5;return x===-Infinity})());
+p("float + string",(()=>{let x=1.5;x+="a";return x})());
+p("int overflow chain",(()=>{let x=2147483646;x+=1;x+=1;x+=1;return x})());
+p("big precision",(()=>{let x=9007199254740992;x+=1;return x})());
+p("mixed loop sum",(()=>{let s=0;for(let i=0;i<1000000;i++)s+=i;return s})());
+p("float loop sum",(()=>{let s=0;for(let i=0;i<100;i++)s+=0.1;return s.toFixed(10)})());
+p("subtract/mul unaffected",(()=>{let a=5;a-=1.5;let b=2;b*=1.5;return [a,b]})());
+console.log(L.join("\n"));
