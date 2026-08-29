@@ -114,6 +114,11 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # Accessor semantics: receivers, redefinition, getter<->data transitions,
   # throwing getters, shadowing, frozen objects.
   add_test(NAME sxn-getter-semantics COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/getter_semantics.mjs)
+  # Standard-JS integer overflow must promote to double, never wrap. The SX
+  # fused accumulator opcode (OP_add_loc_safe_i32) wraps by design, so this
+  # guards the boundary: it must stay gated on `safe` locals and never be
+  # applied to plain JS/TS accumulators.
+  add_test(NAME sxn-js-overflow COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/js_overflow.mjs)
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
 

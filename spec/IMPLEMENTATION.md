@@ -81,6 +81,19 @@ retried without new evidence:
   any real benchmark. Beware benchmarks that share a process with earlier
   ones -- measure each in isolation and take a minimum.
 
+One avenue is deliberately *not* taken, and the reason is a compatibility
+boundary rather than performance. A plain JS loop body compiles to 11 opcodes
+per iteration (~11 ns), six of them TDZ-checked local accesses; the fork's
+fused `OP_add_loc_safe_i32` would collapse the accumulator, and the compiler
+gates it on `safe` locals. That gate is load-bearing: the opcode computes
+`(int32_t)((uint32_t)left + (uint32_t)right)`, i.e. it *wraps* on overflow,
+which is the defined semantics for SX `safe x: i32` but wrong for standard
+JavaScript, where `x += 1` at 2^31-1 must promote to a double. Extending i32
+inference to plain-JS accumulators would silently corrupt arithmetic.
+`tests/fixtures/js_overflow.mjs` guards this boundary. The loop floor is in
+any case ~11 ns against per-iteration benchmark costs of 90-100 ns, so
+halving it would return roughly 5%.
+
 Two further attempts were reverted for measuring *slower*: caching accessor
 properties in the property inline cache (typed-array `.length` 35.3 -> 49.7
 ns, because the extra branch on every cache hit costs more than the walk it
