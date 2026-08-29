@@ -155,6 +155,10 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # not change: redeclaration errors, block shadowing, TDZ, closure capture
   # per iteration, and the same over 300 declarations so the hashed path runs.
   add_test(NAME sxn-declaration-scoping COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/declaration_scoping.mjs)
+  # Regexp semantics across the register-based engine port: groups, named and
+  # duplicate-named groups, lookaround, sticky/global state, unicode
+  # properties, v flag, modifiers, and a linear-time catastrophic case.
+  add_test(NAME sxn-regexp COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/regexp_conformance.mjs)
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
 
