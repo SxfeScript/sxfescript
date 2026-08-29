@@ -1,7 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
-project(sxn VERSION 0.1.0 LANGUAGES C)
+project(sxn VERSION 0.0.1 LANGUAGES C)
 find_package(OpenSSL REQUIRED)
 find_package(CURL REQUIRED)
+find_package(libuv CONFIG REQUIRED)
+# New link for Task 5: gzip-decompressing npm tarballs needs zlib's inflate;
+# OpenSSL (already linked) has no gzip support. zlib ships with the OS on
+# macOS/Linux, so this is a find, not a vendor.
+find_package(ZLIB REQUIRED)
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -24,14 +29,44 @@ if(SXN_ENABLE_POISON)
   target_compile_definitions(sxfe PUBLIC SXN_ENABLE_POISON=1)
 endif()
 
+# WinterCG globals (TextEncoder, URL, Headers, fetch's JS glue, ...) are
+# authored as plain JS in src/bootstrap.js and embedded as a byte array so
+# network.c can JS_Eval it at startup without shipping a loose file.
+set(SXN_BOOTSTRAP_JS ${CMAKE_CURRENT_SOURCE_DIR}/src/bootstrap.js)
+set(SXN_BOOTSTRAP_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/sxn_bootstrap.h)
+add_custom_command(
+  OUTPUT ${SXN_BOOTSTRAP_HEADER}
+  COMMAND ${CMAKE_COMMAND} -DIN=${SXN_BOOTSTRAP_JS} -DOUT=${SXN_BOOTSTRAP_HEADER} -DVAR=sxn_bootstrap_js
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_js.cmake
+  DEPENDS ${SXN_BOOTSTRAP_JS} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_js.cmake
+  COMMENT "Embedding bootstrap.js"
+)
+add_custom_target(sxn_bootstrap_header DEPENDS ${SXN_BOOTSTRAP_HEADER})
+
+# node:buffer/path/events/process are authored the same way (src/node_compat.js
+# embedded as a byte array), kept as a separate file/header from bootstrap.js
+# since it's a distinct WinterCG-vs-Node-compat concern.
+set(SXN_NODE_COMPAT_JS ${CMAKE_CURRENT_SOURCE_DIR}/src/node_compat.js)
+set(SXN_NODE_COMPAT_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/sxn_node_compat.h)
+add_custom_command(
+  OUTPUT ${SXN_NODE_COMPAT_HEADER}
+  COMMAND ${CMAKE_COMMAND} -DIN=${SXN_NODE_COMPAT_JS} -DOUT=${SXN_NODE_COMPAT_HEADER} -DVAR=sxn_node_compat_js
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_js.cmake
+  DEPENDS ${SXN_NODE_COMPAT_JS} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_js.cmake
+  COMMENT "Embedding node_compat.js"
+)
+add_custom_target(sxn_node_compat_header DEPENDS ${SXN_NODE_COMPAT_HEADER})
+
 add_executable(sxn
   src/main.c
   src/package.c
   src/lsp.c
   src/network.c
+  src/node.c
 )
-target_include_directories(sxn PRIVATE include third_party/quickjs)
-target_link_libraries(sxn PRIVATE sxfe qjs qjs-libc OpenSSL::Crypto CURL::libcurl)
+add_dependencies(sxn sxn_bootstrap_header sxn_node_compat_header)
+target_include_directories(sxn PRIVATE include third_party/quickjs ${CMAKE_CURRENT_BINARY_DIR}/generated)
+target_link_libraries(sxn PRIVATE sxfe qjs qjs-libc OpenSSL::Crypto CURL::libcurl libuv::uv_a ZLIB::ZLIB)
 if(WIN32)
   target_compile_definitions(sxn PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
 endif()
@@ -48,9 +83,19 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   add_test(NAME sxfe-frontend COMMAND sxfe-tests)
   add_test(NAME sxn-help COMMAND sxn --help)
   add_test(NAME sxn-example COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/examples/velocity.sx)
+  add_test(NAME sxn-memory-report COMMAND sxn --memory-report ${CMAKE_CURRENT_SOURCE_DIR}/examples/velocity.sx)
+  add_test(NAME sxn-memory-usage COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/memory-usage.sx)
+  add_test(NAME sxn-native-safe COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/compute-native-safe.sx)
+  set_tests_properties(sxn-native-safe PROPERTIES ENVIRONMENT "SXN_NATIVE_SX=1")
+  add_test(NAME sxn-native-safe-function COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/compute-native-safe-function.sx)
+  set_tests_properties(sxn-native-safe-function PROPERTIES ENVIRONMENT "SXN_NATIVE_SX=1")
+  add_test(NAME sxn-leak-check COMMAND sxn --leak-check ${CMAKE_CURRENT_SOURCE_DIR}/examples/velocity.sx)
   add_test(NAME sxn-sx-module COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/import-main.sx)
   add_test(NAME sxn-reject-enum COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/reject-enum.sx)
   set_tests_properties(sxn-reject-enum PROPERTIES WILL_FAIL TRUE)
+  # Regression coverage: SX's contextual `interface` grammar hook must not
+  # leak into ordinary .cjs execution (see update_token_ident in quickjs.c).
+  add_test(NAME sxn-interface-ident COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/interface-ident.cjs)
 endif()
 
 install(TARGETS sxn RUNTIME DESTINATION bin)

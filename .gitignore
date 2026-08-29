@@ -3,3 +3,4 @@
 /node_modules/
 *.sxn.tmp
 
+.DS_Store

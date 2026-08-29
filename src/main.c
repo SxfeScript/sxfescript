@@ -15,48 +15,52 @@ static bool suffix(const char *value, const char *ending) {
     return a >= b && !strcasecmp(value + a - b, ending);
 }
 
-static void print_diagnostics(const char *filename, const SxfeCompileResult *result) {
-    for (size_t i = 0; i < result->diagnostic_count; ++i) {
-        const SxfeDiagnostic *d = &result->diagnostics[i];
-        fprintf(stderr, "%s:%zu:%zu: %s %s\n", filename, d->line, d->column,
-                sxfe_diagnostic_name(d->code), d->message);
-    }
+static uint8_t *sxn_load_file(JSContext *ctx, size_t *length, const char *filename) {
+    /* QuickJS's native parser understands SX syntax (safe/mut/interface,
+       type annotations, &/&mut reference sigils) directly, so .sx sources
+       load exactly like any other extension. The text-level compatibility
+       transformer (sxfe_compile) is no longer wired into execution; it
+       stays available as a standalone, independently-tested unit (see the
+       sxfe-frontend ctest) but has no remaining call site here. */
+    return js_load_file(ctx, length, filename);
 }
 
-static uint8_t *sxn_load_file(JSContext *ctx, size_t *length, const char *filename) {
-    uint8_t *source = js_load_file(ctx, length, filename);
-    if (!source || !suffix(filename, ".sx")) return source;
-    SxfeCompileResult compiled;
-    int status = sxfe_compile((const char *)source, *length, &compiled);
-    js_free(ctx, source);
-    if (status != 0) {
-        print_diagnostics(filename, &compiled);
-        sxfe_compile_result_free(&compiled);
-        JS_ThrowSyntaxError(ctx, "SxfeScript compilation failed for '%s'", filename);
-        return NULL;
-    }
-    if (getenv("SXN_DUMP_TRANSFORM")) fprintf(stderr, "--- %s ---\n%.*s\n", filename, (int)compiled.length, compiled.javascript);
-    uint8_t *result = js_malloc(ctx, compiled.length + 1);
-    if (result) {
-        memcpy(result, compiled.javascript, compiled.length + 1);
-        *length = compiled.length;
-    }
-    sxfe_compile_result_free(&compiled);
-    return result;
+static bool has_prefix(const char *value, const char *prefix) {
+    return !strncmp(value, prefix, strlen(prefix));
 }
 
 static JSModuleDef *sxn_module_loader(JSContext *ctx, const char *name, void *opaque,
                                       JSValueConst attributes) {
+    /* node:buffer/path/events/process/fs/fs-promises are pre-registered by
+       sxn_install_node_compat via JS_NewCModule (same mechanism as
+       qjs:std/qjs:os/qjs:bjson below), so `import ... from "node:xxx"`
+       resolves to them without ever reaching this loader. Only an
+       unregistered node: specifier gets here -- report it clearly instead
+       of falling through to file-based resolution, which would otherwise
+       try (and fail confusingly) to open a file literally named "node:xxx". */
+    if (has_prefix(name, "node:")) {
+        JS_ThrowReferenceError(ctx, "unsupported node: module '%s'", name);
+        return NULL;
+    }
     if (!suffix(name, ".sx")) return js_module_loader(ctx, name, opaque, attributes);
     return js_module_load(ctx, name, opaque, attributes, sxn_load_file);
 }
 
-static int execute_file(int argc, char **argv) {
-    const char *filename = argv[1];
+static int execute_file(int argc, char **argv, const char *filename,
+                        bool memory_report, bool leak_check) {
     size_t length = 0;
     uint8_t *source = NULL;
     JSRuntime *runtime = JS_NewRuntime();
     if (!runtime) { fputs("sxn: unable to create QuickJS runtime\n", stderr); return 2; }
+    /* QuickJS's default 256KB threshold is tuned for a bare interpreter;
+       bootstrap.js + node_compat.js's one-time class/closure setup alone
+       gets within reach of it, which used to trigger a spurious cyclic GC
+       during startup (before any user code ran) on every invocation. Give
+       it real headroom rather than let that budget keep shrinking as more
+       builtin JS surface (node:* compat, future tasks) is added. */
+    JS_SetGCThreshold(runtime, 8 * 1024 * 1024);
+    if (leak_check) JS_SetDumpFlags(runtime, JS_ABORT_ON_LEAKS | JS_DUMP_MEM);
+    if (getenv("SXN_DUMP_BYTECODE")) JS_SetDumpFlags(runtime, JS_GetDumpFlags(runtime) | JS_DUMP_BYTECODE_FINAL);
     js_std_init_handlers(runtime);
     JSContext *context = JS_NewContext(runtime);
     if (!context) { JS_FreeRuntime(runtime); return 2; }
@@ -66,6 +70,10 @@ static int execute_file(int argc, char **argv) {
     js_std_add_helpers(context, argc - 1, argv + 1);
     if (sxn_install_network(context) != 0) {
         fputs("sxn: unable to initialize network runtime\n", stderr);
+        goto failure;
+    }
+    if (sxn_install_node_compat(context, argv[0]) != 0) {
+        fputs("sxn: unable to initialize node compatibility layer\n", stderr);
         goto failure;
     }
     JS_SetModuleLoaderFunc2(runtime, NULL, sxn_module_loader, js_module_check_attributes, NULL);
@@ -87,6 +95,15 @@ static int execute_file(int argc, char **argv) {
     if (JS_IsException(value)) { js_std_dump_error(context); JS_FreeValue(context, value); goto failure; }
     JS_FreeValue(context, value);
     if (js_std_loop(context)) { js_std_dump_error(context); goto failure; }
+    /* Drains any server sockets / async file reads registered by network.c;
+       a no-op that returns immediately for scripts that never called
+       Sxn.serve or Sxn.file(...).text(). */
+    if (sxn_run_event_loop(context)) { js_std_dump_error(context); goto failure; }
+    if (memory_report) {
+        JSMemoryUsage usage;
+        JS_ComputeMemoryUsage(runtime, &usage);
+        JS_DumpMemoryUsage(stderr, &usage, runtime);
+    }
     js_std_free_handlers(runtime); JS_FreeContext(context); JS_FreeRuntime(runtime); return 0;
 failure:
     if (source) js_free(context, source);
@@ -94,7 +111,7 @@ failure:
 }
 
 static void usage(void) {
-    puts("SXN 0.1.0\n"
+    puts("SXN 0.0.1\n"
          "Usage:\n"
          "  sxn <file.sx|file.js|file.mjs|file.cjs> [args...]\n"
          "  sxn run [script] -- [args...]\n"
@@ -103,17 +120,26 @@ static void usage(void) {
          "  sxn add [--dev] package[@range]\n"
          "  sxn remove package\n"
          "  sxn init\n"
+         "  sxn [--memory-report] [--leak-check] <file.sx|file.js|file.mjs|file.cjs> [args...]\n"
          "  sxn lsp --stdio\n"
          "  sxn --help | --version");
 }
 
 int main(int argc, char **argv) {
     if (argc < 2 || !strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) { usage(); return 0; }
-    if (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v")) { puts("sxn 0.1.0"); return 0; }
+    if (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v")) { puts("sxn 0.0.1"); return 0; }
     if (!strcmp(argv[1], "lsp")) return sxn_lsp_main();
     if (!strcmp(argv[1], "run") || !strcmp(argv[1], "install") || !strcmp(argv[1], "add") ||
         !strcmp(argv[1], "remove") || !strcmp(argv[1], "init")) return sxn_package_command(argc, argv);
-    if (!suffix(argv[1], ".sx") && !suffix(argv[1], ".js") && !suffix(argv[1], ".mjs") && !suffix(argv[1], ".cjs")) {
+    bool memory_report = false, leak_check = false;
+    int file_index = 1;
+    while (file_index < argc && (!strcmp(argv[file_index], "--memory-report") || !strcmp(argv[file_index], "--leak-check"))) {
+        if (!strcmp(argv[file_index], "--memory-report")) memory_report = true;
+        else leak_check = true;
+        ++file_index;
+    }
+    if (file_index >= argc) { usage(); return 2; }
+    if (!suffix(argv[file_index], ".sx") && !suffix(argv[file_index], ".js") && !suffix(argv[file_index], ".mjs") && !suffix(argv[file_index], ".cjs")) {
         char **run_argv = calloc((size_t)argc + 1, sizeof(*run_argv));
         if (!run_argv) return 2;
         run_argv[0] = argv[0]; run_argv[1] = "run";
@@ -121,5 +147,5 @@ int main(int argc, char **argv) {
         int status = sxn_package_command(argc + 1, run_argv);
         free(run_argv); return status;
     }
-    return execute_file(argc, argv);
+    return execute_file(argc, argv, argv[file_index], memory_report, leak_check);
 }

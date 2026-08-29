@@ -57,21 +57,6 @@ static int diagnostic(SxfeCompileResult *out, const char *source, SxfeDiagnostic
     return 0;
 }
 
-/* SX deliberately accepts only erasable TypeScript. Constructs that require emit are rejected. */
-static void validate_unsupported(const char *source, size_t length, SxfeCompileResult *out) {
-    const char *words[] = { "enum", "namespace", "decorator", "abstract" };
-    for (size_t w = 0; w < sizeof(words) / sizeof(words[0]); ++w) {
-        for (size_t i = 0; i < length; ++i) {
-            if (word_at(source, length, i, words[w])) {
-                char message[160];
-                snprintf(message, sizeof(message), "'%s' requires TypeScript code generation and is not supported in .sx", words[w]);
-                diagnostic(out, source, SX1001_UNSUPPORTED_SYNTAX, i, message);
-                break;
-            }
-        }
-    }
-}
-
 static size_t skip_string(const char *source, size_t length, size_t i) {
     char quote = source[i++];
     while (i < length) {
@@ -91,6 +76,28 @@ static size_t skip_comment(const char *source, size_t length, size_t i) {
         return i + (i + 1 < length ? 2 : 0);
     }
     return i;
+}
+
+/* SX deliberately accepts only erasable TypeScript. Constructs that require emit are rejected. */
+static void validate_unsupported(const char *source, size_t length, SxfeCompileResult *out) {
+    const char *words[] = { "enum", "namespace", "decorator", "abstract" };
+    bool reported[sizeof(words) / sizeof(words[0])] = {0};
+    /* Skip string/comment bodies so an occurrence of these words inside them
+       (e.g. a "// TODO: support enum" comment) doesn't misfire. */
+    for (size_t i = 0; i < length; ) {
+        if (source[i] == '\'' || source[i] == '"' || source[i] == '`') { i = skip_string(source, length, i); continue; }
+        size_t comment = skip_comment(source, length, i);
+        if (comment != i) { i = comment; continue; }
+        for (size_t w = 0; w < sizeof(words) / sizeof(words[0]); ++w) {
+            if (!reported[w] && word_at(source, length, i, words[w])) {
+                char message[160];
+                snprintf(message, sizeof(message), "'%s' requires TypeScript code generation and is not supported in .sx", words[w]);
+                diagnostic(out, source, SX1001_UNSUPPORTED_SYNTAX, i, message);
+                reported[w] = true;
+            }
+        }
+        ++i;
+    }
 }
 
 static size_t skip_declaration(const char *source, size_t length, size_t i) {
@@ -151,6 +158,52 @@ int sxfe_compile(const char *source, size_t length, SxfeCompileResult *out) {
             size_t end = skip_declaration(source, length, i);
             for (size_t p = i; p < end; ++p) if (source[p] == '\n' && append(&result, "\n", 1)) goto oom;
             i = end; continue;
+        }
+        /* Primitive FFI declarations are lowered to a host call until the
+           native SX parser grows first-class FFI bytecodes. */
+        if (word_at(source, length, i, "extern") || word_at(source, length, i, "using")) {
+            size_t end = i;
+            while (end < length && source[end] != ';') ++end;
+            if (end < length) ++end;
+            size_t p = i + (word_at(source, length, i, "extern") ? 6 : 5);
+            while (p < end && isspace((unsigned char)source[p])) ++p;
+            size_t ns = p; while (p < end && ident_char(source[p])) ++p;
+            size_t name_len = p - ns;
+            const char *from = strstr(source + p, "from");
+            const char *quote = from ? strchr(from, '"') : NULL;
+            const char *close = quote ? strchr(quote + 1, '"') : NULL;
+            const char *open = strchr(source + p, '(');
+            const char *colon = open ? strchr(open, ':') : NULL;
+            if (name_len && from && quote && close && open && colon) {
+                char line[1024];
+                int n = snprintf(line, sizeof(line),
+                    "const %.*s = (...args) => Sxn.ffi(\"%.*s\", \"%.*s\", \"%.*s\", args);",
+                    (int)name_len, source + ns, (int)(close - quote - 1), quote + 1,
+                    (int)name_len, source + ns, (int)(colon - open - 1), open + 1);
+                if (n < 0 || (size_t)n >= sizeof(line) || append(&result, line, (size_t)n)) goto oom;
+                i = end;
+                continue;
+            }
+            diagnostic(out, source, SX1002_INVALID_TYPE, i,
+                       "invalid FFI declaration; expected extern name(types): return from \"library\"");
+            i = end;
+            continue;
+        }
+        /* `safe` is a contextual declaration qualifier.  It is intentionally
+           erased by the compatibility frontend; the native SX parser will
+           attach the type contract to the resulting binding. */
+        if (word_at(source, length, i, "safe")) {
+            size_t j = i + 4;
+            while (j < length && isspace((unsigned char)source[j])) ++j;
+            if (word_at(source, length, j, "let") || word_at(source, length, j, "const")) {
+                i = j;
+                if (append(&result, "", 0)) goto oom;
+                continue;
+            }
+            if (word_at(source, length, j, "var")) {
+                diagnostic(out, source, SX1002_INVALID_TYPE, i,
+                           "safe may qualify only let or const declarations");
+            }
         }
         if (word_at(source, length, i, "let") || word_at(source, length, i, "const") || word_at(source, length, i, "var")) declaration_context = true;
         if (word_at(source, length, i, "let")) {

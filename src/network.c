@@ -1,11 +1,16 @@
 #include <quickjs.h>
+#include <quickjs-libc.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
+#include <openssl/rand.h>
 #include <curl/curl.h>
+#include <uv.h>
 #include "sxfe.h"
+#include "sxn_bootstrap.h"
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,19 +22,149 @@
 
 #define countof(x) (sizeof(x) / sizeof((x)[0]))
 
-static int send_all(int fd, const char *data, size_t length) {
-    while (length) {
-        ssize_t sent = send(fd, data, length, 0);
-        if (sent <= 0) return -1;
-        data += sent; length -= (size_t)sent;
+/* One process-wide loop, shared by the server socket and the async file
+   reader; main.c drives it via sxn_run_event_loop after top-level eval. */
+static uv_loop_t *sxn_loop(void) { return uv_default_loop(); }
+
+/* --- curl_multi driven by sxn_loop(), the standard "hiperfifo" pattern:
+   CURLMOPT_SOCKETFUNCTION/CURLMOPT_TIMERFUNCTION let libcurl drive
+   uv_poll_t/uv_timer_t handles instead of blocking inside
+   curl_easy_perform, so fetch() no longer stalls the runtime while a
+   response streams in. One multi handle for the whole process, matching
+   the one-loop-per-process design of sxn_loop(). */
+static CURLM *sxn_curl_multi = NULL;
+static uv_timer_t sxn_curl_timer;
+
+typedef struct CurlSocketCtx { uv_poll_t poll_handle; curl_socket_t sockfd; } CurlSocketCtx;
+
+static void sxn_curl_check_multi_info(void);
+
+static void curl_socket_close_cb(uv_handle_t *handle) { free(handle->data); }
+
+static void curl_poll_cb(uv_poll_t *handle, int status, int events) {
+    CurlSocketCtx *sc = (CurlSocketCtx *)handle->data;
+    int flags = 0, running = 0;
+    if (status < 0) flags = CURL_CSELECT_ERR;
+    else {
+        if (events & UV_READABLE) flags |= CURL_CSELECT_IN;
+        if (events & UV_WRITABLE) flags |= CURL_CSELECT_OUT;
     }
+    curl_multi_socket_action(sxn_curl_multi, sc->sockfd, flags, &running);
+    sxn_curl_check_multi_info();
+}
+
+static int curl_handle_socket_cb(CURL *easy, curl_socket_t s, int action, void *userp, void *socketp) {
+    (void)easy; (void)userp;
+    if (action == CURL_POLL_REMOVE) {
+        if (socketp) {
+            CurlSocketCtx *sc = (CurlSocketCtx *)socketp;
+            uv_poll_stop(&sc->poll_handle);
+            uv_close((uv_handle_t *)&sc->poll_handle, curl_socket_close_cb);
+            curl_multi_assign(sxn_curl_multi, s, NULL);
+        }
+        return 0;
+    }
+    CurlSocketCtx *sc = (CurlSocketCtx *)socketp;
+    if (!sc) {
+        sc = malloc(sizeof(*sc));
+        uv_poll_init_socket(sxn_loop(), &sc->poll_handle, s);
+        sc->poll_handle.data = sc; sc->sockfd = s;
+        curl_multi_assign(sxn_curl_multi, s, sc);
+    }
+    int events = 0;
+    if (action != CURL_POLL_IN) events |= UV_WRITABLE;
+    if (action != CURL_POLL_OUT) events |= UV_READABLE;
+    uv_poll_start(&sc->poll_handle, events, curl_poll_cb);
     return 0;
 }
+
+static void curl_timeout_cb(uv_timer_t *handle) {
+    (void)handle;
+    int running = 0;
+    curl_multi_socket_action(sxn_curl_multi, CURL_SOCKET_TIMEOUT, 0, &running);
+    sxn_curl_check_multi_info();
+}
+
+static int curl_start_timeout_cb(CURLM *multi, long timeout_ms, void *userp) {
+    (void)multi; (void)userp;
+    if (timeout_ms < 0) { uv_timer_stop(&sxn_curl_timer); return 0; }
+    if (timeout_ms == 0) timeout_ms = 1; /* uv_timer_start(0) fires immediately; force one loop tick instead */
+    uv_timer_start(&sxn_curl_timer, curl_timeout_cb, (uint64_t)timeout_ms, 0);
+    return 0;
+}
+
+static void sxn_curl_multi_init(void) {
+    if (sxn_curl_multi) return;
+    sxn_curl_multi = curl_multi_init();
+    uv_timer_init(sxn_loop(), &sxn_curl_timer);
+    curl_multi_setopt(sxn_curl_multi, CURLMOPT_SOCKETFUNCTION, curl_handle_socket_cb);
+    curl_multi_setopt(sxn_curl_multi, CURLMOPT_TIMERFUNCTION, curl_start_timeout_cb);
+}
+
+/* Grow-as-you-go byte buffer used to assemble a whole HTTP response before
+   handing it to a single uv_write, mirroring the byte stream the old
+   blocking send_all() calls produced. */
+typedef struct DynBuf { char *data; size_t length, cap; } DynBuf;
+static void dynbuf_append(DynBuf *buf, const void *data, size_t n) {
+    if (buf->length + n > buf->cap) {
+        size_t cap = buf->cap ? buf->cap * 2 : 256;
+        while (cap < buf->length + n) cap *= 2;
+        buf->data = realloc(buf->data, cap); buf->cap = cap;
+    }
+    memcpy(buf->data + buf->length, data, n); buf->length += n;
+}
+static void dynbuf_puts(DynBuf *buf, const char *s) { dynbuf_append(buf, s, strlen(s)); }
+
+/* Forward declarations for the SxnChunkView borrow-lock machinery (full
+   definitions further down, alongside FetchState/ChunkNode -- see that
+   section's doc comment). conn_read_cb below needs to detect and
+   zero-copy-append a BorrowedChunk passed as a served response body (the
+   file-serving primitive added alongside Sxn.file(path).readBorrowed()),
+   reusing the exact same borrow-guarded mechanism built for streamed fetch
+   chunks rather than inventing a second one. */
+typedef struct SxnChunkViewState SxnChunkViewState;
+static JSClassID sxn_chunkview_class_id;
+static JSValue sxn_chunkview_acquire(JSContext *ctx, SxnChunkViewState *st, int exclusive, JSValue *out_buffer);
+static void sxn_chunkview_release_shared(SxnChunkViewState *st);
 
 static const char *reason(int status) {
     switch (status) { case 200: return "OK"; case 201: return "Created"; case 204: return "No Content";
         case 400: return "Bad Request"; case 404: return "Not Found"; case 500: return "Internal Server Error";
         default: return "Response"; }
+}
+
+static JSValue sxn_memory_usage(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSMemoryUsage mem;
+    JSGCStats gc;
+    JS_ComputeMemoryUsage(rt, &mem);
+    JS_GetGCStats(rt, &gc);
+    JSValue result = JS_NewObject(ctx);
+    if (JS_IsException(result)) return result;
+#define MEM_FIELD(name, value) \
+    JS_SetPropertyStr(ctx, result, name, JS_NewInt64(ctx, (int64_t)(value)))
+    MEM_FIELD("mallocSize", mem.malloc_size);
+    MEM_FIELD("memoryUsed", mem.memory_used_size);
+    MEM_FIELD("objects", mem.obj_count);
+    MEM_FIELD("strings", mem.str_count);
+    MEM_FIELD("atoms", mem.atom_count);
+    MEM_FIELD("shapes", mem.shape_count);
+    MEM_FIELD("bytecodeBytes", mem.js_func_code_size);
+    MEM_FIELD("gcCount", gc.count);
+    MEM_FIELD("gcTotalNs", gc.total_ns);
+    MEM_FIELD("gcLastNs", gc.last_ns);
+    MEM_FIELD("gcMaxNs", gc.max_ns);
+#undef MEM_FIELD
+    return result;
+}
+
+static JSValue sxn_ffi(JSContext *ctx, JSValueConst this_val, int argc,
+                       JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    return JS_ThrowTypeError(ctx,
+        "FFI calls require the native SX parser/ABI backend (not enabled in this build)");
 }
 
 static char *header_value(char *request, const char *name) {
@@ -45,7 +180,7 @@ static char *header_value(char *request, const char *name) {
     return NULL;
 }
 
-static int websocket_handshake(int fd, const char *key) {
+static void websocket_handshake(DynBuf *out, const char *key) {
     char joined[256], encoded[64], response[512];
     unsigned char digest[SHA_DIGEST_LENGTH];
     snprintf(joined, sizeof(joined), "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key);
@@ -53,123 +188,1316 @@ static int websocket_handshake(int fd, const char *key) {
     EVP_EncodeBlock((unsigned char *)encoded, digest, SHA_DIGEST_LENGTH);
     int n = snprintf(response, sizeof(response),
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", encoded);
-    return send_all(fd, response, (size_t)n);
+    dynbuf_append(out, response, (size_t)n);
 }
 
-static int websocket_text(int fd, const char *text) {
+static void websocket_text(DynBuf *out, const char *text) {
     size_t length = strlen(text); unsigned char header[10]; size_t h = 0;
     header[h++] = 0x81;
     if (length < 126) header[h++] = (unsigned char)length;
     else if (length <= 65535) { header[h++] = 126; header[h++] = (length >> 8) & 255; header[h++] = length & 255; }
-    else return -1;
-    return send(fd, header, h, 0) == (ssize_t)h && send_all(fd, text, length) == 0 ? 0 : -1;
+    else return;
+    dynbuf_append(out, header, h); dynbuf_append(out, text, length);
+}
+
+/* Shared by every accepted connection: the JS handler is looked up once per
+   Sxn.serve() call and kept alive (JS_DupValue) for the server's lifetime. */
+typedef struct ServeState { JSContext *ctx; JSValue handler; } ServeState;
+
+/* Per-connection state: outlives the read/parse/dispatch step so the
+   assembled response survives until the uv_write completes. */
+typedef struct ConnState { ServeState *serve; uv_tcp_t handle; char *write_data; } ConnState;
+
+static void conn_close_cb(uv_handle_t *handle) {
+    ConnState *conn = (ConnState *)handle->data;
+    free(conn->write_data); free(conn);
+}
+
+static void conn_write_cb(uv_write_t *req, int status) {
+    (void)status;
+    ConnState *conn = (ConnState *)req->data; free(req);
+    uv_close((uv_handle_t *)&conn->handle, conn_close_cb);
+}
+
+static void conn_alloc_cb(uv_handle_t *handle, size_t suggested, uv_buf_t *buf) {
+    (void)handle; (void)suggested;
+    buf->base = malloc(65536); buf->len = buf->base ? 65535 : 0; /* room for a trailing NUL */
+}
+
+static void conn_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
+    ConnState *conn = (ConnState *)stream->data;
+    uv_read_stop(stream);
+    if (nread <= 0) { free(buf->base); uv_close((uv_handle_t *)&conn->handle, conn_close_cb); return; }
+    JSContext *ctx = conn->serve->ctx;
+    char *request = buf->base; request[nread] = 0;
+    char method[16] = {0}, url[4096] = {0}; sscanf(request, "%15s %4095s", method, url);
+    char *body = strstr(request, "\r\n\r\n"); body = body ? body + 4 : request + nread;
+    char *ws_key = header_value(request, "Sec-WebSocket-Key");
+    char *upgrade = header_value(request, "Upgrade");
+    JSValue req_obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, req_obj, "method", JS_NewString(ctx, method));
+    JS_SetPropertyStr(ctx, req_obj, "url", JS_NewString(ctx, url));
+    JS_SetPropertyStr(ctx, req_obj, "body", JS_NewString(ctx, body));
+    JSValue headers = JS_NewObject(ctx);
+    if (upgrade) JS_SetPropertyStr(ctx, headers, "upgrade", JS_NewString(ctx, upgrade));
+    JS_SetPropertyStr(ctx, req_obj, "headers", headers);
+    JSValue result = JS_Call(ctx, conn->serve->handler, JS_UNDEFINED, 1, &req_obj); JS_FreeValue(ctx, req_obj);
+
+    DynBuf out = {0};
+    if (JS_IsException(result)) {
+        JS_FreeValue(ctx, result);
+        dynbuf_puts(&out, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+    } else {
+        JSValue mode_value = JS_GetPropertyStr(ctx, result, "mode"); const char *mode = JS_ToCString(ctx, mode_value);
+        if (mode && !strcmp(mode, "websocket") && upgrade && ws_key) {
+            websocket_handshake(&out, ws_key);
+            JSValue messages = JS_GetPropertyStr(ctx, result, "wsMessages"); uint32_t length = 0; JSValue size = JS_GetPropertyStr(ctx, messages, "length"); JS_ToUint32(ctx, &length, size); JS_FreeValue(ctx, size);
+            for (uint32_t i = 0; i < length; ++i) { JSValue item = JS_GetPropertyUint32(ctx, messages, i); const char *text = JS_ToCString(ctx, item); if (text) websocket_text(&out, text); JS_FreeCString(ctx, text); JS_FreeValue(ctx, item); }
+            JS_FreeValue(ctx, messages);
+        } else if (mode && !strcmp(mode, "sse")) {
+            dynbuf_puts(&out, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n");
+            JSValue events = JS_GetPropertyStr(ctx, result, "events"); uint32_t length = 0; JSValue size = JS_GetPropertyStr(ctx, events, "length"); JS_ToUint32(ctx, &length, size); JS_FreeValue(ctx, size);
+            for (uint32_t i = 0; i < length; ++i) {
+                JSValue event = JS_GetPropertyUint32(ctx, events, i); JSValue data = JS_GetPropertyStr(ctx, event, "data"); JSValue type = JS_GetPropertyStr(ctx, event, "event"); JSValue id = JS_GetPropertyStr(ctx, event, "id");
+                const char *text = JS_ToCString(ctx, data), *event_name = JS_ToCString(ctx, type), *event_id = JS_ToCString(ctx, id);
+                char full[4096]; int n;
+                if (event_id) n = snprintf(full, sizeof(full), "event: %s\nid: %s\ndata: %s\n\n", event_name ? event_name : "message", event_id, text ? text : "");
+                else n = snprintf(full, sizeof(full), "%s%s%sdata: %s\n\n", event_name ? "event: " : "", event_name ? event_name : "", event_name ? "\n" : "", text ? text : "");
+                dynbuf_append(&out, full, (size_t)n);
+                JS_FreeCString(ctx, text); JS_FreeCString(ctx, event_name); JS_FreeCString(ctx, event_id); JS_FreeValue(ctx, data); JS_FreeValue(ctx, type); JS_FreeValue(ctx, id); JS_FreeValue(ctx, event);
+            }
+            JS_FreeValue(ctx, events);
+        } else {
+            int32_t status = 200; JSValue status_value = JS_GetPropertyStr(ctx, result, "statusCode"); JS_ToInt32(ctx, &status, status_value); JS_FreeValue(ctx, status_value);
+            JSValue body_value = JS_GetPropertyStr(ctx, result, "body");
+
+            /* Binary-safe body handling: the old code below unconditionally
+               JS_ToCString+strlen'd the body, which silently mangled (wrong
+               bytes, via JS's string-conversion of a typed array) and
+               truncated (strlen stops at the first 0x00) any binary
+               response -- there was no correct way to serve non-text
+               content. Checked cheapest/most-specific first:
+                 1. a BorrowedChunk (Sxn.file(path).readBorrowed()'s result)
+                    -- zero-copy: acquire a shared borrow, copy its bytes
+                    straight into `out`, release immediately. Reuses the
+                    exact SxnBorrow machinery Task 4 built for streamed
+                    fetch chunks -- see this file's borrow-lock doc comment.
+                 2. a Blob (bootstrap.js) -- bytes live in a plain Uint8Array.
+                 3. a raw Uint8Array/Uint8ClampedArray/ArrayBuffer.
+               Anything else (the common case) falls through to the
+               original JS_ToCString string path, unchanged. */
+            const uint8_t *body_bytes = NULL; size_t body_len = 0;
+            const char *body_text = NULL;
+            const char *content_type = "text/plain; charset=utf-8";
+            int is_binary = 0;
+            SxnChunkViewState *borrowed_cv = JS_GetOpaque(body_value, sxn_chunkview_class_id);
+            JSValue borrow_u8 = JS_UNDEFINED, borrow_buffer = JS_UNDEFINED;
+            JSValue blob_bytes_value = JS_UNDEFINED, blob_type_value = JS_UNDEFINED;
+            const char *blob_type_cstr = NULL;
+
+            if (borrowed_cv) {
+                JSValue u8 = sxn_chunkview_acquire(ctx, borrowed_cv, 0 /* shared: read-only, allows concurrent borrows across requests */, &borrow_buffer);
+                if (!JS_IsException(u8)) {
+                    size_t n = 0; uint8_t *p = JS_GetUint8Array(ctx, &n, u8);
+                    body_bytes = p; body_len = n; is_binary = 1; content_type = "application/octet-stream";
+                    borrow_u8 = u8;
+                } else {
+                    JS_FreeValue(ctx, JS_GetException(ctx)); /* conflict/retired: surface as 500, don't stringify the BorrowedChunk object */
+                    status = 500; is_binary = 1;
+                }
+            } else {
+                JSValue global = JS_GetGlobalObject(ctx);
+                JSValue blob_ctor = JS_GetPropertyStr(ctx, global, "Blob");
+                JS_FreeValue(ctx, global);
+                int is_blob = JS_IsFunction(ctx, blob_ctor) && JS_IsInstanceOf(ctx, body_value, blob_ctor) > 0;
+                JS_FreeValue(ctx, blob_ctor);
+                if (is_blob) {
+                    blob_bytes_value = JS_GetPropertyStr(ctx, body_value, "_bytes");
+                    blob_type_value = JS_GetPropertyStr(ctx, body_value, "type");
+                    size_t n = 0; uint8_t *p = JS_GetUint8Array(ctx, &n, blob_bytes_value);
+                    if (p) {
+                        body_bytes = p; body_len = n; is_binary = 1;
+                        blob_type_cstr = JS_ToCString(ctx, blob_type_value);
+                        content_type = (blob_type_cstr && blob_type_cstr[0]) ? blob_type_cstr : "application/octet-stream";
+                    }
+                } else {
+                    int tt = JS_GetTypedArrayType(body_value);
+                    if (tt == JS_TYPED_ARRAY_UINT8 || tt == JS_TYPED_ARRAY_UINT8C) {
+                        size_t n = 0; uint8_t *p = JS_GetUint8Array(ctx, &n, body_value);
+                        if (p) { body_bytes = p; body_len = n; is_binary = 1; content_type = "application/octet-stream"; }
+                    } else if (JS_IsArrayBuffer(body_value)) {
+                        size_t n = 0; uint8_t *p = JS_GetArrayBuffer(ctx, &n, body_value);
+                        if (p) { body_bytes = p; body_len = n; is_binary = 1; content_type = "application/octet-stream"; }
+                    }
+                }
+            }
+
+            if (!is_binary) { body_text = JS_ToCString(ctx, body_value); body_len = body_text ? strlen(body_text) : 0; }
+
+            char head[512]; int n = snprintf(head, sizeof(head), "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\nConnection: close\r\nContent-Type: %s\r\n\r\n", status, reason(status), body_len, content_type);
+            dynbuf_append(&out, head, (size_t)n);
+            if (is_binary) { if (body_bytes) dynbuf_append(&out, body_bytes, body_len); }
+            else if (body_text) dynbuf_append(&out, body_text, body_len);
+
+            if (borrowed_cv && !JS_IsUndefined(borrow_u8)) {
+                JS_FreeValue(ctx, borrow_u8);
+                JS_DetachArrayBuffer(ctx, borrow_buffer); /* ends this borrow's visibility, same as withSharedBorrow */
+                JS_FreeValue(ctx, borrow_buffer);
+                sxn_chunkview_release_shared(borrowed_cv);
+            }
+            if (blob_type_cstr) JS_FreeCString(ctx, blob_type_cstr);
+            JS_FreeValue(ctx, blob_type_value);
+            JS_FreeValue(ctx, blob_bytes_value);
+            if (body_text) JS_FreeCString(ctx, body_text);
+            JS_FreeValue(ctx, body_value);
+        }
+        JS_FreeCString(ctx, mode); JS_FreeValue(ctx, mode_value); JS_FreeValue(ctx, result);
+    }
+    free(buf->base);
+
+    conn->write_data = out.data;
+    uv_write_t *write_req = malloc(sizeof(*write_req)); write_req->data = conn;
+    uv_buf_t write_buf = uv_buf_init(out.data, (unsigned)out.length);
+    uv_write(write_req, stream, &write_buf, 1, conn_write_cb);
+}
+
+static void on_connection_cb(uv_stream_t *server_handle, int status) {
+    if (status < 0) return;
+    ServeState *serve = (ServeState *)server_handle->data;
+    ConnState *conn = calloc(1, sizeof(*conn)); conn->serve = serve;
+    uv_tcp_init(sxn_loop(), &conn->handle); conn->handle.data = conn;
+    if (uv_accept(server_handle, (uv_stream_t *)&conn->handle) == 0)
+        uv_read_start((uv_stream_t *)&conn->handle, conn_alloc_cb, conn_read_cb);
+    else
+        uv_close((uv_handle_t *)&conn->handle, conn_close_cb);
 }
 
 static JSValue js_serve(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     int32_t port = 3000;
     if (argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_ThrowTypeError(ctx, "serve(options, handler) requires a handler");
     JSValue port_value = JS_GetPropertyStr(ctx, argv[0], "port"); JS_ToInt32(ctx, &port, port_value); JS_FreeValue(ctx, port_value);
-    int server = socket(AF_INET, SOCK_STREAM, 0), enabled = 1;
-    if (server < 0) return JS_ThrowInternalError(ctx, "socket: %s", strerror(errno));
-    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
-    struct sockaddr_in address = {0}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK); address.sin_port = htons((uint16_t)port);
-    if (bind(server, (struct sockaddr *)&address, sizeof(address)) || listen(server, 64)) {
-        close(server); return JS_ThrowInternalError(ctx, "listen on %d: %s", port, strerror(errno));
+
+    ServeState *serve = malloc(sizeof(*serve)); serve->ctx = ctx; serve->handler = JS_DupValue(ctx, argv[1]);
+    uv_tcp_t *server = malloc(sizeof(*server));
+    uv_tcp_init(sxn_loop(), server); server->data = serve;
+    struct sockaddr_in address; uv_ip4_addr("127.0.0.1", port, &address);
+    int rc = uv_tcp_bind(server, (const struct sockaddr *)&address, 0);
+    if (rc == 0) rc = uv_listen((uv_stream_t *)server, 64, on_connection_cb);
+    if (rc != 0) {
+        free(server); JS_FreeValue(ctx, serve->handler); free(serve);
+        return JS_ThrowInternalError(ctx, "listen on %d: %s", port, uv_strerror(rc));
     }
-    for (;;) {
-        int client = accept(server, NULL, NULL); if (client < 0) { if (errno == EINTR) continue; break; }
-        char buffer[65536]; ssize_t got = recv(client, buffer, sizeof(buffer) - 1, 0);
-        if (got <= 0) { close(client); continue; } buffer[got] = 0;
-        char method[16] = {0}, url[4096] = {0}; sscanf(buffer, "%15s %4095s", method, url);
-        char *body = strstr(buffer, "\r\n\r\n"); body = body ? body + 4 : buffer + got;
-        char *ws_key = header_value(buffer, "Sec-WebSocket-Key");
-        char *upgrade = header_value(buffer, "Upgrade");
-        JSValue request = JS_NewObject(ctx);
-        JS_SetPropertyStr(ctx, request, "method", JS_NewString(ctx, method));
-        JS_SetPropertyStr(ctx, request, "url", JS_NewString(ctx, url));
-        JS_SetPropertyStr(ctx, request, "body", JS_NewString(ctx, body));
-        JSValue headers = JS_NewObject(ctx);
-        if (upgrade) JS_SetPropertyStr(ctx, headers, "upgrade", JS_NewString(ctx, upgrade));
-        JS_SetPropertyStr(ctx, request, "headers", headers);
-        JSValue result = JS_Call(ctx, argv[1], JS_UNDEFINED, 1, &request); JS_FreeValue(ctx, request);
-        if (JS_IsException(result)) { JS_FreeValue(ctx, result); send_all(client, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n", 57); close(client); continue; }
-        JSValue mode_value = JS_GetPropertyStr(ctx, result, "mode"); const char *mode = JS_ToCString(ctx, mode_value);
-        if (mode && !strcmp(mode, "websocket") && upgrade && ws_key) {
-            websocket_handshake(client, ws_key);
-            JSValue messages = JS_GetPropertyStr(ctx, result, "wsMessages"); uint32_t length = 0; JSValue size = JS_GetPropertyStr(ctx, messages, "length"); JS_ToUint32(ctx, &length, size); JS_FreeValue(ctx, size);
-            for (uint32_t i = 0; i < length; ++i) { JSValue item = JS_GetPropertyUint32(ctx, messages, i); const char *text = JS_ToCString(ctx, item); if (text) websocket_text(client, text); JS_FreeCString(ctx, text); JS_FreeValue(ctx, item); }
-            JS_FreeValue(ctx, messages);
-        } else if (mode && !strcmp(mode, "sse")) {
-            const char *sse_head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"; send_all(client, sse_head, strlen(sse_head));
-            JSValue events = JS_GetPropertyStr(ctx, result, "events"); uint32_t length = 0; JSValue size = JS_GetPropertyStr(ctx, events, "length"); JS_ToUint32(ctx, &length, size); JS_FreeValue(ctx, size);
-            for (uint32_t i = 0; i < length; ++i) { JSValue event = JS_GetPropertyUint32(ctx, events, i); JSValue data = JS_GetPropertyStr(ctx, event, "data"); JSValue type = JS_GetPropertyStr(ctx, event, "event"); JSValue id = JS_GetPropertyStr(ctx, event, "id"); const char *text = JS_ToCString(ctx, data), *event_name = JS_ToCString(ctx, type), *event_id = JS_ToCString(ctx, id); char line[4096]; int n = snprintf(line, sizeof(line), "%s%s%s%sdata: %s\n\n", event_name ? "event: " : "", event_name ? event_name : "", event_name ? "\n" : "", event_id ? "id: " : "", text ? text : ""); if (event_id) { char full[4096]; n = snprintf(full, sizeof(full), "event: %s\nid: %s\ndata: %s\n\n", event_name ? event_name : "message", event_id, text ? text : ""); send_all(client, full, (size_t)n); } else send_all(client, line, (size_t)n); JS_FreeCString(ctx, text); JS_FreeCString(ctx, event_name); JS_FreeCString(ctx, event_id); JS_FreeValue(ctx, data); JS_FreeValue(ctx, type); JS_FreeValue(ctx, id); JS_FreeValue(ctx, event); }
-            JS_FreeValue(ctx, events);
-        } else {
-            int32_t status = 200; JSValue status_value = JS_GetPropertyStr(ctx, result, "statusCode"); JS_ToInt32(ctx, &status, status_value); JS_FreeValue(ctx, status_value);
-            JSValue body_value = JS_GetPropertyStr(ctx, result, "body"); const char *body = JS_ToCString(ctx, body_value); size_t length = body ? strlen(body) : 0;
-            char head[512]; int n = snprintf(head, sizeof(head), "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n", status, reason(status), length);
-            send_all(client, head, (size_t)n); if (body) send_all(client, body, length); JS_FreeCString(ctx, body); JS_FreeValue(ctx, body_value);
-        }
-        JS_FreeCString(ctx, mode); JS_FreeValue(ctx, mode_value); JS_FreeValue(ctx, result); close(client);
-    }
-    close(server); return JS_UNDEFINED;
+    return JS_UNDEFINED;
 }
 
-typedef struct FetchBuffer { char *data; size_t length; } FetchBuffer;
-static size_t fetch_write(char *data, size_t size, size_t count, void *opaque) {
-    FetchBuffer *buffer = opaque; size_t amount = size * count;
-    char *next = realloc(buffer->data, buffer->length + amount + 1); if (!next) return 0;
-    buffer->data = next; memcpy(next + buffer->length, data, amount); buffer->length += amount; next[buffer->length] = 0; return amount;
-}
-static JSValue fetch_text(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    return JS_GetPropertyStr(ctx, this_val, "_body");
-}
-static JSValue fetch_json(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    JSValue body = JS_GetPropertyStr(ctx, this_val, "_body"); size_t length = 0; const char *text = JS_ToCStringLen(ctx, &length, body);
-    JSValue result = text ? JS_ParseJSON(ctx, text, length, "<fetch>") : JS_EXCEPTION; JS_FreeCString(ctx, text); JS_FreeValue(ctx, body); return result;
-}
-static JSValue js_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    const char *url = argc ? JS_ToCString(ctx, argv[0]) : NULL; if (!url) return JS_EXCEPTION;
-    const char *method = NULL, *request_body = NULL;
-    JSValue method_value = JS_UNDEFINED, body_value = JS_UNDEFINED;
-    if (argc > 1 && JS_IsObject(argv[1])) {
-        method_value = JS_GetPropertyStr(ctx, argv[1], "method");
-        if (!JS_IsUndefined(method_value)) method = JS_ToCString(ctx, method_value);
-        body_value = JS_GetPropertyStr(ctx, argv[1], "body");
-        if (!JS_IsUndefined(body_value)) request_body = JS_ToCString(ctx, body_value);
+/* --- Streaming fetch() -----------------------------------------------
+   FetchState is shared between the curl_multi callbacks (which own one
+   refcount share until the transfer finishes or is torn down) and the
+   native "stream" object exposed to JS as response.body (which owns
+   another share, released by its GC finalizer). Response head data
+   (status/headers) is pure bookkeeping done here in C because it has to
+   be assembled from libcurl callbacks; Headers/Response/fetch() itself
+   are plain JS in bootstrap.js since that's pure spec logic. */
+/* --- Borrow lock: guards native chunk memory handed to JS zero-copy -----
+   (Task 4.) Nothing in this codebase constructs an SX20xx diagnostic
+   before this file: include/sxfe.h's SX2001-SX2004 were unused enum
+   values (only referenced by frontend.c's name-lookup switch), and there
+   is no compile-time borrow checker anywhere -- this is the first real
+   runtime use of one of them (SX2002_BORROW_CONFLICT, in
+   sxn_throw_borrow_conflict below), and it stays a runtime notion only.
+
+   Single-threaded-cooperative, like the rest of this file: fetch_write_cb
+   (libcurl's data callback) only ever runs from inside curl_multi_socket_action,
+   which is only ever called from the uv_poll/uv_timer callbacks driven by
+   sxn_run_event_loop's uv_run(loop, UV_RUN_ONCE) below -- see the hiperfifo
+   wiring above sxn_curl_multi. Every JS-side acquire/release call likewise
+   only runs on that same main-thread call stack (QuickJS is not
+   reentered from any other thread anywhere in this codebase). So a plain
+   int flag/counter, unguarded by atomics or an OS mutex, is a correct and
+   sufficient lock -- there is no concurrent OS thread that could ever
+   observe or mutate it mid-update. */
+typedef struct SxnBorrow {
+    int exclusive;      /* 1 while an exclusive (read/write) borrow is held */
+    int shared_count;   /* number of concurrently outstanding shared (read-only) borrows */
+} SxnBorrow;
+
+static int sxn_borrow_busy(const SxnBorrow *b) { return b->exclusive || b->shared_count > 0; }
+static int sxn_borrow_acquire_shared(SxnBorrow *b) { if (b->exclusive) return 0; b->shared_count++; return 1; }
+static int sxn_borrow_acquire_exclusive(SxnBorrow *b) { if (sxn_borrow_busy(b)) return 0; b->exclusive = 1; return 1; }
+static void sxn_borrow_release_shared(SxnBorrow *b) { if (b->shared_count > 0) b->shared_count--; }
+static void sxn_borrow_release_exclusive(SxnBorrow *b) { b->exclusive = 0; }
+
+typedef struct ChunkNode {
+    struct ChunkNode *next;
+    uint8_t *data;
+    size_t len;
+    /* Only meaningful once this node has been handed to JS zero-copy via
+       readBorrowed() (see SxnChunkView, below stream_cancel) -- a node
+       still sitting in fs->head/fs->tail (the plain, copy-based read()
+       path, unchanged by Task 4) never touches these. */
+    SxnBorrow borrow;
+    struct FetchState *owner;  /* fs this node is registered with, for fetch_chunks_free's deferred-free walk; NULL once that walk has run */
+    int pending_free;          /* fetch_chunks_free wanted to free this node's data but a borrow was outstanding; a matching release() finishes the job instead */
+    int retired;                /* data already freed (immediately, or via a deferred release) */
+} ChunkNode;
+
+/* The JS-visible handle readBorrowed() hands back. Deliberately not a
+   plain Uint8Array: its bytes are reachable only while a borrow is held
+   (withSharedBorrow/withExclusiveBorrow hand a scope-limited Uint8Array to
+   the callback and detach it the instant the callback returns;
+   acquireExclusive/acquireShared+release hand back a view that stays live
+   until release() detaches it). That is what makes "hold a borrow across
+   an await" a well-defined thing to test, and what makes
+   fetch_chunks_free's defer-until-released logic below load-bearing:
+   outside of an active borrow there is no way for JS to read node->data,
+   so once no borrow is outstanding it is genuinely safe to free. */
+typedef struct SxnChunkViewState {
+    ChunkNode *node;
+    JSValue held_buffer;   /* JS_UNDEFINED unless acquireExclusive()/acquireShared() is outstanding */
+    int held_exclusive;
+} SxnChunkViewState;
+
+typedef struct FetchState {
+    JSContext *ctx;
+    CURL *easy;
+    struct curl_slist *req_headers;
+    char *request_body;
+    char *url;
+
+    long status;
+    char status_text[128];
+    JSValue header_pairs;      /* flat [name, value, ...] JS array */
+    int response_started;
+    JSValue resolve_fetch, reject_fetch;
+
+    ChunkNode *head, *tail;
+    ChunkNode *borrowed;         /* chunks delivered via readBorrowed(), tracked so cancel()/teardown can find & defer-free them (see fetch_chunks_free) */
+    JSValue pending_read_resolve, pending_read_reject;
+    int has_pending_read;
+    int pending_read_borrowed;   /* the outstanding pending read is a readBorrowed() call, not a plain read() */
+    int done, errored, aborted;
+    char error_msg[256];
+
+    int refcount;
+} FetchState;
+
+static JSClassID sxn_stream_class_id;
+/* sxn_chunkview_class_id is forward-declared near the top of this file (see
+   conn_read_cb's needs); this is its one definition. */
+
+static void fetch_state_incref(FetchState *fs) { fs->refcount++; }
+
+static void fetch_chunks_free(FetchState *fs) {
+    while (fs->head) { ChunkNode *n = fs->head; fs->head = n->next; free(n->data); free(n); }
+    fs->tail = NULL;
+    /* Chunks delivered zero-copy via readBorrowed() (SxnChunkView, below):
+       this is the actual hazard Task 4 guards against -- a JS script can
+       be mid-borrow (acquireExclusive()/withExclusiveBorrow()) on one of
+       these the moment cancel()/abort()/final teardown reaches here. Free
+       immediately only if unborrowed; otherwise defer to whichever
+       release() brings that specific node's borrow count back to zero --
+       tracked per node, so a borrow on one chunk never blocks freeing any
+       other. */
+    ChunkNode *n = fs->borrowed;
+    fs->borrowed = NULL;
+    while (n) {
+        ChunkNode *next = n->next;
+        n->owner = NULL; /* fs is done tracking it either way */
+        if (sxn_borrow_busy(&n->borrow)) n->pending_free = 1;
+        else { free(n->data); n->data = NULL; n->retired = 1; }
+        n = next;
     }
-    CURL *curl = curl_easy_init(); FetchBuffer buffer = {0}; long status = 0;
-    if (!curl) { JS_FreeCString(ctx, url); return JS_ThrowInternalError(ctx, "curl initialization failed"); }
-    curl_easy_setopt(curl, CURLOPT_URL, url); curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    if (method) curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
-    if (request_body) curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request_body);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, fetch_write); curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "sxn/0.1"); CURLcode code = curl_easy_perform(curl);
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status); curl_easy_cleanup(curl); JS_FreeCString(ctx, url);
-    JS_FreeCString(ctx, method); JS_FreeCString(ctx, request_body); JS_FreeValue(ctx, method_value); JS_FreeValue(ctx, body_value);
-    if (code != CURLE_OK) { free(buffer.data); return JS_ThrowInternalError(ctx, "fetch failed: %s", curl_easy_strerror(code)); }
-    JSValue result = JS_NewObject(ctx); JS_SetPropertyStr(ctx, result, "status", JS_NewInt32(ctx, (int)status));
-    JS_SetPropertyStr(ctx, result, "ok", JS_NewBool(ctx, status >= 200 && status < 300));
-    JS_SetPropertyStr(ctx, result, "_body", JS_NewStringLen(ctx, buffer.data ? buffer.data : "", buffer.length));
-    JS_SetPropertyStr(ctx, result, "text", JS_NewCFunction(ctx, fetch_text, "text", 0));
-    JS_SetPropertyStr(ctx, result, "json", JS_NewCFunction(ctx, fetch_json, "json", 0)); free(buffer.data); return result;
+}
+
+static void fetch_state_decref(FetchState *fs) {
+    if (--fs->refcount > 0) return;
+    fetch_chunks_free(fs);
+    JS_FreeValue(fs->ctx, fs->header_pairs);
+    JS_FreeValue(fs->ctx, fs->resolve_fetch);
+    JS_FreeValue(fs->ctx, fs->reject_fetch);
+    JS_FreeValue(fs->ctx, fs->pending_read_resolve);
+    JS_FreeValue(fs->ctx, fs->pending_read_reject);
+    free(fs->request_body); free(fs->url);
+    if (fs->req_headers) curl_slist_free_all(fs->req_headers);
+    free(fs);
+}
+
+static JSValue make_named_error(JSContext *ctx, const char *name, const char *message) {
+    JSValue err = JS_NewError(ctx);
+    JS_SetPropertyStr(ctx, err, "name", JS_NewString(ctx, name));
+    JS_SetPropertyStr(ctx, err, "message", JS_NewString(ctx, message));
+    return err;
+}
+
+/* node->data's ownership never passes to QuickJS's ArrayBuffer machinery --
+   it stays with the ChunkNode until fetch_chunks_free or the SxnChunkView
+   wrapper's finalizer frees it (whichever runs last), so every zero-copy
+   ArrayBuffer/Uint8Array built over it uses this no-op free_func. */
+static void sxn_chunk_noop_free(JSRuntime *rt, void *opaque, void *ptr) { (void)rt; (void)opaque; (void)ptr; }
+
+/* Takes ownership of `data` (n bytes this file already controls -- either a
+   dequeued ChunkNode's buffer or a fresh copy of libcurl's transient
+   write-callback buffer) and hands back a native SxnChunkView wrapper,
+   registering the backing node with fs so cancel()/teardown can find and
+   (if borrowed) defer-free it. */
+static JSValue sxn_make_borrowed_chunk(JSContext *ctx, FetchState *fs, uint8_t *data, size_t len) {
+    ChunkNode *node = calloc(1, sizeof(*node));
+    node->data = data; node->len = len; node->owner = fs;
+    node->next = fs->borrowed; fs->borrowed = node;
+    SxnChunkViewState *st = calloc(1, sizeof(*st));
+    st->node = node; st->held_buffer = JS_UNDEFINED;
+    JSValue view = JS_NewObjectClass(ctx, sxn_chunkview_class_id);
+    JS_SetOpaque(view, st);
+    return view;
+}
+
+/* File-backed sibling of sxn_make_borrowed_chunk above: no FetchState owns
+   this node (owner stays NULL, never linked into any fs->borrowed list --
+   there is no stream cancel()/teardown event that needs to find and
+   defer-free it). Its only teardown path is its own GC finalizer, which is
+   safe by the same reasoning as sxn_chunkview_finalizer's doc comment: a
+   borrow can only be outstanding while the JS BorrowedChunk object is
+   reachable, so GC can never collect it mid-borrow. This is what lets
+   Sxn.file(path).readBorrowed() hand back a chunk that can be borrowed
+   (shared) once per served request, indefinitely, without re-reading the
+   file -- the actual "safe zero-copy file serving" win. */
+static JSValue sxn_make_owned_borrowed_chunk(JSContext *ctx, uint8_t *data, size_t len) {
+    ChunkNode *node = calloc(1, sizeof(*node));
+    node->data = data; node->len = len; node->owner = NULL; node->next = NULL;
+    SxnChunkViewState *st = calloc(1, sizeof(*st));
+    st->node = node; st->held_buffer = JS_UNDEFINED;
+    JSValue view = JS_NewObjectClass(ctx, sxn_chunkview_class_id);
+    JS_SetOpaque(view, st);
+    return view;
+}
+
+/* Stops the transfer and releases curl's ownership share of fs. Idempotent
+   (guarded by fs->easy) so it is safe from fetch_cancel, stream_cancel and
+   normal completion alike. */
+static void fetch_teardown_curl(FetchState *fs) {
+    if (!fs->easy) return;
+    curl_multi_remove_handle(sxn_curl_multi, fs->easy);
+    curl_easy_cleanup(fs->easy);
+    fs->easy = NULL;
+    fetch_state_decref(fs);
+}
+
+/* Consumes result_or_error (one ref). */
+static void fetch_settle_pending_read(FetchState *fs, JSValue result_or_error, int is_error) {
+    JSContext *ctx = fs->ctx;
+    JSValue fn = is_error ? fs->pending_read_reject : fs->pending_read_resolve;
+    JSValue args[1] = { result_or_error };
+    JSValue ret = JS_Call(ctx, fn, JS_UNDEFINED, 1, args);
+    JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, result_or_error);
+    JS_FreeValue(ctx, fs->pending_read_resolve); JS_FreeValue(ctx, fs->pending_read_reject);
+    fs->pending_read_resolve = JS_UNDEFINED; fs->pending_read_reject = JS_UNDEFINED;
+    fs->has_pending_read = 0;
+}
+
+/* Real cancellation: tears down the libcurl handle (closing the socket),
+   not just a JS-side flag. Used by both AbortSignal ('abort' -> __abort)
+   and would-be direct callers; idempotent via the aborted/done guard. */
+static void fetch_cancel(FetchState *fs) {
+    if (fs->aborted || fs->done) return;
+    fs->aborted = 1; fs->done = 1;
+    JSContext *ctx = fs->ctx;
+    JSValue err = make_named_error(ctx, "AbortError", "The operation was aborted.");
+    if (!fs->response_started) {
+        JSValue args[1] = { err };
+        JSValue ret = JS_Call(ctx, fs->reject_fetch, JS_UNDEFINED, 1, args); JS_FreeValue(ctx, ret);
+    }
+    if (fs->has_pending_read) {
+        fetch_settle_pending_read(fs, JS_DupValue(ctx, err), 1);
+    } else {
+        fs->errored = 1;
+        snprintf(fs->error_msg, sizeof(fs->error_msg), "The operation was aborted.");
+    }
+    JS_FreeValue(ctx, err);
+    fetch_chunks_free(fs);
+    fetch_teardown_curl(fs);
+}
+
+static void start_response(FetchState *fs) {
+    fs->response_started = 1;
+    JSContext *ctx = fs->ctx;
+    JSValue head = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, head, "status", JS_NewInt32(ctx, (int)fs->status));
+    JS_SetPropertyStr(ctx, head, "statusText", JS_NewString(ctx, fs->status_text));
+    const char *effective_url = fs->url;
+    char *curl_url = NULL;
+    if (fs->easy && curl_easy_getinfo(fs->easy, CURLINFO_EFFECTIVE_URL, &curl_url) == CURLE_OK && curl_url)
+        effective_url = curl_url;
+    JS_SetPropertyStr(ctx, head, "url", JS_NewString(ctx, effective_url));
+    if (JS_IsUndefined(fs->header_pairs)) fs->header_pairs = JS_NewArray(ctx);
+    JS_SetPropertyStr(ctx, head, "headers", fs->header_pairs);
+    fs->header_pairs = JS_UNDEFINED; /* ownership transferred into head.headers */
+    JSValue args[1] = { head };
+    JSValue ret = JS_Call(ctx, fs->resolve_fetch, JS_UNDEFINED, 1, args); JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, head);
+}
+
+static size_t fetch_header_cb(char *buf, size_t size, size_t nitems, void *userdata) {
+    FetchState *fs = userdata;
+    size_t n = size * nitems;
+    JSContext *ctx = fs->ctx;
+    if (n >= 5 && !strncmp(buf, "HTTP/", 5)) {
+        /* Start of a header block: redirects mean this fires more than
+           once, so reset and keep only the most recent (final) block. */
+        JS_FreeValue(ctx, fs->header_pairs);
+        fs->header_pairs = JS_NewArray(ctx);
+        long code = 0; int consumed = 0;
+        sscanf(buf, "%*s %ld%n", &code, &consumed);
+        fs->status = code;
+        fs->status_text[0] = 0;
+        if (consumed > 0 && (size_t)consumed < n) {
+            size_t start = (size_t)consumed; while (start < n && buf[start] == ' ') start++;
+            size_t end = n; while (end > start && (buf[end - 1] == '\r' || buf[end - 1] == '\n')) end--;
+            size_t len = end > start ? end - start : 0;
+            if (len >= sizeof(fs->status_text)) len = sizeof(fs->status_text) - 1;
+            memcpy(fs->status_text, buf + start, len); fs->status_text[len] = 0;
+        }
+        return n;
+    }
+    if (n <= 2) return n; /* blank line: end of this header block */
+    char *colon = memchr(buf, ':', n);
+    if (!colon) return n;
+    size_t namelen = (size_t)(colon - buf);
+    char *v = colon + 1; size_t vlen = (size_t)((buf + n) - v);
+    while (vlen && (*v == ' ' || *v == '\t')) { v++; vlen--; }
+    while (vlen && (v[vlen - 1] == '\r' || v[vlen - 1] == '\n')) vlen--;
+    if (JS_IsUndefined(fs->header_pairs)) fs->header_pairs = JS_NewArray(ctx);
+    uint32_t idx = 0; JSValue lenv = JS_GetPropertyStr(ctx, fs->header_pairs, "length"); JS_ToUint32(ctx, &idx, lenv); JS_FreeValue(ctx, lenv);
+    JS_SetPropertyUint32(ctx, fs->header_pairs, idx, JS_NewStringLen(ctx, buf, namelen));
+    JS_SetPropertyUint32(ctx, fs->header_pairs, idx + 1, JS_NewStringLen(ctx, v, vlen));
+    return n;
+}
+
+static size_t fetch_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    FetchState *fs = userdata;
+    size_t n = size * nmemb;
+    if (fs->aborted) return 0; /* CURLE_WRITE_ERROR; harmless, handle is already being torn down */
+    JSContext *ctx = fs->ctx;
+    if (!fs->response_started) start_response(fs);
+    if (fs->has_pending_read) {
+        JSValue chunk;
+        if (fs->pending_read_borrowed) {
+            /* ptr is libcurl's own transient buffer -- not safe to alias
+               past this callback's return (libcurl owns and reuses it), so
+               this one copy is unavoidable regardless of borrowing. The
+               zero-copy win readBorrowed() provides is cutting the SECOND
+               copy (native buffer -> JS-owned array) that the plain
+               JS_NewUint8ArrayCopy below still does. */
+            uint8_t *copy = malloc(n ? n : 1); memcpy(copy, ptr, n);
+            chunk = sxn_make_borrowed_chunk(ctx, fs, copy, n);
+        } else {
+            chunk = JS_NewUint8ArrayCopy(ctx, (const uint8_t *)ptr, n);
+        }
+        JSValue result = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, result, "value", chunk);
+        JS_SetPropertyStr(ctx, result, "done", JS_FALSE);
+        fs->pending_read_borrowed = 0;
+        fetch_settle_pending_read(fs, result, 0);
+    } else {
+        ChunkNode *node = malloc(sizeof(*node));
+        node->data = malloc(n ? n : 1); memcpy(node->data, ptr, n); node->len = n; node->next = NULL;
+        if (fs->tail) fs->tail->next = node; else fs->head = node;
+        fs->tail = node;
+    }
+    return n;
+}
+
+static void sxn_curl_check_multi_info(void) {
+    CURLMsg *msg; int pending;
+    while ((msg = curl_multi_info_read(sxn_curl_multi, &pending))) {
+        if (msg->msg != CURLMSG_DONE) continue;
+        FetchState *fs = NULL;
+        curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &fs);
+        if (!fs || fs->aborted) continue; /* already torn down by fetch_cancel/stream_cancel */
+        JSContext *ctx = fs->ctx;
+        CURLcode code = msg->data.result;
+        if (!fs->response_started) {
+            if (code == CURLE_OK) {
+                start_response(fs);
+            } else {
+                JSValue err = make_named_error(ctx, "TypeError", curl_easy_strerror(code));
+                JSValue args[1] = { err };
+                JSValue ret = JS_Call(ctx, fs->reject_fetch, JS_UNDEFINED, 1, args); JS_FreeValue(ctx, ret);
+                JS_FreeValue(ctx, err);
+            }
+        }
+        fs->done = 1;
+        if (fs->has_pending_read) {
+            if (code == CURLE_OK) {
+                JSValue result = JS_NewObject(ctx);
+                JS_SetPropertyStr(ctx, result, "value", JS_UNDEFINED);
+                JS_SetPropertyStr(ctx, result, "done", JS_TRUE);
+                fetch_settle_pending_read(fs, result, 0);
+            } else {
+                fetch_settle_pending_read(fs, make_named_error(ctx, "TypeError", curl_easy_strerror(code)), 1);
+            }
+        } else if (code != CURLE_OK && fs->response_started) {
+            fs->errored = 1;
+            snprintf(fs->error_msg, sizeof(fs->error_msg), "%s", curl_easy_strerror(code));
+        }
+        fetch_teardown_curl(fs);
+    }
+}
+
+static JSValue stream_get_reader(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    if (!JS_GetOpaque2(ctx, this_val, sxn_stream_class_id)) return JS_EXCEPTION;
+    return JS_DupValue(ctx, this_val); /* single-reader simplification: the stream is its own reader */
+}
+
+static JSValue stream_read(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    FetchState *fs = JS_GetOpaque2(ctx, this_val, sxn_stream_class_id);
+    if (!fs) return JS_EXCEPTION;
+    JSValue funcs[2];
+    JSValue promise = JS_NewPromiseCapability(ctx, funcs);
+    if (JS_IsException(promise)) return promise;
+    if (fs->head) {
+        ChunkNode *node = fs->head; fs->head = node->next; if (!fs->head) fs->tail = NULL;
+        JSValue chunk = JS_NewUint8ArrayCopy(ctx, node->data, node->len);
+        free(node->data); free(node);
+        JSValue result = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, result, "value", chunk);
+        JS_SetPropertyStr(ctx, result, "done", JS_FALSE);
+        JSValue args[1] = { result };
+        JSValue ret = JS_Call(ctx, funcs[0], JS_UNDEFINED, 1, args); JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, result);
+    } else if (fs->errored) {
+        JSValue err = make_named_error(ctx, fs->aborted ? "AbortError" : "TypeError", fs->error_msg);
+        JSValue args[1] = { err };
+        JSValue ret = JS_Call(ctx, funcs[1], JS_UNDEFINED, 1, args); JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, err);
+        fs->errored = 0;
+    } else if (fs->done) {
+        JSValue result = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, result, "value", JS_UNDEFINED);
+        JS_SetPropertyStr(ctx, result, "done", JS_TRUE);
+        JSValue args[1] = { result };
+        JSValue ret = JS_Call(ctx, funcs[0], JS_UNDEFINED, 1, args); JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, result);
+    } else {
+        fs->pending_read_resolve = funcs[0]; fs->pending_read_reject = funcs[1];
+        fs->has_pending_read = 1; fs->pending_read_borrowed = 0;
+        return promise;
+    }
+    JS_FreeValue(ctx, funcs[0]); JS_FreeValue(ctx, funcs[1]);
+    return promise;
+}
+
+/* Additive zero-copy sibling of read() above: hands back a borrow-guarded
+   BorrowedChunk (SxnChunkView) instead of a copied Uint8Array, so read()
+   itself -- and everything built on it, including Response.body's default
+   consumption -- is completely unaffected by Task 4. */
+static JSValue stream_read_borrowed(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    FetchState *fs = JS_GetOpaque2(ctx, this_val, sxn_stream_class_id);
+    if (!fs) return JS_EXCEPTION;
+    JSValue funcs[2];
+    JSValue promise = JS_NewPromiseCapability(ctx, funcs);
+    if (JS_IsException(promise)) return promise;
+    if (fs->head) {
+        ChunkNode *n = fs->head; fs->head = n->next; if (!fs->head) fs->tail = NULL;
+        JSValue view = sxn_make_borrowed_chunk(ctx, fs, n->data, n->len);
+        free(n); /* only the queue wrapper struct -- data ownership moved into the new borrowed node */
+        JSValue result = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, result, "value", view);
+        JS_SetPropertyStr(ctx, result, "done", JS_FALSE);
+        JSValue args[1] = { result };
+        JSValue ret = JS_Call(ctx, funcs[0], JS_UNDEFINED, 1, args); JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, result);
+    } else if (fs->errored) {
+        JSValue err = make_named_error(ctx, fs->aborted ? "AbortError" : "TypeError", fs->error_msg);
+        JSValue args[1] = { err };
+        JSValue ret = JS_Call(ctx, funcs[1], JS_UNDEFINED, 1, args); JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, err);
+        fs->errored = 0;
+    } else if (fs->done) {
+        JSValue result = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, result, "value", JS_UNDEFINED);
+        JS_SetPropertyStr(ctx, result, "done", JS_TRUE);
+        JSValue args[1] = { result };
+        JSValue ret = JS_Call(ctx, funcs[0], JS_UNDEFINED, 1, args); JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, result);
+    } else {
+        fs->pending_read_resolve = funcs[0]; fs->pending_read_reject = funcs[1];
+        fs->has_pending_read = 1; fs->pending_read_borrowed = 1;
+        return promise;
+    }
+    JS_FreeValue(ctx, funcs[0]); JS_FreeValue(ctx, funcs[1]);
+    return promise;
+}
+
+static JSValue stream_cancel(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    FetchState *fs = JS_GetOpaque2(ctx, this_val, sxn_stream_class_id);
+    if (fs && !fs->done) { fs->done = 1; fetch_chunks_free(fs); fetch_teardown_curl(fs); }
+    JSValue funcs[2];
+    JSValue promise = JS_NewPromiseCapability(ctx, funcs);
+    if (!JS_IsException(promise)) {
+        JSValue args[1] = { JS_UNDEFINED };
+        JSValue ret = JS_Call(ctx, funcs[0], JS_UNDEFINED, 1, args); JS_FreeValue(ctx, ret);
+    }
+    JS_FreeValue(ctx, funcs[0]); JS_FreeValue(ctx, funcs[1]);
+    return promise;
+}
+
+/* Bound to AbortSignal's 'abort' listener from fetch()'s JS wrapper; the
+   only path that actually reaches into libcurl and tears the transfer
+   down, as opposed to merely flipping a JS-visible flag. */
+static JSValue stream_abort(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    FetchState *fs = JS_GetOpaque2(ctx, this_val, sxn_stream_class_id);
+    if (fs) fetch_cancel(fs);
+    return JS_UNDEFINED;
+}
+
+static void sxn_stream_finalizer(JSRuntime *rt, JSValue val) {
+    (void)rt;
+    FetchState *fs = JS_GetOpaque(val, sxn_stream_class_id);
+    if (fs) fetch_state_decref(fs);
+}
+
+static JSClassDef sxn_stream_class_def = { "SxnBodyStream", .finalizer = sxn_stream_finalizer };
+
+static const JSCFunctionListEntry sxn_stream_proto_funcs[] = {
+    JS_CFUNC_DEF("getReader", 0, stream_get_reader),
+    JS_CFUNC_DEF("read", 0, stream_read),
+    JS_CFUNC_DEF("readBorrowed", 0, stream_read_borrowed),
+    JS_CFUNC_DEF("cancel", 1, stream_cancel),
+    JS_CFUNC_DEF("__abort", 0, stream_abort),
+};
+
+/* --- SxnChunkView ("BorrowedChunk"): the JS-visible handle for a
+   readBorrowed() chunk. See SxnChunkViewState's doc comment above
+   FetchState for why bytes are only reachable while a borrow is held. */
+
+static JSValue sxn_throw_borrow_conflict(JSContext *ctx, const char *action) {
+    JSValue err = make_named_error(ctx, "BorrowConflictError", action);
+    JS_SetPropertyStr(ctx, err, "code", JS_NewString(ctx, sxfe_diagnostic_name(SX2002_BORROW_CONFLICT)));
+    return JS_Throw(ctx, err);
+}
+
+static void sxn_chunkview_finalizer(JSRuntime *rt, JSValue val) {
+    SxnChunkViewState *st = JS_GetOpaque(val, sxn_chunkview_class_id);
+    if (!st) return;
+    ChunkNode *node = st->node;
+    if (node) {
+        /* A borrow can never be outstanding here: it is only ever held
+           synchronously inside a call reachable from this very object, so
+           GC cannot be collecting us mid-borrow. */
+        if (node->owner) {
+            ChunkNode **link = &node->owner->borrowed;
+            while (*link && *link != node) link = &(*link)->next;
+            if (*link) *link = node->next;
+        }
+        if (!node->retired) free(node->data);
+        free(node);
+    }
+    if (!JS_IsUndefined(st->held_buffer)) JS_FreeValueRT(rt, st->held_buffer);
+    free(st);
+}
+
+static JSClassDef sxn_chunkview_class_def = { "BorrowedChunk", .finalizer = sxn_chunkview_finalizer };
+
+/* Acquires (shared or exclusive) and hands back a zero-copy Uint8Array plus
+   its backing ArrayBuffer (the latter is what callers detach to end the
+   borrow's visibility). Returns JS_EXCEPTION (SX2002_BORROW_CONFLICT
+   already thrown) on conflict, or a plain TypeError if the node has
+   already been retired (native-side freed by fetch_chunks_free while
+   unborrowed). */
+static JSValue sxn_chunkview_acquire(JSContext *ctx, SxnChunkViewState *st, int exclusive, JSValue *out_buffer) {
+    ChunkNode *node = st->node;
+    if (!node || node->retired) { JS_ThrowTypeError(ctx, "chunk is no longer available (stream was cancelled or torn down)"); return JS_EXCEPTION; }
+    int ok = exclusive ? sxn_borrow_acquire_exclusive(&node->borrow) : sxn_borrow_acquire_shared(&node->borrow);
+    if (!ok) return sxn_throw_borrow_conflict(ctx, exclusive ? "acquireExclusive: chunk already borrowed" : "acquireShared: chunk already exclusively borrowed");
+    JSValue u8 = JS_NewUint8Array(ctx, node->data, node->len, sxn_chunk_noop_free, NULL, false);
+    *out_buffer = JS_GetTypedArrayBuffer(ctx, u8, NULL, NULL, NULL);
+    return u8;
+}
+
+/* Finishes a release: if fetch_chunks_free already wanted this node's data
+   freed (deferred because a borrow was outstanding then), and the borrow
+   count has now genuinely reached zero, do it now. */
+static void sxn_chunkview_release_common(ChunkNode *node) {
+    if (node->pending_free && !sxn_borrow_busy(&node->borrow)) {
+        node->pending_free = 0;
+        free(node->data); node->data = NULL; node->retired = 1;
+    }
+}
+
+/* conn_read_cb's forward-declared release helper (see the top of this file):
+   releases a shared borrow acquired via sxn_chunkview_acquire, mirroring the
+   shared-release half of sxn_chunkview_with_borrow. Its caller detaches the
+   ArrayBuffer view itself (a public API, no incomplete-type issue) before
+   calling this. */
+static void sxn_chunkview_release_shared(SxnChunkViewState *st) {
+    sxn_borrow_release_shared(&st->node->borrow);
+    sxn_chunkview_release_common(st->node);
+}
+
+static JSValue sxn_chunkview_with_borrow(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int exclusive) {
+    SxnChunkViewState *st = JS_GetOpaque2(ctx, this_val, sxn_chunkview_class_id);
+    if (!st) return JS_EXCEPTION;
+    if (argc < 1 || !JS_IsFunction(ctx, argv[0])) return JS_ThrowTypeError(ctx, "expected a function");
+    JSValue buffer;
+    JSValue u8 = sxn_chunkview_acquire(ctx, st, exclusive, &buffer);
+    if (JS_IsException(u8)) return JS_EXCEPTION;
+    JSValue args[1] = { u8 };
+    JSValue ret = JS_Call(ctx, argv[0], JS_UNDEFINED, 1, args);
+    int had_exception = JS_IsException(ret);
+    JSValue exc = had_exception ? JS_GetException(ctx) : JS_UNDEFINED;
+    JS_FreeValue(ctx, ret); JS_FreeValue(ctx, u8);
+    JS_DetachArrayBuffer(ctx, buffer); /* ends the borrow's visibility: fn can't retain a live reference past this call */
+    JS_FreeValue(ctx, buffer);
+    if (exclusive) sxn_borrow_release_exclusive(&st->node->borrow); else sxn_borrow_release_shared(&st->node->borrow);
+    sxn_chunkview_release_common(st->node);
+    if (had_exception) return JS_Throw(ctx, exc);
+    return JS_UNDEFINED;
+}
+
+static JSValue sxn_chunkview_with_shared(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) { return sxn_chunkview_with_borrow(ctx, this_val, argc, argv, 0); }
+static JSValue sxn_chunkview_with_exclusive(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) { return sxn_chunkview_with_borrow(ctx, this_val, argc, argv, 1); }
+
+/* Explicit acquire()/release() pair, for a borrow that needs to span an
+   await -- the with*Borrow pair above can't do that by construction (fn
+   runs and is released synchronously), which is deliberate: it makes
+   "holding a borrow with no clear release point" hard to write by
+   accident. This explicit pair is for the cases that genuinely need to
+   span a suspension point. */
+static JSValue sxn_chunkview_acquire_x(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int exclusive) {
+    (void)argc; (void)argv;
+    SxnChunkViewState *st = JS_GetOpaque2(ctx, this_val, sxn_chunkview_class_id);
+    if (!st) return JS_EXCEPTION;
+    if (!JS_IsUndefined(st->held_buffer)) return sxn_throw_borrow_conflict(ctx, "this BorrowedChunk already has an outstanding acquire(); call release() first");
+    JSValue buffer;
+    JSValue u8 = sxn_chunkview_acquire(ctx, st, exclusive, &buffer);
+    if (JS_IsException(u8)) return JS_EXCEPTION;
+    st->held_buffer = buffer; st->held_exclusive = exclusive;
+    return u8;
+}
+static JSValue sxn_chunkview_acquire_shared_fn(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) { return sxn_chunkview_acquire_x(ctx, this_val, argc, argv, 0); }
+static JSValue sxn_chunkview_acquire_exclusive_fn(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) { return sxn_chunkview_acquire_x(ctx, this_val, argc, argv, 1); }
+
+static JSValue sxn_chunkview_release_fn(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    SxnChunkViewState *st = JS_GetOpaque2(ctx, this_val, sxn_chunkview_class_id);
+    if (!st) return JS_EXCEPTION;
+    if (JS_IsUndefined(st->held_buffer)) return JS_ThrowTypeError(ctx, "release(): no outstanding acquire() on this BorrowedChunk");
+    JS_DetachArrayBuffer(ctx, st->held_buffer);
+    JS_FreeValue(ctx, st->held_buffer); st->held_buffer = JS_UNDEFINED;
+    if (st->held_exclusive) sxn_borrow_release_exclusive(&st->node->borrow); else sxn_borrow_release_shared(&st->node->borrow);
+    sxn_chunkview_release_common(st->node);
+    return JS_UNDEFINED;
+}
+
+static const JSCFunctionListEntry sxn_chunkview_proto_funcs[] = {
+    JS_CFUNC_DEF("withSharedBorrow", 1, sxn_chunkview_with_shared),
+    JS_CFUNC_DEF("withExclusiveBorrow", 1, sxn_chunkview_with_exclusive),
+    JS_CFUNC_DEF("acquireShared", 0, sxn_chunkview_acquire_shared_fn),
+    JS_CFUNC_DEF("acquireExclusive", 0, sxn_chunkview_acquire_exclusive_fn),
+    JS_CFUNC_DEF("release", 0, sxn_chunkview_release_fn),
+};
+
+/* Low-level primitive wrapped by fetch()/Request/Response/Headers in
+   bootstrap.js. Returns { promise, stream } synchronously: promise
+   resolves with response head info once headers arrive, stream is the
+   body reader (see sxn_stream_proto_funcs) usable immediately and also
+   used internally to wire AbortSignal. */
+static JSValue js_sxn_fetch_raw(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    sxn_curl_multi_init();
+    const char *url = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+    if (!url) return JS_ThrowTypeError(ctx, "fetch requires a URL");
+    const char *method = (argc > 1 && !JS_IsUndefined(argv[1])) ? JS_ToCString(ctx, argv[1]) : NULL;
+
+    struct curl_slist *headers = NULL;
+    if (argc > 2 && JS_IsArray(argv[2])) {
+        uint32_t len = 0; JSValue lenv = JS_GetPropertyStr(ctx, argv[2], "length"); JS_ToUint32(ctx, &len, lenv); JS_FreeValue(ctx, lenv);
+        for (uint32_t i = 0; i + 1 < len; i += 2) {
+            JSValue nv = JS_GetPropertyUint32(ctx, argv[2], i);
+            JSValue vv = JS_GetPropertyUint32(ctx, argv[2], i + 1);
+            const char *name = JS_ToCString(ctx, nv), *value = JS_ToCString(ctx, vv);
+            if (name && value) {
+                char line[1024]; snprintf(line, sizeof(line), "%s: %s", name, value);
+                headers = curl_slist_append(headers, line);
+            }
+            JS_FreeCString(ctx, name); JS_FreeCString(ctx, value);
+            JS_FreeValue(ctx, nv); JS_FreeValue(ctx, vv);
+        }
+    }
+
+    char *request_body = NULL;
+    if (argc > 3 && !JS_IsUndefined(argv[3]) && !JS_IsNull(argv[3])) {
+        const char *b = JS_ToCString(ctx, argv[3]);
+        if (b) request_body = strdup(b);
+        JS_FreeCString(ctx, b);
+    }
+
+    CURL *easy = curl_easy_init();
+    if (!easy) {
+        JS_FreeCString(ctx, url); JS_FreeCString(ctx, method); free(request_body);
+        if (headers) curl_slist_free_all(headers);
+        return JS_ThrowInternalError(ctx, "curl initialization failed");
+    }
+
+    FetchState *fs = calloc(1, sizeof(*fs));
+    fs->ctx = ctx; fs->easy = easy; fs->refcount = 1;
+    fs->url = strdup(url);
+    fs->req_headers = headers;
+    fs->request_body = request_body;
+    fs->header_pairs = JS_UNDEFINED;
+    fs->pending_read_resolve = JS_UNDEFINED; fs->pending_read_reject = JS_UNDEFINED;
+
+    curl_easy_setopt(easy, CURLOPT_URL, url);
+    curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(easy, CURLOPT_USERAGENT, "sxn/0.0.1");
+    curl_easy_setopt(easy, CURLOPT_PRIVATE, fs);
+    curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, fetch_header_cb);
+    curl_easy_setopt(easy, CURLOPT_HEADERDATA, fs);
+    curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, fetch_write_cb);
+    curl_easy_setopt(easy, CURLOPT_WRITEDATA, fs);
+    if (headers) curl_easy_setopt(easy, CURLOPT_HTTPHEADER, headers);
+    if (method) curl_easy_setopt(easy, CURLOPT_CUSTOMREQUEST, method);
+    if (request_body) {
+        curl_easy_setopt(easy, CURLOPT_COPYPOSTFIELDS, request_body);
+        curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, (long)strlen(request_body));
+    }
+    JS_FreeCString(ctx, url); JS_FreeCString(ctx, method);
+
+    JSValue funcs[2];
+    JSValue promise = JS_NewPromiseCapability(ctx, funcs);
+    fs->resolve_fetch = funcs[0]; fs->reject_fetch = funcs[1];
+
+    JSValue stream_obj = JS_NewObjectClass(ctx, sxn_stream_class_id);
+    fetch_state_incref(fs); /* the JS wrapper object's own share, released by its finalizer */
+    JS_SetOpaque(stream_obj, fs);
+
+    curl_multi_add_handle(sxn_curl_multi, easy);
+
+    JSValue out = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, out, "promise", promise);
+    JS_SetPropertyStr(ctx, out, "stream", stream_obj);
+    return out;
+}
+
+/* --- setTimeout/setInterval: real uv_timer_t handles on sxn_loop() (the
+   same loop the curl_multi/serve/fs primitives above already share), not a
+   second timer mechanism and not queueMicrotask/busy-poll based -- so the
+   process genuinely sleeps between fires. bootstrap.js's setTimeout/
+   setInterval/clearTimeout/clearInterval wrap this with Node's delay/arg
+   handling; extra args are just closed over there, so this primitive only
+   needs to know the callback, the delay, and whether to repeat. */
+typedef struct SxnTimer {
+    uv_timer_t handle;
+    JSContext *ctx;
+    JSValue callback;
+    int64_t id;
+    int repeat;
+    struct SxnTimer *prev, *next;
+} SxnTimer;
+
+static SxnTimer *sxn_timers_head = NULL;
+static int64_t sxn_timer_next_id = 1;
+
+static void sxn_timer_close_cb(uv_handle_t *handle) {
+    SxnTimer *timer = (SxnTimer *)handle->data;
+    JS_FreeValue(timer->ctx, timer->callback);
+    free(timer);
+}
+
+/* Unlinks from the active-timer list and tears the handle down; every call
+   site (clearTimer, and a fired one-shot's own callback below) reaches this
+   at most once per timer, since a cleared/finished timer is no longer in
+   the list for a second clearTimer call to find. */
+static void sxn_timer_stop(SxnTimer *timer) {
+    if (timer->prev) timer->prev->next = timer->next; else sxn_timers_head = timer->next;
+    if (timer->next) timer->next->prev = timer->prev;
+    uv_timer_stop(&timer->handle);
+    uv_close((uv_handle_t *)&timer->handle, sxn_timer_close_cb);
+}
+
+static void sxn_timer_cb(uv_timer_t *handle) {
+    SxnTimer *timer = (SxnTimer *)handle->data;
+    JSContext *ctx = timer->ctx;
+    JSValue ret = JS_Call(ctx, timer->callback, JS_UNDEFINED, 0, NULL);
+    /* A throwing callback must not crash the process or corrupt engine
+       state -- report it the same way main.c reports an uncaught top-level
+       exception, then keep going (matches js_serve/fetch's convention of
+       never letting a JS_Call exception propagate past this dispatch). */
+    if (JS_IsException(ret)) js_std_dump_error(ctx);
+    JS_FreeValue(ctx, ret);
+    if (!timer->repeat) sxn_timer_stop(timer); /* a repeat timer keeps firing on libuv's own schedule until cleared */
+}
+
+static JSValue sxn_set_timer(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1 || !JS_IsFunction(ctx, argv[0])) return JS_ThrowTypeError(ctx, "expected a function");
+    double delay_ms = 0;
+    if (argc > 1 && JS_ToFloat64(ctx, &delay_ms, argv[1]) < 0) return JS_EXCEPTION;
+    if (!(delay_ms >= 0)) delay_ms = 0;
+    int repeat = argc > 2 && JS_ToBool(ctx, argv[2]);
+
+    SxnTimer *timer = calloc(1, sizeof(*timer));
+    timer->ctx = ctx;
+    timer->callback = JS_DupValue(ctx, argv[0]);
+    timer->id = sxn_timer_next_id++;
+    timer->repeat = repeat;
+    timer->next = sxn_timers_head;
+    if (sxn_timers_head) sxn_timers_head->prev = timer;
+    timer->prev = NULL;
+    sxn_timers_head = timer;
+
+    uv_timer_init(sxn_loop(), &timer->handle);
+    timer->handle.data = timer;
+    uint64_t ms = (uint64_t)delay_ms;
+    uv_timer_start(&timer->handle, sxn_timer_cb, ms, repeat ? ms : 0);
+    return JS_NewInt64(ctx, timer->id);
+}
+
+static JSValue sxn_clear_timer(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_UNDEFINED;
+    int64_t id;
+    if (JS_ToInt64(ctx, &id, argv[0])) { JS_FreeValue(ctx, JS_GetException(ctx)); return JS_UNDEFINED; } /* non-numeric id: no-op, never throw */
+    for (SxnTimer *t = sxn_timers_head; t; t = t->next) {
+        if (t->id == id) { sxn_timer_stop(t); break; } /* not found (already fired/bogus id): no-op */
+    }
+    return JS_UNDEFINED;
+}
+
+static uint64_t sxn_time_origin_ns;
+
+static JSValue sxn_now(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    return JS_NewFloat64(ctx, (double)(uv_hrtime() - sxn_time_origin_ns) / 1e6);
+}
+
+static JSValue sxn_random_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    int64_t n = 0;
+    if (argc < 1 || JS_ToInt64(ctx, &n, argv[0]) || n < 0 || n > (1 << 20))
+        return JS_ThrowRangeError(ctx, "invalid byte length for getRandomValues");
+    uint8_t *buf = malloc(n ? (size_t)n : 1);
+    if (RAND_bytes(buf, (int)n) != 1) { free(buf); return JS_ThrowInternalError(ctx, "RAND_bytes failed"); }
+    JSValue result = JS_NewUint8ArrayCopy(ctx, buf, (size_t)n);
+    free(buf);
+    return result;
+}
+
+static JSValue sxn_digest(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    const char *algo = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+    if (!algo) return JS_EXCEPTION;
+    size_t inlen = 0;
+    uint8_t *input = argc > 1 ? JS_GetUint8Array(ctx, &inlen, argv[1]) : NULL;
+    if (!input) { JS_FreeCString(ctx, algo); return JS_ThrowTypeError(ctx, "digest expects a Uint8Array"); }
+    char normalized[32]; size_t j = 0;
+    for (size_t i = 0; algo[i] && j + 1 < sizeof(normalized); i++)
+        if (algo[i] != '-') normalized[j++] = (char)tolower((unsigned char)algo[i]);
+    normalized[j] = 0;
+    const EVP_MD *md = EVP_get_digestbyname(normalized);
+    JS_FreeCString(ctx, algo);
+    if (!md) return JS_ThrowTypeError(ctx, "unsupported digest algorithm");
+    uint8_t out[EVP_MAX_MD_SIZE]; unsigned int outlen = 0;
+    if (!EVP_Digest(input, inlen, out, &outlen, md, NULL)) return JS_ThrowInternalError(ctx, "digest failed");
+    return JS_NewUint8ArrayCopy(ctx, out, outlen);
+}
+
+/* TextEncoder.encode() native primitive (bootstrap.js's TextEncoder wraps
+   this). JS_NewUint8ArrayFromString transcodes straight into the Uint8Array's
+   backing store in one pass -- no intermediate JSString, no second copy
+   (the previous JS_ToCStringLen2 + JS_NewUint8ArrayCopy pair wrote the bytes
+   twice: once into a throwaway transcoded string, once copying that into the
+   final buffer). Encoding (surrogate-pair combining, unmatched-surrogate
+   handling) is byte-identical to before -- same transcode loop, just with
+   the write going directly to its final home. */
+/* Bound directly as TextEncoder.prototype.encode (see bootstrap.js) -- the
+   undefined->empty check lives here so no JS wrapper frame runs per call.
+   Non-strings coerce via ToString inside JS_NewUint8ArrayFromString; note
+   symbols therefore throw TypeError, matching Node/WHATWG TextEncoder
+   (the old JS wrapper's String() would have stringified them). */
+static JSValue sxn_utf8_encode(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1 || JS_IsUndefined(argv[0]))
+        return JS_NewUint8ArrayCopy(ctx, (const uint8_t *)"", 0);
+    return JS_NewUint8ArrayFromString(ctx, argv[0]);
+}
+
+/* Buffer.from(string, "utf-8") primitive: same one-pass encode as
+   sxn_utf8_encode, but goes straight to the bare ArrayBuffer via
+   JS_NewArrayBufferFromString instead of building (and discarding) a
+   Uint8Array wrapper -- node_compat.js does `new Buffer(arrayBuffer)`
+   directly, so there's no use for a wrapper here. */
+static JSValue sxn_utf8_encode_buffer(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    JSValueConst input = argc > 0 ? argv[0] : JS_UNDEFINED;
+    return JS_NewArrayBufferFromString(ctx, input);
+}
+
+/* TextDecoder.decode() native primitive. Mirrors the previous hand-rolled
+   JS decode loop byte-for-byte (same fatal/replacement-char/truncation
+   rules) so behavior -- including the {stream:true} partial-sequence
+   buffering -- is unchanged; only the per-byte JS loop and per-iteration
+   string concatenation are replaced with a single C pass into a UTF-16
+   buffer. bootstrap.js still owns merging a prior _pending buffer into
+   `bytes` before calling this, since that happens once per decode() call
+   (not once per byte) and isn't the hot path. Returns {text, pending}. */
+static JSValue sxn_utf8_decode(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "decode expects a Uint8Array");
+    size_t len = 0;
+    uint8_t *bytes = JS_GetUint8Array(ctx, &len, argv[0]);
+    if (!bytes && len == 0) {
+        /* JS_GetUint8Array returns NULL+0 both on error (already threw) and
+           in principle for a genuinely empty view; in this codebase's
+           existing zero-length Uint8Arrays always carry a non-NULL data
+           pointer (see js_array_buffer_constructor3's max_int(len,1)
+           allocation), so NULL here reliably means an exception is pending. */
+        return JS_EXCEPTION;
+    }
+    int fatal = argc > 1 && JS_ToBool(ctx, argv[1]);
+    int stream = argc > 2 && JS_ToBool(ctx, argv[2]);
+
+    uint16_t *out = len ? malloc(len * sizeof(uint16_t)) : NULL;
+    if (len && !out) return JS_ThrowOutOfMemory(ctx);
+    size_t out_len = 0;
+    size_t i = 0;
+    size_t pending_start = (size_t)-1;
+    while (i < len) {
+        uint8_t b0 = bytes[i];
+        uint32_t cp;
+        size_t seqlen;
+        if (b0 < 0x80) { cp = b0; seqlen = 1; }
+        else if ((b0 & 0xE0) == 0xC0) { cp = b0 & 0x1F; seqlen = 2; }
+        else if ((b0 & 0xF0) == 0xE0) { cp = b0 & 0x0F; seqlen = 3; }
+        else if ((b0 & 0xF8) == 0xF0) { cp = b0 & 0x07; seqlen = 4; }
+        else {
+            if (fatal) { free(out); return JS_ThrowTypeError(ctx, "invalid UTF-8"); }
+            out[out_len++] = 0xFFFD; i++; continue;
+        }
+        if (i + seqlen > len) {
+            if (stream) { pending_start = i; i = len; break; }
+            if (fatal) { free(out); return JS_ThrowTypeError(ctx, "truncated UTF-8"); }
+            out[out_len++] = 0xFFFD; i = len; break;
+        }
+        int ok = 1;
+        for (size_t k = 1; k < seqlen; k++) {
+            uint8_t b = bytes[i + k];
+            if ((b & 0xC0) != 0x80) { ok = 0; break; }
+            cp = (cp << 6) | (b & 0x3F);
+        }
+        if (!ok) {
+            if (fatal) { free(out); return JS_ThrowTypeError(ctx, "invalid UTF-8"); }
+            out[out_len++] = 0xFFFD; i++; continue;
+        }
+        i += seqlen;
+        if (cp > 0xFFFF) {
+            cp -= 0x10000;
+            out[out_len++] = (uint16_t)(0xD800 + (cp >> 10));
+            out[out_len++] = (uint16_t)(0xDC00 + (cp & 0x3FF));
+        } else {
+            out[out_len++] = (uint16_t)cp;
+        }
+    }
+    JSValue text = JS_NewStringUTF16(ctx, out, out_len);
+    JSValue pending = pending_start != (size_t)-1
+        ? JS_NewUint8ArrayCopy(ctx, bytes + pending_start, len - pending_start)
+        : JS_NewUint8ArrayCopy(ctx, NULL, 0);
+    free(out);
+    if (JS_IsException(text) || JS_IsException(pending)) {
+        JS_FreeValue(ctx, text); JS_FreeValue(ctx, pending);
+        return JS_EXCEPTION;
+    }
+    JSValue result = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, result, "text", text);
+    JS_SetPropertyStr(ctx, result, "pending", pending);
+    return result;
+}
+
+/* Sxn.file(path).text() reads via libuv's thread pool (uv_fs_open/read/close)
+   and resolves a real Promise from the completion callback, so the caller's
+   synchronous code keeps running while the read happens off-thread. This is
+   the primitive a future `node:fs/promises` polyfill (Task 3/5) would wrap.
+
+   .arrayBuffer() and .readBorrowed() (new) share this exact open/read/close
+   state machine -- only the completion callback's final resolution differs
+   (`mode`), per the instruction to follow this pattern rather than
+   reimplement async file I/O. .text() UTF-8-decodes via JS_NewStringLen;
+   the other two hand off fr->data's raw bytes with no decode step, either
+   as a plain ArrayBuffer or as a borrow-guarded BorrowedChunk (reusing the
+   SxnChunkView machinery from the streaming-fetch borrow lock above). */
+typedef enum FileReadMode { FILE_READ_TEXT, FILE_READ_BYTES, FILE_READ_BORROWED } FileReadMode;
+
+typedef struct FileReadReq {
+    uv_fs_t req;
+    JSContext *ctx;
+    JSValue resolve, reject;
+    uv_file fd;
+    char *data; size_t length, cap;
+    char chunk[65536];
+    FileReadMode mode;
+} FileReadReq;
+
+static void file_read_reject(FileReadReq *fr, int uv_errno) {
+    JSValue error = JS_NewError(fr->ctx);
+    JS_SetPropertyStr(fr->ctx, error, "message", JS_NewString(fr->ctx, uv_strerror(uv_errno)));
+    JS_Call(fr->ctx, fr->reject, JS_UNDEFINED, 1, &error);
+    JS_FreeValue(fr->ctx, error);
+    JS_FreeValue(fr->ctx, fr->resolve); JS_FreeValue(fr->ctx, fr->reject);
+    free(fr->data); free(fr);
+}
+
+/* Ownership-transfer free_func for FILE_READ_BYTES: fr->data was malloc'd by
+   file_read_on_read below and handed directly to the ArrayBuffer with no
+   copy, so releasing it is just a plain free(). */
+static void sxn_filebuf_free(JSRuntime *rt, void *opaque, void *ptr) { (void)rt; (void)opaque; free(ptr); }
+
+static void file_read_on_close(uv_fs_t *req) {
+    FileReadReq *fr = (FileReadReq *)req->data; uv_fs_req_cleanup(req);
+    JSValue value;
+    if (fr->mode == FILE_READ_TEXT) {
+        value = JS_NewStringLen(fr->ctx, fr->data ? fr->data : "", fr->length);
+    } else {
+        if (!fr->data) fr->data = malloc(1); /* guarantee a real owned allocation even for a zero-length file */
+        value = fr->mode == FILE_READ_BYTES
+            ? JS_NewArrayBuffer(fr->ctx, (uint8_t *)fr->data, fr->length, sxn_filebuf_free, NULL, false)
+            : sxn_make_owned_borrowed_chunk(fr->ctx, (uint8_t *)fr->data, fr->length);
+        fr->data = NULL; /* ownership transferred either way */
+    }
+    JS_Call(fr->ctx, fr->resolve, JS_UNDEFINED, 1, &value);
+    JS_FreeValue(fr->ctx, value); JS_FreeValue(fr->ctx, fr->resolve); JS_FreeValue(fr->ctx, fr->reject);
+    free(fr->data); free(fr);
+}
+
+static void file_read_on_read(uv_fs_t *req) {
+    FileReadReq *fr = (FileReadReq *)req->data; ssize_t n = req->result; uv_fs_req_cleanup(req);
+    if (n < 0) { uv_fs_close(sxn_loop(), &fr->req, fr->fd, NULL); file_read_reject(fr, (int)n); return; }
+    if (n == 0) { uv_fs_close(sxn_loop(), &fr->req, fr->fd, file_read_on_close); return; }
+    if (fr->length + (size_t)n > fr->cap) {
+        fr->cap = fr->cap ? fr->cap * 2 : 65536; while (fr->cap < fr->length + (size_t)n) fr->cap *= 2;
+        fr->data = realloc(fr->data, fr->cap);
+    }
+    memcpy(fr->data + fr->length, fr->chunk, (size_t)n); fr->length += (size_t)n;
+    uv_buf_t buf = uv_buf_init(fr->chunk, sizeof(fr->chunk));
+    uv_fs_read(sxn_loop(), &fr->req, fr->fd, &buf, 1, -1, file_read_on_read);
+}
+
+static void file_read_on_open(uv_fs_t *req) {
+    FileReadReq *fr = (FileReadReq *)req->data; int result = (int)req->result; uv_fs_req_cleanup(req);
+    if (result < 0) { file_read_reject(fr, result); return; }
+    fr->fd = result;
+    uv_buf_t buf = uv_buf_init(fr->chunk, sizeof(fr->chunk));
+    uv_fs_read(sxn_loop(), &fr->req, fr->fd, &buf, 1, -1, file_read_on_read);
+}
+
+static JSValue sxn_file_read_start(JSContext *ctx, JSValueConst this_val, FileReadMode mode) {
+    JSValue path_value = JS_GetPropertyStr(ctx, this_val, "path");
+    const char *path = JS_ToCString(ctx, path_value); JS_FreeValue(ctx, path_value);
+    if (!path) return JS_EXCEPTION;
+    JSValue funcs[2];
+    JSValue promise = JS_NewPromiseCapability(ctx, funcs);
+    if (JS_IsException(promise)) { JS_FreeCString(ctx, path); return promise; }
+    FileReadReq *fr = calloc(1, sizeof(*fr));
+    fr->ctx = ctx; fr->resolve = funcs[0]; fr->reject = funcs[1]; fr->req.data = fr; fr->mode = mode;
+    int rc = uv_fs_open(sxn_loop(), &fr->req, path, O_RDONLY, 0, file_read_on_open);
+    JS_FreeCString(ctx, path);
+    if (rc < 0) { uv_fs_req_cleanup(&fr->req); file_read_reject(fr, rc); }
+    return promise;
 }
 
 static JSValue sxn_file_text(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    JSValue path_value = JS_GetPropertyStr(ctx, this_val, "path");
-    const char *path = JS_ToCString(ctx, path_value);
-    if (!path) { JS_FreeValue(ctx, path_value); return JS_EXCEPTION; }
-    FILE *file = fopen(path, "rb");
-    if (!file) { JSValue error = JS_ThrowInternalError(ctx, "cannot read '%s': %s", path, strerror(errno)); JS_FreeCString(ctx, path); JS_FreeValue(ctx, path_value); return error; }
-    fseek(file, 0, SEEK_END); long length = ftell(file); rewind(file);
-    char *data = malloc((size_t)length + 1);
-    if (!data || fread(data, 1, (size_t)length, file) != (size_t)length) {
-        fclose(file); free(data); JS_FreeCString(ctx, path); JS_FreeValue(ctx, path_value);
-        return JS_ThrowInternalError(ctx, "cannot read file");
-    }
-    fclose(file); data[length] = 0;
-    JSValue result = JS_NewStringLen(ctx, data, (size_t)length);
-    free(data); JS_FreeCString(ctx, path); JS_FreeValue(ctx, path_value); return result;
+    (void)argc; (void)argv;
+    return sxn_file_read_start(ctx, this_val, FILE_READ_TEXT);
+}
+
+/* Sxn.file(path).arrayBuffer(): raw bytes, no UTF-8 decode step -- the
+   binary-file-read primitive Task 3 was missing entirely (Sxn.file's only
+   existing reader was .text(), always UTF-8-decoded). */
+static JSValue sxn_file_array_buffer(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    return sxn_file_read_start(ctx, this_val, FILE_READ_BYTES);
+}
+
+/* Sxn.file(path).readBorrowed(): same raw bytes as .arrayBuffer(), but
+   handed back as a borrow-guarded BorrowedChunk (see
+   sxn_make_owned_borrowed_chunk) instead of a plain ArrayBuffer -- read the
+   file once, then reuse the same native buffer to serve it zero-copy across
+   many Sxn.serve() requests (conn_read_cb's BorrowedChunk body path above)
+   without re-reading from disk or re-copying into a fresh JS allocation
+   each time. */
+static JSValue sxn_file_read_borrowed(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    return sxn_file_read_start(ctx, this_val, FILE_READ_BORROWED);
+}
+
+/* Sxn's async write counterpart to sxn_file_text above -- same
+   uv_fs_open/.../close shape, just OPEN|WRITE|CLOSE instead of
+   OPEN|READ*|CLOSE. Consumed by node_compat.js's fs/promises.writeFile
+   (Task 5); no existing promise-based write primitive existed to reuse. */
+typedef struct FileWriteReq {
+    uv_fs_t req;
+    JSContext *ctx;
+    JSValue resolve, reject;
+    uv_file fd;
+    char *data;
+    uv_buf_t buf;
+} FileWriteReq;
+
+static void file_write_reject(FileWriteReq *fw, int uv_errno) {
+    JSValue error = JS_NewError(fw->ctx);
+    JS_SetPropertyStr(fw->ctx, error, "message", JS_NewString(fw->ctx, uv_strerror(uv_errno)));
+    JS_Call(fw->ctx, fw->reject, JS_UNDEFINED, 1, &error);
+    JS_FreeValue(fw->ctx, error);
+    JS_FreeValue(fw->ctx, fw->resolve); JS_FreeValue(fw->ctx, fw->reject);
+    free(fw->data); free(fw);
+}
+
+static void file_write_on_close(uv_fs_t *req) {
+    FileWriteReq *fw = (FileWriteReq *)req->data; uv_fs_req_cleanup(req);
+    JSValue undef = JS_UNDEFINED;
+    JS_Call(fw->ctx, fw->resolve, JS_UNDEFINED, 1, &undef);
+    JS_FreeValue(fw->ctx, fw->resolve); JS_FreeValue(fw->ctx, fw->reject);
+    free(fw->data); free(fw);
+}
+
+static void file_write_on_write(uv_fs_t *req) {
+    FileWriteReq *fw = (FileWriteReq *)req->data; ssize_t n = req->result; uv_fs_req_cleanup(req);
+    if (n < 0) { uv_fs_close(sxn_loop(), &fw->req, fw->fd, NULL); file_write_reject(fw, (int)n); return; }
+    uv_fs_close(sxn_loop(), &fw->req, fw->fd, file_write_on_close);
+}
+
+static void file_write_on_open(uv_fs_t *req) {
+    FileWriteReq *fw = (FileWriteReq *)req->data; int result = (int)req->result; uv_fs_req_cleanup(req);
+    if (result < 0) { file_write_reject(fw, result); return; }
+    fw->fd = result;
+    uv_fs_write(sxn_loop(), &fw->req, fw->fd, &fw->buf, 1, 0, file_write_on_write);
+}
+
+static JSValue sxn_file_write_async(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 2) return JS_ThrowTypeError(ctx, "expects (path, data)");
+    const char *path = JS_ToCString(ctx, argv[0]);
+    size_t length = 0;
+    const char *data = JS_ToCStringLen(ctx, &length, argv[1]);
+    if (!path || !data) { JS_FreeCString(ctx, path); JS_FreeCString(ctx, data); return JS_EXCEPTION; }
+    JSValue funcs[2];
+    JSValue promise = JS_NewPromiseCapability(ctx, funcs);
+    if (JS_IsException(promise)) { JS_FreeCString(ctx, path); JS_FreeCString(ctx, data); return promise; }
+    FileWriteReq *fw = calloc(1, sizeof(*fw));
+    fw->ctx = ctx; fw->resolve = funcs[0]; fw->reject = funcs[1]; fw->req.data = fw;
+    fw->data = malloc(length ? length : 1);
+    memcpy(fw->data, data, length);
+    fw->buf = uv_buf_init(fw->data, (unsigned int)length);
+    JS_FreeCString(ctx, data);
+    int rc = uv_fs_open(sxn_loop(), &fw->req, path, O_WRONLY | O_CREAT | O_TRUNC, 0644, file_write_on_open);
+    JS_FreeCString(ctx, path);
+    if (rc < 0) { uv_fs_req_cleanup(&fw->req); file_write_reject(fw, rc); }
+    return promise;
 }
 
 static JSValue sxn_file_exists(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -188,6 +1516,8 @@ static JSValue sxn_file(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     JS_SetPropertyStr(ctx, file, "size", JS_NewInt64(ctx, exists ? (int64_t)info.st_size : 0));
     JS_SetPropertyStr(ctx, file, "type", JS_NewString(ctx, "application/octet-stream"));
     JS_SetPropertyStr(ctx, file, "text", JS_NewCFunction(ctx, sxn_file_text, "text", 0));
+    JS_SetPropertyStr(ctx, file, "arrayBuffer", JS_NewCFunction(ctx, sxn_file_array_buffer, "arrayBuffer", 0));
+    JS_SetPropertyStr(ctx, file, "readBorrowed", JS_NewCFunction(ctx, sxn_file_read_borrowed, "readBorrowed", 0));
     JS_SetPropertyStr(ctx, file, "exists", JS_NewCFunction(ctx, sxn_file_exists, "exists", 0));
     JS_FreeCString(ctx, path); return file;
 }
@@ -207,15 +1537,81 @@ static JSValue sxn_write(JSContext *ctx, JSValueConst this_val, int argc, JSValu
 
 int sxn_install_network(JSContext *ctx) {
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) return -1;
+    sxn_time_origin_ns = uv_hrtime();
+
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JS_NewClassID(rt, &sxn_stream_class_id);
+    JS_NewClass(rt, sxn_stream_class_id, &sxn_stream_class_def);
+    JSValue stream_proto = JS_NewObject(ctx);
+    JS_SetPropertyFunctionList(ctx, stream_proto, sxn_stream_proto_funcs, countof(sxn_stream_proto_funcs));
+    JS_SetClassProto(ctx, sxn_stream_class_id, stream_proto);
+
+    JS_NewClassID(rt, &sxn_chunkview_class_id);
+    JS_NewClass(rt, sxn_chunkview_class_id, &sxn_chunkview_class_def);
+    JSValue chunkview_proto = JS_NewObject(ctx);
+    JS_SetPropertyFunctionList(ctx, chunkview_proto, sxn_chunkview_proto_funcs, countof(sxn_chunkview_proto_funcs));
+    JS_SetClassProto(ctx, sxn_chunkview_class_id, chunkview_proto);
+
     JSValue global = JS_GetGlobalObject(ctx);
     JSValue runtime = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, runtime, "version", JS_NewString(ctx, "0.1.0"));
+    JS_SetPropertyStr(ctx, runtime, "version", JS_NewString(ctx, "0.0.1"));
     JS_SetPropertyStr(ctx, runtime, "serve", JS_NewCFunction(ctx, js_serve, "serve", 2));
     JS_SetPropertyStr(ctx, runtime, "file", JS_NewCFunction(ctx, sxn_file, "file", 1));
     JS_SetPropertyStr(ctx, runtime, "write", JS_NewCFunction(ctx, sxn_write, "write", 2));
-    JS_SetPropertyStr(ctx, runtime, "fetch", JS_NewCFunction(ctx, js_fetch, "fetch", 2));
+    JS_SetPropertyStr(ctx, runtime, "memoryUsage", JS_NewCFunction(ctx, sxn_memory_usage, "memoryUsage", 0));
+    JS_SetPropertyStr(ctx, runtime, "ffi", JS_NewCFunction(ctx, sxn_ffi, "ffi", 3));
     JS_SetPropertyStr(ctx, global, "Sxn", runtime);
     JS_SetPropertyStr(ctx, global, "__sxnServe", JS_NewCFunction(ctx, js_serve, "__sxnServe", 2));
-    JS_SetPropertyStr(ctx, global, "fetch", JS_NewCFunction(ctx, js_fetch, "fetch", 2));
-    JS_FreeValue(ctx, global); return 0;
+
+    /* Native primitives consumed only by bootstrap.js (fetch's raw
+       networking primitive, the monotonic clock, and OpenSSL-backed
+       crypto); bootstrap.js builds the spec-shaped globals on top of them
+       and installs fetch/TextEncoder/URL/Headers/etc. on `global` itself. */
+    JS_SetPropertyStr(ctx, global, "__sxnFetchRaw", JS_NewCFunction(ctx, js_sxn_fetch_raw, "__sxnFetchRaw", 4));
+    JS_SetPropertyStr(ctx, global, "__sxnNow", JS_NewCFunction(ctx, sxn_now, "__sxnNow", 0));
+    JS_SetPropertyStr(ctx, global, "__sxnRandomBytes", JS_NewCFunction(ctx, sxn_random_bytes, "__sxnRandomBytes", 1));
+    JS_SetPropertyStr(ctx, global, "__sxnDigest", JS_NewCFunction(ctx, sxn_digest, "__sxnDigest", 2));
+    /* Consumed only by bootstrap.js's TextEncoder/TextDecoder. */
+    JS_SetPropertyStr(ctx, global, "__sxnUtf8Encode", JS_NewCFunction(ctx, sxn_utf8_encode, "__sxnUtf8Encode", 1));
+    JS_SetPropertyStr(ctx, global, "__sxnUtf8Decode", JS_NewCFunction(ctx, sxn_utf8_decode, "__sxnUtf8Decode", 3));
+    /* Consumed only by node_compat.js's Buffer.from(string, "utf-8"). */
+    JS_SetPropertyStr(ctx, global, "__sxnUtf8EncodeArrayBuffer", JS_NewCFunction(ctx, sxn_utf8_encode_buffer, "__sxnUtf8EncodeArrayBuffer", 1));
+    /* Consumed only by node_compat.js's fs/promises.writeFile (Task 5). */
+    JS_SetPropertyStr(ctx, global, "__sxnWriteFileAsync", JS_NewCFunction(ctx, sxn_file_write_async, "__sxnWriteFileAsync", 2));
+    /* Consumed only by bootstrap.js's setTimeout/setInterval/clearTimeout/clearInterval. */
+    JS_SetPropertyStr(ctx, global, "__sxnSetTimer", JS_NewCFunction(ctx, sxn_set_timer, "__sxnSetTimer", 3));
+    JS_SetPropertyStr(ctx, global, "__sxnClearTimer", JS_NewCFunction(ctx, sxn_clear_timer, "__sxnClearTimer", 1));
+    JS_FreeValue(ctx, global);
+
+    /* Strict mode: measurably faster function dispatch in QuickJS. */
+    JSValue bootstrap = JS_Eval(ctx, sxn_bootstrap_js, strlen(sxn_bootstrap_js), "<sxn:bootstrap>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT);
+    if (JS_IsException(bootstrap)) { JS_FreeValue(ctx, bootstrap); return -1; }
+    JS_FreeValue(ctx, bootstrap);
+
+    /* Sxn.fetch mirrors the global fetch() bootstrap.js just installed, for
+       code that reaches it through the Sxn namespace. */
+    global = JS_GetGlobalObject(ctx);
+    JSValue fetch_fn = JS_GetPropertyStr(ctx, global, "fetch");
+    JS_SetPropertyStr(ctx, runtime, "fetch", fetch_fn);
+    JS_FreeValue(ctx, global);
+    return 0;
+}
+
+int sxn_run_event_loop(JSContext *ctx) {
+    uv_loop_t *loop = sxn_loop();
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    for (;;) {
+        JSContext *ctx1; int err;
+        while ((err = JS_ExecutePendingJob(rt, &ctx1)) > 0) {}
+        if (err < 0) break;
+        /* UV_RUN_ONCE blocks (no busy-loop) until the next batch of I/O is
+           ready, then returns so we can drain any jobs it just enqueued
+           before waiting on the next batch. Exits once nothing is left:
+           no active/ref'd handles (e.g. no serve() was ever called) and no
+           pending job, which is what keeps a plain script's exit identical
+           to before this loop existed. */
+        int more_handles = uv_run(loop, UV_RUN_ONCE);
+        if (!more_handles && !JS_IsJobPending(rt)) break;
+    }
+    return JS_HasException(ctx);
 }

@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define SXFE_VERSION "0.1.0"
+#define SXFE_VERSION "0.0.1"
 
 typedef enum SxfeDiagnosticCode {
     SX0000_OK = 0,
@@ -82,6 +82,17 @@ int sxn_lsp_main(void);
 
 struct JSContext;
 int sxn_install_network(struct JSContext *context);
+/* Drains pending libuv I/O (server sockets, async file reads) registered by
+   sxn_install_network, interleaved with the QuickJS job queue. No-op/returns
+   immediately if nothing registered any handles (e.g. a script that never
+   calls Sxn.serve or the async file API). */
+int sxn_run_event_loop(struct JSContext *context);
+
+/* Installs the `node:buffer`/`node:path`/`node:events`/`node:process`
+   compatibility modules (src/node.c + src/node_compat.js), following the
+   same native-primitives-plus-JS-bootstrap split as sxn_install_network.
+   exec_path becomes process.argv[0]. */
+int sxn_install_node_compat(struct JSContext *context, const char *exec_path);
 
 #ifdef __cplusplus
 }

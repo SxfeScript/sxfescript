@@ -1,0 +1,2 @@
+const usage = Sxn.memoryUsage();
+if (typeof usage.objects !== "number" || typeof usage.gcCount !== "number") throw new Error("invalid memory usage report");

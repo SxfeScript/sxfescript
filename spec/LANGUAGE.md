@@ -5,6 +5,28 @@ ordinary JS semantics. Types that can be erased without generating runtime code
 are accepted. JSX, enums, namespaces, decorators, and parameter properties are
 rejected.
 
+`safe` is an optional contextual qualifier for `let` and `const`. It marks a
+binding as type-stable for runtime validation and optimization; ordinary
+bindings remain dynamic. `safe let` follows the ownership rules below, while
+`safe let mut` allows reassignment only within its declared or inferred type.
+Safe object shapes reject property addition/deletion and incompatible writes.
+The compatibility transformer erases this qualifier; the native parser is
+responsible for attaching its runtime descriptor.
+
+Primitive FFI declarations use an explicit unsafe boundary:
+
+```sx
+unsafe extern add(i32, i32): i32 from "add.dylib";
+```
+
+Native parsing does not implement this lowering yet and rejects `extern`
+declarations with an explicit "not yet supported" error rather than
+mis-parsing them; the standalone compatibility transformer (src/frontend.c)
+still lowers the declaration to `Sxn.ffi` as a reference implementation, but
+it is no longer wired into execution. Calls must eventually be restricted to
+the declared C-ABI scalar types; strings, callbacks, pointers, structs, and
+variadics require separate ownership rules.
+
 ## Ownership
 
 - `let mut value: T` creates a mutable owner.
@@ -30,4 +52,3 @@ Fields retain declaration order. `bool` has size/alignment 1, `i32` and `f32`
 have size/alignment 4, and `f64` has size/alignment 8. Each field and final
 struct size are padded to natural alignment. This layout is identical on all
 supported desktop targets.
-

@@ -1,0 +1,9 @@
+function compute() {
+    safe let mut total: i32 = 0;
+    for (let i = 0; i < 10000000; i++) total += i;
+    return total;
+}
+console.log(compute());
+const memory = Sxn.memoryUsage();
+console.log(memory.gcCount);
+if (memory.gcCount !== 0) throw new Error("safe scalar kernel triggered cycle GC");

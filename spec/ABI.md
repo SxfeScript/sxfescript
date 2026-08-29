@@ -14,3 +14,8 @@ into JavaScript creates a revocable proxy. Typed JavaScript objects crossing
 into SX use shared/exclusive header locks, and incompatible property writes
 throw `TypeError`.
 
+FFI declarations are unsafe by default and are expected to use the platform C
+ABI. The initial syntax is `unsafe extern name(types): return from "library"`.
+Library handles must be runtime-owned and remain live until all wrappers and
+callbacks are released; native pointers may not outlive a call unless an
+explicit ownership type is added.

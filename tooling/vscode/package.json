@@ -1,7 +1,7 @@
 {
   "name": "sxfescript",
   "displayName": "SxfeScript",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "publisher": "raythings",
   "engines": { "vscode": "^1.90.0" },
   "categories": ["Programming Languages"],
@@ -36,4 +36,3 @@
     }
   }
 }
-

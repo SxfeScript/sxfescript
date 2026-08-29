@@ -1,5 +1,7 @@
 # QuickJS provenance
 
+- Fork name: **ArcSX** (this repository's own quickjs fork, diverged from the
+  snapshot below with local SX-language patches and upstream cherry-picks)
 - Upstream project: `quickjs-ng/quickjs`
 - Rayact fork URL: `https://github.com/raythings/quickjs.git`
 - Exported Git revision: `66f4965`
