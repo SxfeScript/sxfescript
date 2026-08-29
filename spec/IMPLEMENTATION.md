@@ -129,6 +129,33 @@ it. Benchmarks against JIT runtimes should be read with that in mind: on
 JIT-bound microbenchmarks the comparison is against something this project
 structurally cannot do.
 
+### The remaining collector rewrites are measured at ~zero ceiling
+
+The second-opinion review (see below) rated two collector-level designs as
+the strongest remaining options: replacing the per-object GC list with
+arena-block iteration (est. 8-20 ns of the 76 ns object lifecycle) and
+Bacon-Rajan candidate buffering so a 1->0 death never touches the list
+(est. 10-25 ns). Both estimates rest on the same premise: that
+add_gc_object/remove_gc_object's doubly-linked list maintenance is a
+material per-object cost.
+
+An ablation tested the premise directly. Building with
+-DSXN_ABLATE_GC_LIST makes add_gc_object self-loop the link instead of
+inserting into gc_obj_list, eliminating the list cost entirely; on
+workloads verified GC-free (gcCount 0, so the list is never read), the
+binary is behaviorally identical and the A/B isolates pure linkage cost.
+Result, interleaved minimums: `{}` lifecycle 37.0 -> 37.7 ns, `{a:1}` 63.0
+-> 62.7, empty array 45.8 -> 45.7, all three throughput benchmarks within
+noise. The ceiling for both rewrites is ~0-1 ns on this allocator: the
+insert/remove touches adjacent hot cache lines and is effectively free.
+
+Both designs are therefore closed with a negative result rather than
+deferred: multi-week collector rewrites cannot pay when an exact upper
+bound on their benefit measures zero. The remaining lifecycle cost sits in
+JS_NewObjectFromShape's field initialization, shape refcounting and the
+allocator fast path itself, per the profile -- diffuse, not concentrated
+behind any single removable structure.
+
 What remains available is everything that needs no generated code:
 
 - **Direct dispatch of C-function calls** (done): calling js_call_c_function

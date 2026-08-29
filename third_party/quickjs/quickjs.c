@@ -7660,7 +7660,12 @@ static void add_gc_object(JSRuntime *rt, JSGCObjectHeader *h,
 {
     JS_GC_MARK(h) = 0;
     JS_GC_TYPE(h) = type;
+#ifdef SXN_ABLATE_GC_LIST /* experiment only: see spec ledger */
+    init_list_head(&h->link); /* self-loop so list_del stays valid */
+    (void)rt;
+#else
     list_add_tail(&h->link, &rt->gc_obj_list);
+#endif
 }
 
 static void remove_gc_object(JSGCObjectHeader *h)
