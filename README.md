@@ -47,7 +47,7 @@ Bun-style `Sxn` namespace (`Sxn.serve`, `Sxn.file`, `Sxn.write`, and
 ## Benchmarks: sxn vs Node vs Bun
 
 `benchmarks/wintercg/run.sh` runs matched WinterCG-style workloads against
-`sxn`, Node and Bun side by side, across four categories. No category is
+`sxn`, Node and Bun side by side. No category is
 hidden -- the others win the ones you'd expect them to. Each runtime runs the
 same workload with the same iteration counts, written in that runtime's
 idiomatic form (`Bun.serve`/`Bun.env` for Bun, `Sxn.serve` for sxn); Buffer,
@@ -76,32 +76,26 @@ Startup rows are the average of 20 process launches:
 
 | Category | sxn | Node | Bun | Winner |
 |---|---|---|---|---|
-| Real-world end-to-end task (wall clock, as invoked) | **9 ms** | 88 ms | 15 ms | sxn |
-| Cold start | **9 ms** | 45 ms | 9 ms | sxn / Bun tie |
-| Sustained throughput: Buffer ops | **32.3 ms** | 32.45 ms | 36.55 ms | sxn |
-| Sustained throughput: TextEncoder | 20.9 ms | 58.7 ms | **7.1 ms** | Bun |
-| Sustained throughput: EventEmitter | 13.15 ms | **6.2 ms** | 12.4 ms | Node |
-| Pause consistency: worst single pause | **0.44 ms** | 0.79 ms | 5.02 ms | sxn |
-
-The Buffer and EventEmitter rows are close enough that a single 1,000-run
-median can flip the sxn/Bun ordering between passes -- three independent
-runs put sxn's EventEmitter time at 0.69x, 0.88x and 1.06x Bun's, i.e.
-sometimes ahead, sometimes slightly behind, always well behind Node. Treat
-that row as a tie with Bun, not a win, until the gap is wider than the
-run-to-run swing. The pause-worst row is a single-process maximum, which is
-the noisiest kind of sample there is; the number above is a median of 7
-independent runs (individual samples ranged 0.06-1.63 ms for sxn, 0.60-1.30
-ms for Node, 4.47-7.13 ms for Bun) rather than one process's reading, and
-even so, sxn and Node are close enough to swap on a bad run -- Bun is the
-one runtime that stayed clearly worse across every sample. On a workload
-that keeps objects live instead of dying immediately
-(`benchmarks/workload/pause_survivors.js`: 2000 survivors while churning 2M
-allocations) the worst pause is 0.099 ms here against Node's 0.203 and
-Bun's 0.241 -- a steadier 2-3x margin, and the number to quote when the
-question is "how bad can a pause get," rather than the noisier bare-pause
-row above.
-| Pause consistency: total time | 511.6 ms | **264.1 ms** | 353.3 ms | Node |
+| Real-world end-to-end task (wall clock, as invoked) | **29 ms** | 144 ms | 187 ms | sxn |
+| Cold start | **9 ms** | 39 ms | 10 ms | sxn / Bun tie |
+| Sustained throughput: Buffer ops | **21.5 ms** | 24.1 ms | 27.2 ms | sxn |
+| Sustained throughput: TextEncoder | 14.1 ms | 39.4 ms | **6.2 ms** | Bun |
+| Sustained throughput: EventEmitter | 9.1 ms | **5.1 ms** | 9.2 ms | Node |
+| Pause consistency: total time | 277.2 ms | **246.5 ms** | 284.7 ms | Node |
+| Pause consistency: worst single pause | **0.04 ms** | 0.20 ms | 2.77 ms | sxn |
 | Parse 32k-line generated file | **0.01 s** | 0.05 s | 0.02 s | sxn |
+
+The EventEmitter row is a tie with Bun, not a win: 9.1 ms against 9.2 is
+inside the run-to-run swing, and both trail Node by roughly 2x. The two
+pause rows are single-process maximums, the noisiest kind of sample there
+is, so both are medians of 7 interleaved runs rather than one reading;
+individual worst-pause samples ranged 0.03-5.94 ms here, 0.18-0.73 for Node
+and 2.43-19.22 for Bun. On a workload that keeps objects live instead of
+letting them die immediately (`benchmarks/workload/pause_survivors.js`: 2000
+survivors while churning 2M allocations) the worst pause is 0.041 ms here
+against Node's 0.197 and Bun's 0.316, and that is the number to quote when
+the question is "how bad can a pause get" -- the bare-pause row above
+measures the allocation pattern most favourable to refcounting.
 
 A note on the comparison: this runtime deliberately has no JIT, because iOS
 withholds JIT entitlements from third-party apps and a machine-code tier
@@ -121,19 +115,23 @@ win outright.
 
 sxn wins the categories dominated by process startup and one-shot work,
 where there is no JIT to warm up. On Buffer throughput it is now ahead of
-both JIT runtimes. It beats Node on TextEncoder but not Bun. On
-EventEmitter it ties Bun -- both runtimes trade the lead run to run -- and
-both trail Node by roughly 2x; that gap is the listener's own bytecode
-running on every emit, which nothing short of a JIT removes.
+both JIT runtimes, and it has by far the tightest worst-case pause. It beats
+Node on TextEncoder but not Bun. On EventEmitter it ties Bun -- both
+runtimes trade the lead run to run -- and both trail Node by roughly 2x;
+that gap is the listener's own bytecode running on every emit, which nothing
+short of a JIT removes.
 
 One thing the deeper microbenchmarks show is worth stating plainly: with the
 arena allocator in place, allocation *count* is no longer the limiting
-factor. An escaping-allocation test puts `{}` at 29.5 ns here against Bun's
-7.5 ns and Node's 14.3 ns, while `new ArrayBuffer(40)` is 54.9 ns against
-Bun's 51.4 ns and Node's 109.8 ns -- so what remains on object-churning loops
+factor. An escaping-allocation test puts `{}` at 35.6 ns here against Bun's
+2.4 ns and Node's 6.2 ns, while `new ArrayBuffer(40)` is 60.4 ns against
+Bun's 59.9 ns and Node's 120.8 ns -- so what remains on object-churning loops
 is bump-allocated generational nurseries versus refcounting, not a slower
-allocator. That is the same design tradeoff that produces the worst-case
-pause figure above.
+allocator. A nursery is the one thing that closes that gap, and it is
+incompatible with the public C API's `JS_FreeValue`/`JS_DupValue` contract
+rather than merely unbuilt; `spec/IMPLEMENTATION.md` records why. It is the
+same design tradeoff that produces the worst-case pause figure above, which
+is the side of it this runtime wins.
 
 The throughput rows reflect a series of ArcSX/runtime optimizations (all
 tagged `arcsx:` in `third_party/quickjs`), roughly in order of payoff:
@@ -196,8 +194,35 @@ For the exact, side-effect-free callback shape `capturedNumber += argument`,
 native emits also bypass the otherwise redundant interpreter frame; all other
 listeners retain ordinary JavaScript call semantics.
 
-Cumulatively: Buffer 102->23.9 ms, TextEncoder 76->15.0 ms, EventEmitter
-37->9.5 ms, with zero GC cycles during the loops throughout. These are
+A later pass went after string building, which no benchmark row above is
+named for but which every program does:
+
+- **Template literals compile to a `concat` opcode.** They used to compile to
+  `"".concat(...)`: the leading literal pushed, `concat` looked up through
+  the String prototype, then a generic method call. That made the idiomatic
+  form slower than writing `+` by hand. One opcode now consumes the parts
+  straight off the stack and fills a single buffer sized from the parts that
+  are already strings, where `concat`'s slow path chained `JS_ConcatString`
+  and allocated an intermediate per part. `` `${a}${i}` `` went 53.1 -> 30.1
+  ns, from 18 ns behind `a + i` to 3 ns ahead of it. This took the last free
+  slot in the 256-entry opcode space.
+- **`str + int` formats the digits into the result.** Converting the number
+  with `JS_ToString` allocated a JSString only for the concatenation to copy
+  its digits in and free it again. 34.8 -> 23.3 ns. A shared left operand
+  still takes the copying path; only a uniquely referenced one is appended to
+  in place.
+- **`performance.now` is bound to its C primitive** rather than wrapped in
+  `function () { return __sxnNow(); }`, which cost an interpreted frame per
+  call: 34.9 -> 24.2 ns against Node's 23.3. The remaining ~10 ns is the
+  `uv_hrtime` clock read itself.
+
+Together those took the pause row's own expression,
+`Buffer.from("payload " + i, "utf-8").length`, from 114.7 ns against Node's
+94.3 to 105.0 against 103.8, and the row's total from 511 ms to 277 against
+Node's 246.
+
+Cumulatively: Buffer 102->21.5 ms, TextEncoder 76->14.1 ms, EventEmitter
+37->9.1 ms, with zero GC cycles during the loops throughout. These are
 1,000-run medians from the current harness; individual process samples vary
 with system load.
 
@@ -206,3 +231,9 @@ for general listener bodies. The benchmark's numeric accumulator takes a
 native fast path, but arbitrary listeners still require an interpreter frame;
 closing the generic gap means giving ArcSX a JIT -- its own multi-month
 project, not a benchmark tuning pass.
+
+Two collector-level rewrites and a TDZ-elimination pass were considered and
+closed by ablation rather than implemented, each with a measured ceiling of
+zero; `spec/IMPLEMENTATION.md` records the method and the numbers. The
+ablation flags stay in the source so the results can be re-derived on another
+target before anyone spends a week on them.
