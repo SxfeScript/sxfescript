@@ -23019,6 +23019,15 @@ typedef struct JSFunctionDef {
     int global_var_size;
     JSGlobalVar *global_vars;
     uint32_t *global_vars_htab; /* arcsx: name -> index, see find_global_var */
+    /* arcsx: resolution index for resolve_scope_var; see js_build_resolve_htab */
+    uint32_t *resolve_htab;
+    int resolve_htab_var_count; /* var_count at build; stale if it moved */
+    uint8_t resolve_fast_ok;    /* no `with` pseudo-vars anywhere in fd */
+    /* arcsx: name -> first index for find_closure_var, maintained on append
+       like vars_htab; duplicates keep the first entry to preserve the linear
+       scan's first-match answer */
+    uint32_t *closure_var_htab;
+    uint8_t closure_var_has_pseudo; /* any _var_/_arg_var_/_with_ entries */
 
     DynBuf byte_code;
     int last_opcode_pos; /* -1 if no last opcode */
@@ -33980,6 +33989,8 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
     js_free(ctx, fd->vars);
     js_free(ctx, fd->vars_htab); // XXX can probably be freed earlier?
     js_free(ctx, fd->global_vars_htab); /* arcsx */
+    js_free(ctx, fd->resolve_htab); /* arcsx */
+    js_free(ctx, fd->closure_var_htab); /* arcsx */
     for(i = 0; i < fd->arg_count; i++) {
         JS_FreeAtom(ctx, fd->args[i].var_name);
     }
@@ -34490,6 +34501,47 @@ static __maybe_unused void js_dump_function_bytecode(JSContext *ctx, JSFunctionB
 
 #ifndef QJS_DISABLE_PARSER
 
+/* arcsx: mirrors update_var_htab, but on a duplicate name keeps the earlier
+   index so lookups agree with the linear scan's first-match rule. */
+static int update_closure_var_htab(JSContext *ctx, JSFunctionDef *fd)
+{
+    uint32_t i, j, k, m, *p;
+
+    if (fd->closure_var_count < 27) // 27 + 27/5 == 32
+        return 0;
+    k = fd->closure_var_count - 1;
+    m = fd->closure_var_count + fd->closure_var_count/5;
+    if (m & (m - 1)) // unless power of two
+        goto insert;
+    m *= 2;
+    p = js_realloc(ctx, fd->closure_var_htab, m * sizeof(*fd->closure_var_htab));
+    if (!p)
+        return -1;
+    fd->closure_var_htab = p;
+    memset(p, 0xff, m * sizeof(*p)); // fill with UINT32_MAX
+    k = 0; // rehash everything
+ insert:
+    m = fd->closure_var_count + fd->closure_var_count/5;
+    m = UINT32_MAX >> clz32(m);
+    do {
+        i = hash32(fd->closure_var[k].var_name);
+        j = 1;
+        for (;;) {
+            p = &fd->closure_var_htab[i & m];
+            if (*p == UINT32_MAX)
+                break;
+            if (fd->closure_var[*p].var_name == fd->closure_var[k].var_name)
+                goto next; /* keep the first entry */
+            i += j;
+            j += 1; // quadratic probing
+        }
+        *p = k;
+    next:
+        k++;
+    } while (k < (uint32_t)fd->closure_var_count);
+    return 0;
+}
+
 static int add_closure_var(JSContext *ctx, JSFunctionDef *s,
                            JSClosureTypeEnum closure_type,
                            int var_idx, JSAtom var_name,
@@ -34518,6 +34570,11 @@ static int add_closure_var(JSContext *ctx, JSFunctionDef *s,
     cv->is_safe_i32 = false;
     cv->var_idx = var_idx;
     cv->var_name = JS_DupAtom(ctx, var_name);
+    if (var_name == JS_ATOM__var_ || var_name == JS_ATOM__arg_var_ ||
+        var_name == JS_ATOM__with_)
+        s->closure_var_has_pseudo = true;
+    if (update_closure_var_htab(ctx, s))
+        return -1;
     return s->closure_var_count - 1;
 }
 
@@ -34525,6 +34582,25 @@ static int find_closure_var(JSContext *ctx, JSFunctionDef *s,
                             JSAtom var_name)
 {
     int i;
+    /* arcsx: every module- or global-scope reference resolves through this
+       scan, so a file with N top-level declarations paid O(N) here per
+       reference. The index maps a name to its first entry, which is exactly
+       what the scan returned. */
+    if (s->closure_var_htab) {
+        uint32_t h, j, m, *q;
+        m = s->closure_var_count + s->closure_var_count/5;
+        m = UINT32_MAX >> clz32(m);
+        h = hash32(var_name);
+        j = 1;
+        for (;;) {
+            q = &s->closure_var_htab[h & m];
+            if (*q == UINT32_MAX)
+                return -1;
+            if (s->closure_var[*q].var_name == var_name)
+                return (int)*q;
+            h += j; j += 1; /* quadratic probing */
+        }
+    }
     for(i = 0; i < s->closure_var_count; i++) {
         JSClosureVar *cv = &s->closure_var[i];
         if (cv->var_name == var_name)
@@ -34750,6 +34826,77 @@ static inline void capture_var(JSFunctionDef *s, JSVarDef *vd)
 }
 
 /* return the position of the next opcode */
+/* arcsx: resolve_scope_var walks scopes[scope_level].first down scope_next
+   to find a name. The chain holds every scoped variable in the enclosing
+   scopes, so once parsing is done a reference to an early variable walks
+   nearly all of them: O(N/2) per reference, O(N^2) per function, and the
+   dominant cost of parsing generated code (32k top-level lets: 0.73 s
+   against Node's 0.06 s, with this walk at the top of the profile).
+
+   The index maps each name to its variable index when the function declares
+   that name exactly once (the overwhelmingly common case), or to DUP when it
+   is declared more than once. A single-hit candidate stands in for the walk
+   only when:
+   - the function has no `_with_` pseudo-variables at all (the walk emits
+     with-object tests for `_with_` entries it passes, a side effect the
+     shortcut must not skip) -- checked once at build;
+   - the candidate is a scoped variable (scope_level != 0; plain vars are
+     not on the chain and must not be found by it); and
+   - its scope is an ancestor-or-self of the reference's scope
+     (is_child_scope), i.e. it is actually on this chain.
+   Anything else -- duplicates, misses, pseudo-vars, stale index after
+   var_count moved -- falls back to the walk unchanged. */
+#define JS_RESOLVE_HTAB_DUP (UINT32_MAX - 1)
+
+static void js_build_resolve_htab(JSContext *ctx, JSFunctionDef *fd)
+{
+    uint32_t m, i, h, j, *p;
+
+    fd->resolve_htab_var_count = fd->var_count;
+    fd->resolve_fast_ok = false;
+    m = fd->var_count * 2;
+    m = UINT32_MAX >> clz32(m);
+    p = js_realloc(ctx, fd->resolve_htab, ((size_t)m + 1) * sizeof(*p));
+    if (!p)
+        return; /* stays NULL or stale; lookups fall back to the walk */
+    fd->resolve_htab = p;
+    memset(p, 0xff, ((size_t)m + 1) * sizeof(*p));
+    for (i = 0; i < (uint32_t)fd->var_count; i++) {
+        JSAtom name = fd->vars[i].var_name;
+        if (name == JS_ATOM__with_)
+            return; /* leave resolve_fast_ok false: walk everything */
+        h = hash32(name);
+        j = 1;
+        for (;;) {
+            uint32_t *q = &fd->resolve_htab[h & m];
+            if (*q == UINT32_MAX) { *q = i; break; }
+            if (fd->vars[*q].var_name == name) { *q = JS_RESOLVE_HTAB_DUP; break; }
+            h += j; j += 1; /* quadratic probing */
+        }
+    }
+    fd->resolve_fast_ok = true;
+}
+
+static int js_resolve_htab_lookup(JSFunctionDef *fd, JSAtom name)
+{
+    uint32_t m, h, j;
+
+    m = fd->resolve_htab_var_count * 2;
+    m = UINT32_MAX >> clz32(m);
+    h = hash32(name);
+    j = 1;
+    for (;;) {
+        uint32_t v = fd->resolve_htab[h & m];
+        if (v == UINT32_MAX)
+            return -1; /* definitively absent */
+        if (v != JS_RESOLVE_HTAB_DUP && fd->vars[v].var_name == name)
+            return (int)v;
+        if (v == JS_RESOLVE_HTAB_DUP)
+            return -2; /* declared more than once: caller must walk */
+        h += j; j += 1;
+    }
+}
+
 static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                              JSAtom var_name, int scope_level, int op,
                              DynBuf *bc, uint8_t *bc_buf,
@@ -34772,6 +34919,40 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
 
     /* resolve local scoped variables */
     var_idx = -1;
+    /* arcsx: index the common single-declaration case; see
+       js_build_resolve_htab above for the exact conditions. */
+    if (!is_pseudo_var && s->var_count >= 64) {
+        if (!s->resolve_htab || s->resolve_htab_var_count != s->var_count)
+            js_build_resolve_htab(ctx, s);
+        if (s->resolve_fast_ok && s->resolve_htab_var_count == s->var_count) {
+            int ridx = js_resolve_htab_lookup(s, var_name);
+            if (ridx >= 0) {
+                vd = &s->vars[ridx];
+                if (vd->scope_level != 0 &&
+                    is_child_scope(ctx, s, scope_level, vd->scope_level)) {
+                    if ((op == OP_scope_put_var || op == OP_scope_make_ref) &&
+                        vd->is_const) {
+                        dbuf_putc(bc, OP_throw_error);
+                        dbuf_put_u32(bc, JS_DupAtom(ctx, var_name));
+                        dbuf_putc(bc, JS_THROW_VAR_RO);
+                        goto done;
+                    }
+                    var_idx = ridx;
+                    /* the walk computes is_arg_scope from where the chain
+                       *ended*; on a hit it breaks first, so a found variable
+                       always leaves it false. */
+                    is_arg_scope = false;
+                    goto found_scoped_var;
+                }
+                /* Single declaration but not on this reference's scope
+                   chain, or a plain var (scope_level 0, never chained):
+                   the walk cannot find it either. It still must run --
+                   its end sentinel decides is_arg_scope -- but with the
+                   name known absent it does no per-entry work worth
+                   avoiding, so simply fall through. */
+            }
+        }
+    }
     for (idx = s->scopes[scope_level].first; idx >= 0;) {
         vd = &s->vars[idx];
         if (vd->var_name == var_name) {
@@ -34794,6 +34975,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
         idx = vd->scope_next;
     }
     is_arg_scope = (idx == ARG_SCOPE_END);
+ found_scoped_var:
     if (var_idx < 0) {
         /* argument scope: variables are not visible but pseudo
            variables are visible */
@@ -35019,6 +35201,33 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
         fd = s;
     if (var_idx < 0 && fd->is_eval) {
         int idx1;
+        /* arcsx: a module's top-level declarations all live in this list, so
+           each top-level reference paid a linear scan of it -- the dominant
+           cost of parsing a large module (60k declarations: several seconds,
+           quadratic). When no _var_/_arg_var_/_with_ pseudo entries exist
+           (they only appear for direct eval), the scan has no side effects
+           before a match, and the name index answers it directly; a miss
+           skips the loop entirely. Pseudo entries or a missing index fall
+           back to the scan unchanged. */
+        if (!fd->closure_var_has_pseudo && fd->closure_var_htab && !is_pseudo_var) {
+            idx1 = find_closure_var(ctx, fd, var_name);
+            if (idx1 >= 0) {
+                JSClosureVar *cv = &fd->closure_var[idx1];
+                if (fd != s) {
+                    idx = get_closure_var(ctx, s, fd,
+                                          JS_CLOSURE_REF,
+                                          idx1,
+                                          cv->var_name, cv->is_const,
+                                          cv->is_lexical, cv->var_kind);
+                    if (idx >= 0)
+                        s->closure_var[idx].is_safe_i32 = cv->is_safe_i32;
+                } else {
+                    idx = idx1;
+                }
+                goto has_idx;
+            }
+            goto eval_closure_scan_done; /* arcsx: definitive miss */
+        }
         for (idx1 = 0; idx1 < fd->closure_var_count; idx1++) {
             JSClosureVar *cv = &fd->closure_var[idx1];
             if (var_name == cv->var_name) {
@@ -35052,6 +35261,7 @@ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                 var_object_test(ctx, s, var_name, op, bc, &label_done, is_with);
             }
         }
+    eval_closure_scan_done:;
     }
 
     if (var_idx >= 0) {
@@ -35876,6 +36086,18 @@ static void instantiate_hoisted_definitions(JSContext *ctx, JSFunctionDef *s, Dy
            enclosing variables */
         /* If the outer function has a variable environment,
            create a property for the variable there */
+        /* arcsx: the third and last of the per-global-variable linear scans
+           over the closure list (with the two in resolve_variables); same
+           O(N*M) shape, same fix. Without _var_/_arg_var_ pseudo entries the
+           scan is a first-match name lookup, which the index answers. */
+        if (!s->closure_var_has_pseudo && s->closure_var_htab) {
+            idx = find_closure_var(ctx, s, hf->var_name);
+            if (idx >= 0) {
+                has_closure = 2;
+                force_init = false;
+            }
+            goto closure_scan_done;
+        }
         for(idx = 0; idx < s->closure_var_count; idx++) {
             JSClosureVar *cv = &s->closure_var[idx];
             if (cv->var_name == hf->var_name) {
@@ -35892,6 +36114,7 @@ static void instantiate_hoisted_definitions(JSContext *ctx, JSFunctionDef *s, Dy
                 break;
             }
         }
+    closure_scan_done:;
         if (!has_closure) {
             int flags;
 
@@ -36053,6 +36276,25 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
         int flags;
 
         /* check if global variable (XXX: simplify) */
+        /* arcsx: this inner scan made hoisted-global instantiation O(N*M) --
+           the last leg of the quadratic parse of large modules. When no
+           _var_/_arg_var_ pseudo entries exist (they only appear for direct
+           eval), the scan reduces to a first-match name lookup, which the
+           closure-var index answers; the ordering subtlety between a name
+           match and a pseudo entry cannot arise without pseudo entries. */
+        if (!s->closure_var_has_pseudo && s->closure_var_htab) {
+            idx = find_closure_var(ctx, s, hf->var_name);
+            if (idx >= 0) {
+                JSClosureVar *cv = &s->closure_var[idx];
+                if (s->eval_type == JS_EVAL_TYPE_DIRECT && cv->is_lexical) {
+                    dbuf_putc(&bc_out, OP_throw_error);
+                    dbuf_put_u32(&bc_out, JS_DupAtom(ctx, hf->var_name));
+                    dbuf_putc(&bc_out, JS_THROW_VAR_REDECL);
+                }
+                goto next;
+            }
+            goto global_var_not_closure; /* definitive miss */
+        }
         for(idx = 0; idx < s->closure_var_count; idx++) {
             JSClosureVar *cv = &s->closure_var[idx];
             if (cv->var_name == hf->var_name) {
@@ -36073,6 +36315,7 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
                 cv->var_name == JS_ATOM__arg_var_)
                 goto next;
         }
+    global_var_not_closure:;
 
         dbuf_putc(&bc_out, OP_check_define_var);
         dbuf_put_u32(&bc_out, JS_DupAtom(ctx, hf->var_name));
@@ -38349,6 +38592,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
         js_free(ctx, fd->vars);
         js_free(ctx, fd->vars_htab);
         js_free(ctx, fd->global_vars_htab); /* arcsx */
+        js_free(ctx, fd->resolve_htab); /* arcsx */
+        js_free(ctx, fd->closure_var_htab); /* arcsx */
     }
     b->cpool_count = fd->cpool_count;
     if (b->cpool_count) {

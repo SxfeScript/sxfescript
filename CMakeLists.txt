@@ -159,6 +159,9 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # duplicate-named groups, lookaround, sticky/global state, unicode
   # properties, v flag, modifiers, and a linear-time catastrophic case.
   add_test(NAME sxn-regexp COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/regexp_conformance.mjs)
+  # Direct-eval and with-statement scope resolution -- the pseudo-variable
+  # paths that the resolver's name indexes must fall back to, never shortcut.
+  add_test(NAME sxn-eval-scopes COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/eval_scopes.cjs)
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
 
