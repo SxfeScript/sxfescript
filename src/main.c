@@ -104,9 +104,11 @@ static int execute_file(int argc, char **argv, const char *filename,
         JS_ComputeMemoryUsage(runtime, &usage);
         JS_DumpMemoryUsage(stderr, &usage, runtime);
     }
+    sxn_free_node_compat(context);
     js_std_free_handlers(runtime); JS_FreeContext(context); JS_FreeRuntime(runtime); return 0;
 failure:
     if (source) js_free(context, source);
+    sxn_free_node_compat(context);
     js_std_free_handlers(runtime); JS_FreeContext(context); JS_FreeRuntime(runtime); return 1;
 }
 

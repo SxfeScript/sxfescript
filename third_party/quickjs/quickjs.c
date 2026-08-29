@@ -3801,6 +3801,25 @@ static JSAtom JS_NewAtomStr(JSContext *ctx, JSString *p)
 {
     JSRuntime *rt = ctx->rt;
     uint32_t n;
+    /* arcsx: skip the numeric-string scan when `p` is already interned as a
+       JS_ATOM_TYPE_STRING atom. Such a string cannot be the canonical
+       representation of an integer <= JS_ATOM_MAX_INT: every path that
+       interns a string atom rules those out first -- this function's own
+       is_num_string() branch below, the `n <= JS_ATOM_MAX_INT` guards in
+       JS_NewAtomUInt32/JS_NewAtomInt64, and the documented precondition on
+       __JS_NewAtomInit. So for an existing string atom the scan can only
+       fall through to __JS_NewAtom anyway, which then returns the interned
+       index immediately.
+
+       This is the hot path for `obj[key]` with a string key, and for native
+       code calling JS_ValueToAtom on a bytecode string literal -- e.g.
+       `ee.emit("x", v)`, where the literal is pushed as the atom's own
+       JSString and was being rescanned on every call. The assert states the
+       invariant the shortcut relies on. */
+    if (p->atom_type == JS_ATOM_TYPE_STRING) {
+        assert(!(is_num_string(&n, p) && n <= JS_ATOM_MAX_INT));
+        return __JS_NewAtom(rt, p, JS_ATOM_TYPE_STRING);
+    }
     if (is_num_string(&n, p)) {
         if (n <= JS_ATOM_MAX_INT) {
             js_free_string(rt, p);

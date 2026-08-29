@@ -1013,6 +1013,19 @@ static JSModuleDef *sxn_init_module_node_process(JSContext *ctx, const char *nam
     return m;
 }
 
+void sxn_free_node_compat(JSContext *ctx) {
+    /* The cached atoms below hold real references for the life of the
+       context; without this they show up as leaks under --leak-check (only
+       visible in builds where the runtime's leak dumps are compiled in).
+       JS_FreeAtom is a no-op for the predefined ones. */
+    JS_FreeAtom(ctx, sxn_atom_events);
+    JS_FreeAtom(ctx, sxn_atom_length);
+    JS_FreeAtom(ctx, sxn_atom_error);
+    sxn_atom_events = JS_ATOM_NULL;
+    sxn_atom_length = JS_ATOM_NULL;
+    sxn_atom_error = JS_ATOM_NULL;
+}
+
 int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
     if (sxn_atom_events == JS_ATOM_NULL) sxn_atom_events = JS_NewAtom(ctx, "_events");
     if (sxn_atom_length == JS_ATOM_NULL) sxn_atom_length = JS_NewAtom(ctx, "length");
