@@ -132,6 +132,10 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # Stack exhaustion must raise RangeError and stay recoverable -- including
   # when it unwinds through a native frame -- never crash the process.
   add_test(NAME sxn-stack-safety COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/stack_safety.mjs)
+  # Temporal dead zone must survive the fused let/const compound-assignment
+  # opcodes, and those opcodes must keep exact JS arithmetic (int overflow
+  # promotes to double, BigInt and string accumulation still work).
+  add_test(NAME sxn-tdz-fusion COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/tdz_fusion.mjs)
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
 
