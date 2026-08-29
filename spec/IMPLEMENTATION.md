@@ -156,6 +156,36 @@ JS_NewObjectFromShape's field initialization, shape refcounting and the
 allocator fast path itself, per the profile -- diffuse, not concentrated
 behind any single removable structure.
 
+### TDZ check elimination has a measured ceiling of zero
+
+The interpreter re-tests the temporal dead zone on every read of a `let` or
+`const`: the emit benchmark's inner loop alone runs four `_check` opcodes per
+iteration on bindings that were initialized long before. Eliminating those
+statically needs a dataflow pass -- a fixed point over the CFG, intersecting
+initialized-sets at join points -- which is correctness-critical in the worst
+way, because a bug does not crash. It silently stops throwing ReferenceError
+and the engine quietly accepts programs the spec rejects.
+
+Ablation settles whether that risk is worth taking. Building with
+-DSXN_ABLATE_TDZ=1 skips the JS_IsUninitialized test in OP_get_loc_check and
+OP_get_var_ref_check while leaving the opcode, its operand and dispatch
+untouched, so the A/B isolates exactly the branch a perfect elimination pass
+would remove -- an exact upper bound, and behaviourally identical on code
+that never trips TDZ.
+
+The bound is nothing. Interleaved minimums: buffer 20.9 -> 20.8 ms,
+textencoder 13.7 -> 13.6, events 8.9 -> 8.7, and on the real workloads
+text.js 16.9 -> 17.1, config.js 207.7 -> 209.0, collections.js 41.6 -> 41.7,
+i.e. inside noise and signed the wrong way as often as not. A synthetic loop
+doing eight lexical reads per iteration does show 0.17 ns per check, which is
+what made the lever look worth pulling; real code does not read the same
+binding eight times per iteration, and the branch is perfectly predicted
+not-taken, so the test disappears into the load it accompanies.
+
+Closed as a negative result. The ablation flag stays in the source so the
+measurement can be re-derived on another target before anyone spends a week
+on the pass.
+
 What remains available is everything that needs no generated code:
 
 - **Direct dispatch of C-function calls** (done): calling js_call_c_function

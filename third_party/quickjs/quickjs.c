@@ -45,6 +45,15 @@
 #include "cutils.h"
 #include "list.h"
 #include "quickjs.h"
+/* arcsx: measurement harness, inert unless built with -DSXN_ABLATE_TDZ=1.
+   Skips the temporal-dead-zone test in OP_get_loc_check / OP_get_var_ref_check
+   while leaving the opcode, operand and dispatch identical, so an A/B measures
+   exactly what a TDZ-elimination pass could ever recover. On code that never
+   trips TDZ the two builds are behaviourally identical. See the ledger entry
+   for the result: it is zero. */
+#ifndef SXN_ABLATE_TDZ
+#define SXN_ABLATE_TDZ 0
+#endif
 #include "libregexp.h"
 #include "dtoa.h"
 
@@ -19909,7 +19918,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 idx = get_u16(pc);
                 pc += 2;
                 val = *var_refs[idx]->pvalue;
-                if (unlikely(JS_IsUninitialized(val))) {
+                if (!SXN_ABLATE_TDZ && unlikely(JS_IsUninitialized(val))) {
                     JS_ThrowReferenceErrorUninitialized2(ctx, b, idx, true);
                     goto exception;
                 }
@@ -19956,7 +19965,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 int idx;
                 idx = get_u16(pc);
                 pc += 2;
-                if (unlikely(JS_IsUninitialized(var_buf[idx]))) {
+                if (!SXN_ABLATE_TDZ && unlikely(JS_IsUninitialized(var_buf[idx]))) {
                     JS_ThrowReferenceErrorUninitialized2(caller_ctx, b, idx,
                                                          false);
                     goto exception;
