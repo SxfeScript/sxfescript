@@ -199,14 +199,28 @@ file of top-level `let`s takes ~0.73 s against Node's 0.06 s, and the cost
 grows quadratically -- large bundles and generated code pay it, and it
 undercuts the cold-start advantage that is this runtime's main strength.
 
-The cause is a set of linear scans on the declaration path, each called once
-per declaration. Two are fixed (`find_var_in_child_scope` and
+The cause is a set of linear scans, each run once per declaration or
+reference. Two on the *parse* path are fixed (`find_var_in_child_scope` and
 `find_global_var`, the latter given the same open-addressed index that
-`find_var` already had), worth ~29%: 1.03 -> 0.73 s at 32k lines. At least
-one more remains -- `js_parse_var`/`define_var` still dominates a profile --
-and `find_lexical_decl`'s scope-chain walk is quadratic by construction for
-declarations sharing a scope, short-circuited here only for names absent
-from the function entirely.
+`find_var` already had), worth ~29%: 1.03 -> 0.73 s at 32k lines.
+
+The remaining one is in the *resolution* pass, and is located precisely:
+`resolve_scope_var` walks `s->scopes[scope_level].first` down `vd->scope_next`
+to match a name. The chain is ordered most-recent-first, so at parse time a
+declaration finds itself immediately -- but `resolve_variables` runs later,
+over the whole function, when the chain holds every variable in scope. A
+reference to an early variable then walks the entire chain, giving O(N/2)
+per reference and O(N^2) overall. A 60k-declaration file profiles as
+`resolve_scope_var` 1086 samples and `resolve_variables` 721, with
+`define_var` no longer significant.
+
+Fixing it needs a real index rather than the negative-filter trick used on
+the parse path, because the lookup must return *which* variable matches, not
+merely whether one exists: an index keyed by (scope chain, name), or a
+per-name chain of variable indices that resolution can search in scope
+order. Redeclaration in a single scope is already an error, so a name maps
+to at most one variable per scope level -- the difficulty is only that the
+chain spans enclosing scopes.
 
 Reproducer: `benchmarks/engine/parse_scale.js` (32k declarations); generate
 other sizes to confirm the curve. Any fix must keep
