@@ -22,6 +22,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <dlfcn.h>
+#include <assert.h>
 
 #include "quickjs.h"
 #include <uv.h>
@@ -41,6 +42,21 @@ typedef struct NapiBlock {
     size_t len;
     JSValue values[NAPI_SCOPE_BLOCK];
 } NapiBlock;
+
+/* A handle used after its scope closed is a read of freed memory, and the
+   addon is the only one who can be wrong about it. Release cannot afford to
+   check; the assertions build can, so there it keeps the blocks and stamps
+   every slot, and the next read of one says so instead of returning
+   whatever now lives at that address. This is the whole point of shipping
+   two builds: the checked one finds it, the fast one costs nothing. */
+#ifndef NDEBUG
+#define NAPI_DEAD_HANDLE JS_MKVAL(JS_TAG_UNINITIALIZED, 0x5ca1e)
+static NapiBlock *napi_dead_blocks;
+static bool napi_is_dead(JSValue v) {
+    return JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED &&
+           JS_VALUE_GET_INT(v) == 0x5ca1e;
+}
+#endif
 
 typedef struct NapiScope {
     struct NapiScope *parent;
@@ -95,7 +111,14 @@ static napi_value napi_hold(napi_env env, JSValue v) {
     b->values[b->len] = v;
     return (napi_value)&b->values[b->len++];
 }
-static JSValue napi_val(napi_value v) { return v ? *(JSValue *)v : JS_UNDEFINED; }
+static JSValue napi_val(napi_value v) {
+    if (!v) return JS_UNDEFINED;
+#ifndef NDEBUG
+    assert(!napi_is_dead(*(JSValue *)v) &&
+           "a native addon used a napi_value after its handle scope closed");
+#endif
+    return *(JSValue *)v;
+}
 
 /* An exception thrown by JS during a call the addon made is stashed rather
    than left on the context, because the addon is expected to ask for it with
@@ -123,7 +146,13 @@ static void napi_pop_scope(napi_env env) {
     for (NapiBlock *b = s->blocks; b; ) {
         NapiBlock *next = b->next;
         for (size_t i = 0; i < b->len; i++) JS_FreeValue(env->ctx, b->values[i]);
+#ifndef NDEBUG
+        for (size_t i = 0; i < NAPI_SCOPE_BLOCK; i++) b->values[i] = NAPI_DEAD_HANDLE;
+        b->next = napi_dead_blocks;
+        napi_dead_blocks = b;       /* held, so a stale read lands on the stamp */
+#else
         free(b);
+#endif
         b = next;
     }
     env->scope = s->parent;
@@ -1078,14 +1107,75 @@ napi_status napi_create_external_buffer(napi_env env, size_t len, void *data,
 
 /* napi_define_class: a constructor function with methods on its prototype and
    statics on itself, which is what a JS class is once the sugar is gone. */
+/* A class constructor cannot go through JS_NewCFunctionData: that shape never
+   learns it was called with `new`, so napi_get_new_target always answered
+   "no" and every addon that guards its constructor threw on `new Foo()`.
+   JS_CFUNC_constructor_or_func_magic is the shape that does get told -- it
+   hands the constructor its new_target, and undefined for a plain call -- but
+   it carries only an int, so the callback is looked up by index. Classes are
+   registered once at module init, so the table is tiny and never freed. */
+static NapiFunc **napi_classes;
+static int napi_class_count;
+
+static JSValue napi_ctor_bridge(JSContext *ctx, JSValueConst new_target,
+                                int argc, JSValueConst *argv, int magic) {
+    napi_env env = sxn_env;
+    if (magic < 0 || magic >= napi_class_count) return JS_ThrowTypeError(ctx, "unknown class");
+    NapiFunc *f = napi_classes[magic];
+
+    /* N-API hands the constructor a `this` that already exists and wears the
+       class's prototype; QuickJS expects the C function to make it. */
+    JSValue self = JS_UNDEFINED;
+    if (!JS_IsUndefined(new_target)) {
+        JSValue proto = JS_GetPropertyStr(ctx, new_target, "prototype");
+        if (JS_IsException(proto)) return proto;
+        self = JS_NewObjectProto(ctx, proto);
+        JS_FreeValue(ctx, proto);
+        if (JS_IsException(self)) return self;
+    }
+
+    struct napi_callback_info__ info = { self, argc, argv, f->data,
+                                         JS_DupValue(ctx, new_target) };
+    NapiScope scope;
+    napi_push_scope(env, &scope);
+    napi_value out = f->cb(env, &info);
+    JSValue result = out ? JS_DupValue(ctx, napi_val(out)) : JS_DupValue(ctx, self);
+    napi_pop_scope(env);
+    JS_FreeValue(ctx, info.new_target);
+    JS_FreeValue(ctx, self);
+
+    if (!JS_IsUninitialized(env->pending)) {
+        JSValue e = env->pending;
+        env->pending = JS_UNINITIALIZED;
+        JS_FreeValue(ctx, result);
+        return JS_Throw(ctx, e);
+    }
+    return result;
+}
+
 napi_status napi_define_class(napi_env env, const char *name, size_t name_len,
                               napi_callback constructor, void *data,
                               size_t count, const napi_property_descriptor *props,
                               napi_value *result) {
     CHECK_ENV(env); CHECK_ARG(env, constructor); CHECK_ARG(env, result);
-    JSValue ctor = napi_make_function(env, name, name_len, constructor, data);
+    NapiFunc *f = malloc(sizeof(*f));
+    if (!f) return NAPI_FAIL(env, napi_generic_failure, "out of memory");
+    f->cb = constructor; f->data = data; f->this_ref = JS_UNDEFINED;
+    NapiFunc **grown = realloc(napi_classes, sizeof(*grown) * (size_t)(napi_class_count + 1));
+    if (!grown) { free(f); return NAPI_FAIL(env, napi_generic_failure, "out of memory"); }
+    napi_classes = grown;
+    napi_classes[napi_class_count] = f;
+    int magic = napi_class_count++;
+
+    char buf[128];
+    size_t n = (name_len == NAPI_AUTO_LENGTH) ? (name ? strlen(name) : 0) : name_len;
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    if (name) memcpy(buf, name, n);
+    buf[n] = 0;
+
+    JSValue ctor = JS_NewCFunction2(env->ctx, (JSCFunction *)napi_ctor_bridge, buf, 0,
+                                    JS_CFUNC_constructor_or_func_magic, magic);
     NAPI_TRY(env, ctor);
-    JS_SetConstructorBit(env->ctx, ctor, true);
     JSValue proto = JS_NewObject(env->ctx);
     JS_SetConstructor(env->ctx, ctor, proto);
 
@@ -1527,6 +1617,10 @@ void sxn_shutdown_napi(JSContext *ctx) {
     }
     napi_refs = NULL;
     while (sxn_env->scope) napi_pop_scope(sxn_env);
+#ifndef NDEBUG
+    for (NapiBlock *b = napi_dead_blocks; b; ) { NapiBlock *n = b->next; free(b); b = n; }
+    napi_dead_blocks = NULL;
+#endif
     if (!JS_IsUninitialized(sxn_env->pending)) JS_FreeValue(ctx, sxn_env->pending);
     free(sxn_env);
     sxn_env = NULL;

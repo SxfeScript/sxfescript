@@ -29,6 +29,22 @@ check("a missing addon is an error",
       (() => { try { require("/nonexistent/nope.node"); return "no throw"; }
                catch (e) { return "threw"; } })(), "threw");
 
+// A class. The constructor has to be told it was called with `new`, which is
+// the one thing a plain callback shape never learns.
+const { Box } = a;
+check("static method", Box.add(2, 3), 5);
+const box = new Box(41);
+check("constructor and wrapped state", box.get(), 41);
+check("accessor on the prototype", box.value, 41);
+check("instanceof", box instanceof Box, true);
+check("calling a constructor without new",
+      (() => { try { Box(1); return "no throw"; } catch (e) { return e.constructor.name; } })(),
+      "TypeError");
+
+// More handles than one scope block holds, all read back afterwards: a scope
+// that moved its slots would have invalidated the early ones.
+check("handles survive a growing scope", a.manyHandles(), 19900);
+
 // A real worker thread calling back into JS. The calls have to arrive on the
 // loop thread, in order, and the process has to stay awake until they do.
 const seen = [];

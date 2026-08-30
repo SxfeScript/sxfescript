@@ -140,6 +140,50 @@ static napi_value FromThread(napi_env env, napi_callback_info info) {
   return undef;
 }
 
+/* A class, which is the shape that needs new_target to work: a constructor
+   built the wrong way never learns it was called with `new`. */
+typedef struct { int32_t n; } Box;
+static void BoxFree(napi_env env, void *data, void *hint) { free(data); }
+
+static napi_value BoxNew(napi_env env, napi_callback_info info) {
+  napi_value target;
+  napi_get_new_target(env, info, &target);
+  if (target == NULL) { napi_throw_type_error(env, "ERR_CTOR", "Box requires new"); return NULL; }
+  size_t argc = 1; napi_value argv[1], self;
+  napi_get_cb_info(env, info, &argc, argv, &self, NULL);
+  int32_t n = 0;
+  if (argc > 0) napi_get_value_int32(env, argv[0], &n);
+  Box *b = malloc(sizeof(Box)); b->n = n;
+  napi_wrap(env, self, b, BoxFree, NULL, NULL);
+  return self;
+}
+static napi_value BoxValue(napi_env env, napi_callback_info info) {
+  napi_value self; size_t argc = 0;
+  napi_get_cb_info(env, info, &argc, NULL, &self, NULL);
+  Box *b = NULL; napi_unwrap(env, self, (void **)&b);
+  napi_value out; napi_create_int32(env, b ? b->n : -1, &out);
+  return out;
+}
+static napi_value BoxAdd(napi_env env, napi_callback_info info) {
+  size_t argc = 2; napi_value argv[2];
+  napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  int32_t a = 0, b = 0;
+  napi_get_value_int32(env, argv[0], &a); napi_get_value_int32(env, argv[1], &b);
+  napi_value out; napi_create_int32(env, a + b, &out);
+  return out;
+}
+
+/* More handles than one scope block holds. A scope that relocated its slots
+   would leave every one of these pointing at the wrong place. */
+static napi_value ManyHandles(napi_env env, napi_callback_info info) {
+  napi_value held[200];
+  for (int i = 0; i < 200; i++) napi_create_int32(env, i, &held[i]);
+  int32_t sum = 0;
+  for (int i = 0; i < 200; i++) { int32_t v = -1; napi_get_value_int32(env, held[i], &v); sum += v; }
+  napi_value out; napi_create_int32(env, sum, &out);
+  return out;
+}
+
 static napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor props[] = {
     { "hello", NULL, Hello, NULL, NULL, NULL, napi_default, NULL },
@@ -153,8 +197,19 @@ static napi_value Init(napi_env env, napi_value exports) {
     { "makeCounter", NULL, MakeCounter, NULL, NULL, NULL, napi_default, NULL },
     { "readCounter", NULL, ReadCounter, NULL, NULL, NULL, napi_default, NULL },
     { "fromThread", NULL, FromThread, NULL, NULL, NULL, napi_default, NULL },
+    { "manyHandles", NULL, ManyHandles, NULL, NULL, NULL, napi_default, NULL },
   };
   napi_define_properties(env, exports, sizeof(props)/sizeof(props[0]), props);
+
+  napi_property_descriptor boxprops[] = {
+    { "value", NULL, NULL, BoxValue, NULL, NULL, napi_enumerable, NULL },
+    { "get", NULL, BoxValue, NULL, NULL, NULL, napi_default, NULL },
+    { "add", NULL, BoxAdd, NULL, NULL, NULL, (napi_property_attributes)(napi_static | napi_default), NULL },
+  };
+  napi_value klass;
+  napi_define_class(env, "Box", NAPI_AUTO_LENGTH, BoxNew, NULL,
+                    sizeof(boxprops)/sizeof(boxprops[0]), boxprops, &klass);
+  napi_set_named_property(env, exports, "Box", klass);
   return exports;
 }
 NAPI_MODULE(NODE_GYP_MODULE_NAME, Init)

@@ -122,12 +122,29 @@ refcounted rather than tracing, so a scope only has to release its values on
 close — simpler than the same thing on V8, and it means an addon that leaks
 handles leaks memory rather than corrupting anything.
 
-One detail is worth writing down because getting it wrong looked like an
-addon bug. A `napi_value` is a pointer to the slot holding its JSValue, so
-slots must never move: a growable array would relocate every handle the addon
-still held the moment it needed one more. Scope storage is therefore fixed
-blocks that are allocated and never resized. Small addons never notice; a
-large one fails immediately and confusingly.
+Two details are worth writing down, because both looked like addon bugs.
+
+A `napi_value` is a pointer to the slot holding its JSValue, so slots must
+never move: a growable array would relocate every handle the addon still held
+the moment it needed one more. Scope storage is therefore fixed blocks,
+allocated and never resized. Small addons never notice; a large one fails
+immediately and confusingly.
+
+A handle used *after* its scope closes is the other half of the same hazard,
+and it is the addon that is wrong rather than the runtime. Release cannot
+afford to check every read. The assertions build can, so there a closed scope
+keeps its blocks and stamps every slot, and the next read of one aborts with
+`a native addon used a napi_value after its handle scope closed` instead of
+returning whatever now lives at that address. That is what shipping two
+builds is for: the checked one finds it, the fast one costs nothing.
+
+A class constructor cannot go through the same shape as a plain function.
+QuickJS's data-carrying C functions are never told they were called with
+`new`, so `napi_get_new_target` always answered "no" and every addon that
+guards its constructor threw on `new Foo()` — which is every class written
+with node-addon-api. Constructors use the shape that *is* told, and because
+that shape carries only an integer, the callback is looked up by index in a
+table built once at module init.
 
 Thread-safe functions are implemented on libuv. Each one owns a queue and a
 `uv_async_t`; a worker thread appends under a mutex and calls `uv_async_send`,
