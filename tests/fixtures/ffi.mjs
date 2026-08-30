@@ -6,8 +6,12 @@ const show = (v) => JSON.stringify(v, (_, x) => (typeof x === "bigint" ? x + "n"
 const check = (n, got, want) => { const g = show(got);
   if (g !== show(want)) { bad++; console.log("FAIL " + n + " got=" + g + " want=" + show(want)); } };
 
-const libc = process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6";
-const libm = process.platform === "darwin" ? "libSystem.B.dylib" : "libm.so.6";
+const libc = process.platform === "darwin" ? "libSystem.B.dylib"
+  : process.platform === "win32" ? "msvcrt.dll" : "libc.so.6";
+// msvcrt.dll exports the POSIXish ones with a leading underscore.
+const getpid_sym = process.platform === "win32" ? "_getpid" : "getpid";
+const libm = process.platform === "darwin" ? "libSystem.B.dylib"
+  : process.platform === "win32" ? "msvcrt.dll" : "libm.so.6";
 
 check("f64 in and out", Sxn.ffi(libm, "pow", ["f64", "f64"], "f64")(2, 10), 1024);
 check("i32 in and out", Sxn.ffi(libc, "abs", ["i32"], "i32")(-7), 7);
@@ -51,7 +55,7 @@ check("failures are errors, not crashes", errs,
        ["unknown type", "TypeError"], ["void as an argument", "TypeError"]]);
 
 // `void` alone is C's way of writing "takes nothing".
-check("void argument list means none", typeof Sxn.ffi(libc, "getpid", ["void"], "i32")(), "number");
+check("void argument list means none", typeof Sxn.ffi(libc, getpid_sym, ["void"], "i32")(), "number");
 check("too few arguments throws", trap(() => Sxn.ffi(libm, "pow", ["f64", "f64"], "f64")(2)), "TypeError");
 
 console.log(bad === 0 ? "ALL PASS" : "FAILURES: " + bad);
