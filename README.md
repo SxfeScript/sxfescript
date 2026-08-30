@@ -383,8 +383,9 @@ with system load.
 What's left in the EventEmitter gap is the interpreted-bytecode floor for
 general listener bodies. The benchmark's numeric accumulator takes a native
 fast path and now a fused call site as well, but arbitrary listeners still
-require an interpreter frame; closing the generic gap means giving ArcSX a
-JIT -- its own multi-month project, not a benchmark tuning pass.
+require an interpreter frame. A JIT is the usual way to remove that frame,
+and it's ruled out here; closing the gap some other way is open, and hasn't
+been attempted yet.
 
 Two collector-level rewrites and a TDZ-elimination pass were considered and
 closed by ablation rather than implemented, each with a measured ceiling of

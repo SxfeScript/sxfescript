@@ -212,8 +212,7 @@
       SxfeScript is JavaScript with an explicit <span class="kw-safe">safe</span> and
       <span class="kw-unsafe">unsafe</span> boundary, affine values, and lexical borrows &mdash;
       parsed natively, with no build step, and run by <strong>ArcSX</strong>, a QuickJS-based
-      runtime that never adds a JIT tier, by design, so it runs the same on a phone as it
-      does on a server.
+      runtime built to run the same on a phone as it does on a server.
     </p>
     <div class="cta-row">
       <a class="btn btn-primary" href="{{REPO_URL}}">View the source</a>
@@ -474,9 +473,8 @@
           <li>Adding a JIT, or anything that needs runtime-generated machine code</li>
         </ul>
         <p style="margin-top:14px;">
-          Everything above that line is a real conversation. That one line is a constraint the
-          project is built around, not a preference &mdash; see <a href="#no-jit">Why there's no
-          JIT</a>.
+          Everything above is a real conversation. That one line is a constraint the project
+          is built around, not a preference &mdash; more on <a href="#no-jit">why</a>.
         </p>
       </div>
     </div>
