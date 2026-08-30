@@ -1075,6 +1075,15 @@ static void usage(void) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    /* Windows' CRT opens stdio in text mode by default, which rewrites every
+       '\n' a write() makes into "\r\n" - every other platform this runs on
+       writes bare LF, and scripts/tooling reading sxn's output shouldn't
+       have to special-case Windows to match it. */
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
+    _setmode(_fileno(stdin), _O_BINARY);
+#endif
     if (argc < 2 || !strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) { usage(); return 0; }
     if (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v")) { puts("sxn 0.0.1"); return 0; }
     if (!strcmp(argv[1], "lsp")) return sxn_lsp_main();
