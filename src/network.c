@@ -1641,6 +1641,16 @@ int sxn_install_network(JSContext *ctx) {
     /* Named "now" because bootstrap.js binds this straight onto performance
        rather than wrapping it, so this is the function user code sees. */
     JS_SetPropertyStr(ctx, global, "__sxnNow", JS_NewCFunction(ctx, sxn_now, "now", 0));
+#ifdef SXN_ABLATE_FUSION
+    JS_SetPropertyStr(ctx, global, "__ablNop",
+                      JS_NewCFunction(ctx, sxn_abl_nop, "__ablNop", 2));
+    JS_SetPropertyStr(ctx, global, "__ablEncodeLen",
+                      JS_NewCFunction(ctx, sxn_abl_encode_len, "__ablEncodeLen", 1));
+    JS_SetPropertyStr(ctx, global, "__ablBufLenConcat",
+                      JS_NewCFunction(ctx, sxn_abl_buf_len_concat, "__ablBufLenConcat", 2));
+    JS_SetPropertyStr(ctx, global, "__ablEmit",
+                      JS_NewCFunction(ctx, sxn_abl_emit, "__ablEmit", 2));
+#endif
     JS_SetPropertyStr(ctx, global, "__sxnRandomBytes", JS_NewCFunction(ctx, sxn_random_bytes, "__sxnRandomBytes", 1));
     JS_SetPropertyStr(ctx, global, "__sxnDigest", JS_NewCFunction(ctx, sxn_digest, "__sxnDigest", 2));
     /* Consumed only by bootstrap.js's TextEncoder/TextDecoder. */

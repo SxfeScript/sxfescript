@@ -1488,4 +1488,20 @@ JS_EXTERN uintptr_t js_std_cmd(int cmd, ...);
 } /* extern "C" { */
 #endif
 
+/* arcsx: exact UTF-8 byte length of a string, without encoding it; -1 if not
+   a string. */
+JS_EXTERN int64_t JS_Utf8ByteLength(JSContext *ctx, JSValueConst val);
+
+#ifdef SXN_ABLATE_FUSION
+/* arcsx: fusion-ceiling ablations; see the block in quickjs.c. */
+JS_EXTERN JSValue sxn_abl_nop(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv);
+JS_EXTERN JSValue sxn_abl_encode_len(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv);
+JS_EXTERN JSValue sxn_abl_buf_len_concat(JSContext *ctx, JSValueConst this_val,
+                                         int argc, JSValueConst *argv);
+JS_EXTERN JSValue sxn_abl_emit(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv);
+#endif
+
 #endif /* QUICKJS_H */

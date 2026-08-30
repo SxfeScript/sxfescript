@@ -4966,6 +4966,89 @@ static JSValue js_concat_values(JSContext *ctx, int n, JSValueConst *vals)
     return string_buffer_end(b);
 }
 
+static size_t js_string_utf8_exact(JSString *str);
+
+/* arcsx: exact UTF-8 byte length of a string value, without encoding it.
+   Returns -1 if the value is not a string. Backs Buffer.byteLength. */
+int64_t JS_Utf8ByteLength(JSContext *ctx, JSValueConst val)
+{
+    (void)ctx;
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_STRING)
+        return -1;
+    return (int64_t)js_string_utf8_exact(JS_VALUE_GET_STRING(val));
+}
+
+#ifdef SXN_ABLATE_FUSION
+/* arcsx: measurement harness for the tierless-fusion plan, compiled only with
+   -DSXN_ABLATE_FUSION and registered as globals by network.c. Each function
+   performs the operation a fused call site would ultimately perform, with the
+   surrounding bytecode, property lookups, callback dispatch and temporary
+   allocations removed. They are NOT semantically complete replacements -- they
+   exist to establish the exact ceiling each fusion could reach, so the plan's
+   "within 5% of the fastest Node/Bun median" gate can be evaluated before any
+   of the guard infrastructure is written. */
+
+/* Baseline: the JS->C call frame and loop cost the ablations themselves pay,
+   which a real fused opcode would NOT pay. Subtract this from each ablation to
+   get the true ceiling of an in-interpreter fusion. */
+JSValue sxn_abl_nop(JSContext *ctx, JSValueConst this_val,
+                    int argc, JSValueConst *argv)
+{
+    (void)this_val; (void)argc; (void)argv;
+    return JS_NewInt32(ctx, 1);
+}
+
+/* Ceiling for: new TextEncoder().encode(s).length */
+JSValue sxn_abl_encode_len(JSContext *ctx, JSValueConst this_val,
+                           int argc, JSValueConst *argv)
+{
+    if (argc < 1 || JS_VALUE_GET_TAG(argv[0]) != JS_TAG_STRING)
+        return JS_ThrowTypeError(ctx, "string expected");
+    return JS_NewInt32(ctx, (int)js_string_utf8_exact(JS_VALUE_GET_STRING(argv[0])));
+}
+
+/* Ceiling for: Buffer.from(prefix + i, "utf-8").length, with the intermediate
+   string never built -- literal byte length plus decimal formatting length. */
+JSValue sxn_abl_buf_len_concat(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv)
+{
+    char buf[16];
+    size_t n, d;
+    if (argc < 2 || JS_VALUE_GET_TAG(argv[0]) != JS_TAG_STRING ||
+        JS_VALUE_GET_TAG(argv[1]) != JS_TAG_INT)
+        return JS_ThrowTypeError(ctx, "(string, int) expected");
+    n = js_string_utf8_exact(JS_VALUE_GET_STRING(argv[0]));
+    d = i64toa(buf, JS_VALUE_GET_INT(argv[1]));
+    return JS_NewInt32(ctx, (int)(n + d));
+}
+
+/* Ceiling for: ee.emit("x", i) with the benchmark's captured-add listener.
+   Performs the guard loads a fused site would perform (emitter shape compare,
+   _events slot read, listener identity compare) and then the numeric add. */
+static double sxn_abl_emit_acc;
+static JSShape *sxn_abl_emit_shape;
+static JSValue sxn_abl_emit_listener = JS_UNDEFINED;
+
+JSValue sxn_abl_emit(JSContext *ctx, JSValueConst this_val,
+                     int argc, JSValueConst *argv)
+{
+    JSObject *p;
+    JSValue slot;
+    if (argc < 2 || JS_VALUE_GET_TAG(argv[0]) != JS_TAG_OBJECT)
+        return JS_ThrowTypeError(ctx, "(object, value) expected");
+    p = JS_VALUE_GET_OBJ(argv[0]);
+    if (unlikely(p->shape != sxn_abl_emit_shape))
+        sxn_abl_emit_shape = p->shape;              /* shape guard */
+    slot = p->prop ? p->prop[0].u.value : JS_UNDEFINED;
+    if (unlikely(!js_same_value(ctx, slot, sxn_abl_emit_listener)))
+        sxn_abl_emit_listener = slot;               /* listener identity guard */
+    if (unlikely(JS_VALUE_GET_TAG(argv[1]) != JS_TAG_INT))
+        return JS_FALSE;
+    sxn_abl_emit_acc += JS_VALUE_GET_INT(argv[1]); /* the captured-cell update */
+    return JS_TRUE;
+}
+#endif /* SXN_ABLATE_FUSION */
+
 /* create a string from a UTF-8 buffer */
 JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
 {
@@ -5217,6 +5300,34 @@ fail:
 /* arcsx: sizing pass. Returns an upper bound on the UTF-8 length; *exact is
    true when the bound is the exact length (narrow strings, where non-ASCII
    bytes are counted directly). */
+/* arcsx: exact WHATWG UTF-8 byte length, no allocation. Used by the fusion
+   ablations; see SXN_ABLATE_FUSION below. */
+static size_t js_string_utf8_exact(JSString *str)
+{
+    int len = str->len, pos;
+    size_t n = 0;
+    if (!str->is_wide_char) {
+        const uint8_t *src = str8(str);
+        for (pos = 0; pos < len; pos++)
+            n += 1 + (size_t)(src[pos] >> 7);
+        return n;
+    }
+    for (pos = 0; pos < len; pos++) {
+        uint32_t c = str16(str)[pos];
+        if (c < 0x80) {
+            n += 1;
+        } else if (c < 0x800) {
+            n += 2;
+        } else if (c >= 0xd800 && c <= 0xdbff && pos + 1 < len &&
+                   str16(str)[pos + 1] >= 0xdc00 && str16(str)[pos + 1] <= 0xdfff) {
+            n += 4; pos++;              /* surrogate pair */
+        } else {
+            n += 3;                     /* BMP, or unpaired surrogate -> U+FFFD */
+        }
+    }
+    return n;
+}
+
 static size_t js_string_utf8_bound(JSString *str, bool *exact)
 {
     int len = str->len, pos;
