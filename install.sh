@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Installs the sxn binary release for the current platform.
 #
-#   curl -fsSL https://raw.githubusercontent.com/SxfeScript/sxfescript/main/install.sh | bash
+#   curl -fsSL https://sxfescript.github.io/latest/install.sh | bash
+#
+# https://sxfescript.github.io/vX.Y.Z/install.sh pins a specific version's
+# copy of this same script instead - see scripts/publish-docs.sh, which
+# publishes both from this file on every release.
 #
 # Override the version with SXN_VERSION (default: latest release tag),
 # and the install directory with SXN_INSTALL (default: ~/.sxn).
@@ -28,7 +32,13 @@ esac
 
 version="${SXN_VERSION:-}"
 if [ -z "$version" ]; then
-  version="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
+  # GitHub's /releases/latest only ever returns the newest *stable* release,
+  # 404ing entirely when every release so far is a pre-release - true for
+  # this project today. Fall back to the newest release of any kind.
+  version="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | grep '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')" || true
+  if [ -z "$version" ]; then
+    version="$(curl -fsSL "https://api.github.com/repos/$REPO/releases" | grep '"tag_name"' | head -1 | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')" || true
+  fi
   [ -n "$version" ] || fail "couldn't resolve the latest release; set SXN_VERSION to install a specific one"
 fi
 
