@@ -70,20 +70,28 @@ Keep Debug for leak and correctness checks; Release is the appropriate binary
 for throughput, startup, and pause timing.
 
 Throughput runs 1,000 repetitions by default (`RUNS=1000`; override as needed),
-macOS 26.6.2 (arm64), Node v25.2.1, Bun 1.2.17. Startup rows are measured
-separately because each sample is itself a fresh process launch.
-Startup rows are the average of 20 process launches:
+macOS 26.6.2 (arm64), Node v25.2.1, Bun 1.2.17, all against a Release build.
+The two startup rows are measured separately, because there each sample is
+itself a fresh process launch: 20 launches per runtime, interleaved, quoted
+as the median over four such passes. Medians rather than means, because a
+descheduled launch skews a mean badly -- Node's real-world mean ranged
+77-90 ms across passes while its median held at 71.7-72.7. `run.sh` prints
+these two rows from a single `time` invocation, which shows the shape but is
+too coarse to quote at this scale; the numbers below come from
+`benchmarks/wintercg/startup20.py`, which has the sub-millisecond resolution
+`time` lacks. The pause rows are medians of 7 interleaved runs; the
+throughput rows are the harness's own 1,000-run medians:
 
 | Category | sxn | Node | Bun | Winner |
 |---|---|---|---|---|
-| Real-world end-to-end task (wall clock, as invoked) | **29 ms** | 144 ms | 187 ms | sxn |
-| Cold start | **9 ms** | 39 ms | 10 ms | sxn / Bun tie |
+| Real-world end-to-end task (wall clock, as invoked) | **8.7 ms** | 72.0 ms | 14.9 ms | sxn |
+| Cold start | **8.1 ms** | 39.4 ms | 8.5 ms | sxn / Bun tie |
 | Sustained throughput: Buffer ops | **21.5 ms** | 24.1 ms | 27.2 ms | sxn |
 | Sustained throughput: TextEncoder | 14.1 ms | 39.4 ms | **6.2 ms** | Bun |
 | Sustained throughput: EventEmitter | 9.1 ms | **5.1 ms** | 9.2 ms | Node |
 | Pause consistency: total time | 277.2 ms | **246.5 ms** | 284.7 ms | Node |
 | Pause consistency: worst single pause | **0.04 ms** | 0.20 ms | 2.77 ms | sxn |
-| Parse 32k-line generated file | **0.01 s** | 0.05 s | 0.02 s | sxn |
+| Parse 32k-line generated file | **16 ms** | 53 ms | 24 ms | sxn |
 
 The EventEmitter row is a tie with Bun, not a win: 9.1 ms against 9.2 is
 inside the run-to-run swing, and both trail Node by roughly 2x. The two
@@ -107,7 +115,9 @@ floor and what remains available without generated code.
 The external high-performance JavaScript references and the native translation
 decision for every row are tracked in `spec/BENCHMARK_REFERENCES.md`.
 
-The parse row is new: parsing was quadratic in declarations per scope until
+The parse row is whole-process wall clock, so it carries each runtime's
+startup cost the same way a real `sxn file.js` invocation does. Parsing was
+quadratic in declarations per scope until
 the resolver's linear scans were indexed, and a 32k-line generated file now
 parses faster here than in either JIT runtime -- compilation speed is pure
 interpreter-side work, so it is one sustained category an interpreter can
