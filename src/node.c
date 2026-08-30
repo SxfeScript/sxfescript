@@ -1109,6 +1109,14 @@ static void sxn_install_buffer_natives(JSContext *ctx) {
         JSValue installed_from = JS_GetPropertyStr(ctx, ctor, "from");
         JS_EnableBufferLengthFusion(ctx, installed_from, proto);
         JS_FreeValue(ctx, installed_from);
+        /* The same fusion for `encoder.encode(s).length`: TextEncoder's encode
+           is bound straight to its C primitive, so the guard is that function's
+           identity plus the typed-array length guard captured just above. */
+        JSValue g2 = JS_GetGlobalObject(ctx);
+        JSValue enc_fn = JS_GetPropertyStr(ctx, g2, "__sxnUtf8Encode");
+        JS_EnableEncodeLengthFusion(ctx, enc_fn);
+        JS_FreeValue(ctx, enc_fn);
+        JS_FreeValue(ctx, g2);
     }
     /* Encoding-name atoms, used by both the Buffer.from fast path and the
        toString dispatch below, so they are interned before either is

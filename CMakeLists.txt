@@ -201,6 +201,9 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # The guarded Buffer.from(s,"utf-8").length fusion: fused and unfused results,
   # non-utf-8 encodings, escaping results, and every guard invalidation.
   add_test(NAME sxn-buffer-length-fusion COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/buffer_length_fusion.mjs)
+  # The same fusion for encoder.encode(s).length: coercion, surrogates,
+  # escaping results, and every guard invalidation.
+  add_test(NAME sxn-encode-length-fusion COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/encode_length_fusion.mjs)
   set_tests_properties(sxn-performance-now PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()

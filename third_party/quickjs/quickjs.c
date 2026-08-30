@@ -654,6 +654,8 @@ struct JSContext {
        added to or removed from a prototype, and the getter value catches
        `length` being redefined in place, which leaves the shape alone. */
     bool buf_len_fusion_on;
+    bool enc_len_fusion_on;         /* the same, for TextEncoder#encode */
+    JSValue enc_len_fn;             /* the exact native encode primitive */
     JSValue buf_len_from_fn;        /* the exact native Buffer.from */
     JSValue buf_len_proto;          /* Buffer.prototype */
     JSValue buf_len_u8_proto;       /* Uint8Array.prototype */
@@ -3053,6 +3055,7 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->buf_len_proto = JS_UNDEFINED;
     ctx->buf_len_u8_proto = JS_UNDEFINED;
     ctx->buf_len_ta_proto = JS_UNDEFINED;
+    ctx->enc_len_fn = JS_UNDEFINED;
     ctx->error_stack_trace_limit = js_int32(10);
     init_list_head(&ctx->loaded_modules);
     // TODO(bnoordhuis) use getrandom() etc.
@@ -3188,6 +3191,7 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
     JS_MarkValue(rt, ctx->buf_len_proto, mark_func);
     JS_MarkValue(rt, ctx->buf_len_u8_proto, mark_func);
     JS_MarkValue(rt, ctx->buf_len_ta_proto, mark_func);
+    JS_MarkValue(rt, ctx->enc_len_fn, mark_func);
     JS_MarkValue(rt, ctx->error_stack_trace_limit, mark_func);
     for(i = 0; i < rt->class_count; i++) {
         JS_MarkValue(rt, ctx->class_proto[i], mark_func);
@@ -3218,6 +3222,7 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
 }
 
 void JS_DisableBufferLengthFusion(JSContext *ctx);
+void JS_DisableEncodeLengthFusion(JSContext *ctx);
 
 void JS_FreeContext(JSContext *ctx)
 {
@@ -5040,8 +5045,29 @@ void JS_EnableBufferLengthFusion(JSContext *ctx, JSValueConst from_fn,
     ctx->buf_len_fusion_on = true;
 }
 
+/* arcsx: enable the `encoder.encode(s).length` fusion. Shares the typed-array
+   length guard captured by JS_EnableBufferLengthFusion -- both results are
+   ordinary Uint8Arrays -- so Buffer must be installed first for this to arm. */
+void JS_EnableEncodeLengthFusion(JSContext *ctx, JSValueConst encode_fn)
+{
+    JS_DisableEncodeLengthFusion(ctx);
+    if (!JS_IsFunction(ctx, encode_fn) || !ctx->buf_len_fusion_on)
+        return;
+    ctx->enc_len_fn = js_dup(encode_fn);
+    ctx->enc_len_fusion_on = true;
+}
+
+void JS_DisableEncodeLengthFusion(JSContext *ctx)
+{
+    if (!ctx->enc_len_fusion_on) return;
+    ctx->enc_len_fusion_on = false;
+    JS_FreeValue(ctx, ctx->enc_len_fn);
+    ctx->enc_len_fn = JS_UNDEFINED;
+}
+
 void JS_DisableBufferLengthFusion(JSContext *ctx)
 {
+    JS_DisableEncodeLengthFusion(ctx);
     if (!ctx->buf_len_fusion_on) return;
     ctx->buf_len_fusion_on = false;
     JS_FreeValue(ctx, ctx->buf_len_from_fn);
@@ -19699,19 +19725,36 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    leave the number on the stack either way. When the guards
                    hold, the answer comes from the string without building the
                    bytes, the ArrayBuffer or the Buffer. */
-                if (unlikely(fused_len) && ctx->buf_len_fusion_on &&
-                    call_argc == 2 &&
-                    js_same_value(ctx, call_argv[-1], ctx->buf_len_from_fn) &&
-                    JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_STRING &&
-                    JS_VALUE_GET_TAG(call_argv[1]) == JS_TAG_STRING &&
-                    js_buf_len_encoding_is_utf8(JS_VALUE_GET_STRING(call_argv[1])) &&
-                    js_buf_len_guard_ok(ctx)) {
-                    int64_t n = JS_Utf8ByteLength(ctx, call_argv[0]);
-                    for (i = -2; i < call_argc; i++)
-                        JS_FreeValue(ctx, call_argv[i]);
-                    sp -= call_argc + 2;
-                    *sp++ = JS_NewInt64(ctx, n);
-                    BREAK;
+                if (unlikely(fused_len)) {
+                    /* Both fusions answer the same question -- how many bytes
+                       would this string occupy -- so both skip building the
+                       bytes, the ArrayBuffer and the view. */
+                    int64_t n = -1;
+                    if (ctx->buf_len_fusion_on && call_argc == 2 &&
+                        js_same_value(ctx, call_argv[-1], ctx->buf_len_from_fn) &&
+                        JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_STRING &&
+                        JS_VALUE_GET_TAG(call_argv[1]) == JS_TAG_STRING &&
+                        js_buf_len_encoding_is_utf8(JS_VALUE_GET_STRING(call_argv[1])) &&
+                        js_buf_len_guard_ok(ctx)) {
+                        n = JS_Utf8ByteLength(ctx, call_argv[0]);
+                    } else if (ctx->enc_len_fusion_on && call_argc == 1 &&
+                               js_same_value(ctx, call_argv[-1], ctx->enc_len_fn) &&
+                               js_buf_len_guard_ok(ctx)) {
+                        /* encode() coerces its argument, and coercion can run
+                           user code, so only a string takes the fast path.
+                           An absent or undefined argument encodes to nothing. */
+                        if (JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_STRING)
+                            n = JS_Utf8ByteLength(ctx, call_argv[0]);
+                        else if (JS_IsUndefined(call_argv[0]))
+                            n = 0;
+                    }
+                    if (n >= 0) {
+                        for (i = -2; i < call_argc; i++)
+                            JS_FreeValue(ctx, call_argv[i]);
+                        sp -= call_argc + 2;
+                        *sp++ = JS_NewInt64(ctx, n);
+                        BREAK;
+                    }
                 }
                 /* arcsx: same direct C-function dispatch as OP_call above. */
                 if (likely(JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
@@ -37925,6 +37968,11 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
     CodeContext cc;
     int label;
     JumpSlot *jp;
+    /* arcsx: names of the methods whose [obj, method] pairs are currently on
+       the stack, so a call_method knows what it is calling. See OP_call_method
+       below; overflow simply stops the length fusions from being recognized. */
+    JSAtom mname_stack[32];
+    int mname_depth = 0;
 
     label_slots = s->label_slots;
 
@@ -38059,11 +38107,31 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             break;
 
         case OP_call:
+        case OP_get_field2:
+            if (mname_depth < (int)countof(mname_stack))
+                mname_stack[mname_depth++] = get_u32(bc_buf + pos + 1);
+            goto no_change;
+
+        case OP_get_array_el2:
+            if (mname_depth < (int)countof(mname_stack))
+                mname_stack[mname_depth++] = JS_ATOM_NULL;
+            goto no_change;
+
         case OP_call_method:
             {
                 /* detect and transform tail calls */
                 int argc;
+                JSAtom callee_name;
                 argc = get_u16(bc_buf + pos + 1);
+                /* arcsx: which method is being called. get_field2 pushes
+                   [obj, method] and call_method pops the pair, so a stack of
+                   the names seen nests correctly through argument
+                   expressions. A dynamic `o[k]()` pushes JS_ATOM_NULL to stay
+                   aligned; anything that leaves the stack out of step just
+                   yields JS_ATOM_NULL and no fusion. */
+                callee_name = JS_ATOM_NULL;
+                if (mname_depth > 0)
+                    callee_name = mname_stack[--mname_depth];
                 /* arcsx: a two-argument method call whose result feeds only a
                    `.length` read -- the shape of `Buffer.from(s, enc).length`.
                    Flag the call and drop the read; the interpreter answers
@@ -38072,7 +38140,8 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                    transform below, which cannot apply once the `.length` is
                    there. A label between the two makes code_match fail, so a
                    jump into the middle of the expression cannot be broken. */
-                if (argc == 2 && !(argc & JS_CALL_METHOD_FUSED_LEN) &&
+                if (((argc == 2 && callee_name == JS_ATOM_from) ||
+                     (argc == 1 && callee_name == JS_ATOM_encode)) &&
                     code_match(&cc, pos_next, OP_get_field, -1) &&
                     cc.atom == JS_ATOM_length) {
                     if (cc.line_num >= 0) line_num = cc.line_num;

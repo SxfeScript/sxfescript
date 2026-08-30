@@ -1496,6 +1496,8 @@ JS_EXTERN int64_t JS_Utf8ByteLength(JSContext *ctx, JSValueConst val);
 JS_EXTERN void JS_EnableBufferLengthFusion(JSContext *ctx, JSValueConst from_fn,
                                            JSValueConst buffer_proto);
 JS_EXTERN void JS_DisableBufferLengthFusion(JSContext *ctx);
+JS_EXTERN void JS_EnableEncodeLengthFusion(JSContext *ctx, JSValueConst encode_fn);
+JS_EXTERN void JS_DisableEncodeLengthFusion(JSContext *ctx);
 
 #ifdef SXN_ABLATE_FUSION
 /* arcsx: fusion-ceiling ablations; see the block in quickjs.c. */

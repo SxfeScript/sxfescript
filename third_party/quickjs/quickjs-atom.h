@@ -262,6 +262,8 @@ DEF(CallSite, "CallSite")
 DEF(DisposableStack, "DisposableStack")
 DEF(AsyncDisposableStack, "AsyncDisposableStack")
 DEF(SuppressedError, "SuppressedError")
+/* arcsx: method names the length fusions recognize at compile time. */
+DEF(encode, "encode")
 /* private symbols */
 DEF(Private_brand, "<brand>")
 /* symbols */
