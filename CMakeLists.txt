@@ -211,6 +211,10 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # computed calls in argument position, and deep recursion that only survives
   # if the tail-call transform still applies.
   add_test(NAME sxn-fusion-call-shapes COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/fusion_call_shapes.mjs)
+  # Array.fromAsync and Iterator.zip/zipKeyed load from bytecode blobs
+  # generated at a pinned BC_VERSION; this catches the blobs going stale
+  # against the interpreter, which throws SyntaxError on first access.
+  add_test(NAME sxn-lazy-builtins COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/lazy_builtins.mjs)
   set_tests_properties(sxn-performance-now PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
