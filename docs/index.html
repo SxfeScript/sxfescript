@@ -17,7 +17,7 @@
     --rule-soft: #e3eae8;
     --ink: #131c1a;
     --ink-mid: #43524d;
-    --ink-soft: #75857f;
+    --ink-soft: #62706b;
     --safe: #0e6e63;
     --safe-wash: #ddeeea;
     --unsafe: #a5540f;
@@ -134,9 +134,8 @@
   header.hero { padding: 76px 0 40px; }
   .kicker {
     font-family: "JetBrains Mono", monospace; font-size: 11.5px; letter-spacing: .16em;
-    text-transform: uppercase; color: var(--accent); margin: 0 0 18px; display: flex; align-items: center; gap: 10px;
+    text-transform: uppercase; color: var(--accent); margin: 0 0 18px;
   }
-  .kicker::before { content: ""; width: 22px; height: 1px; background: var(--accent); display: inline-block; }
   h1.title {
     font-size: clamp(40px, 5vw, 64px); line-height: 1.02; font-weight: 600; margin: 0 0 22px;
     letter-spacing: -.02em;
@@ -207,7 +206,7 @@
   td.yes { color: var(--safe); font-weight: 600; }
   td.no { color: var(--ink-soft); }
   td.yes::before { content: "\2713  "; }
-  td.no::before { content: "\2014  "; }
+  td.no::before { content: "-  "; }
   td code { background: none; border: 0; padding: 0; }
   td.num, th.num {
     text-align: right; font-family: "JetBrains Mono", monospace; font-variant-numeric: tabular-nums;
@@ -217,7 +216,7 @@
   ul.check, ul.plain { padding-left: 0; list-style: none; margin: 0; }
   ul.check li, ul.plain li { padding: 5px 0 5px 26px; position: relative; font-size: 15px; color: var(--ink-mid); }
   ul.check li::before { content: "\2713"; position: absolute; left: 0; color: var(--safe); font-weight: 700; }
-  ul.plain li::before { content: "\2014"; position: absolute; left: 0; color: var(--ink-soft); }
+  ul.plain li::before { content: "\00b7"; position: absolute; left: 4px; color: var(--ink-soft); font-weight: 700; }
 
   footer {
     padding: 44px 0 60px; border-top: 1px solid var(--rule-soft); margin-top: 20px;
