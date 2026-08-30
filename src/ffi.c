@@ -14,7 +14,36 @@
  * runtime has not written down yet (spec/ABI.md).
  */
 #include <ffi.h>
+#ifdef _WIN32
+/* MinGW's runtime ships no dlfcn.h; LoadLibrary/GetProcAddress cover the
+   three calls this file makes (dlopen, dlsym, dlerror - dlclose is never
+   used, see the comment on sxn_ffi_libs below). Flags are POSIX-only
+   concepts with no Windows equivalent, so they're accepted and ignored. */
+#include <windows.h>
+#include <stdio.h>
+#define RTLD_LAZY 0
+#define RTLD_LOCAL 0
+static void *dlopen(const char *path, int flags) {
+    (void)flags;
+    return path ? (void *)LoadLibraryA(path) : (void *)GetModuleHandleA(NULL);
+}
+static void *dlsym(void *handle, const char *sym) {
+    return (void *)GetProcAddress((HMODULE)handle, sym);
+}
+static const char *dlerror(void) {
+    static char buf[256];
+    DWORD err = GetLastError();
+    if (!err) return NULL;
+    SetLastError(0);
+    DWORD n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                              NULL, err, 0, buf, sizeof(buf), NULL);
+    if (n) { while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0'; }
+    else snprintf(buf, sizeof(buf), "error %lu", (unsigned long)err);
+    return buf;
+}
+#else
 #include <dlfcn.h>
+#endif
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>

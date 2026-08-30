@@ -21,9 +21,17 @@ void sxn_ffi_init(JSContext *ctx);
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef _WIN32
+/* struct sockaddr_in/sockaddr are the only things this file needs from the
+   BSD sockets headers (see the uv_tcp_bind call below) - everything else
+   goes through libuv, which owns its own Winsock init. */
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#endif
 #include <sys/stat.h>
 
 #define countof(x) (sizeof(x) / sizeof((x)[0]))

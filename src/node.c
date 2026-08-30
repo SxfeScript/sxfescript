@@ -12,9 +12,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+/* MinGW's CRT has no setenv/unsetenv (BSD/glibc extensions), and declares
+   the environment block as _environ rather than environ. _putenv_s with an
+   empty value removes the variable, matching unsetenv - documented CRT
+   behavior, not a guess. */
+#define environ _environ
+static int setenv(const char *name, const char *value, int overwrite) {
+    (void)overwrite;
+    return _putenv_s(name, value);
+}
+static int unsetenv(const char *name) {
+    return _putenv_s(name, "");
+}
+#else
 #include <unistd.h>
-
 extern char **environ;
+#endif
 
 #define countof(x) (sizeof(x) / sizeof((x)[0]))
 
