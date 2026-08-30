@@ -25,15 +25,21 @@ files for each topic.
 
 ## Install
 
+macOS/Linux (arm64 or x64):
+
 ```sh
 curl -fsSL https://sxfescript.github.io/latest/install.sh | bash
 ```
 
-Installs the `sxn` binary for your platform (macOS/Linux, arm64 or x64) to
-`~/.sxn/bin`. `curl -fsSL https://sxfescript.github.io/vX.Y.Z/install.sh |
-bash` pins a specific release instead of the latest one. Windows: download
-the `.zip` from [the releases page](https://github.com/SxfeScript/sxfescript/releases)
-and run `sxn.exe` directly.
+Windows (arm64 or x64):
+
+```powershell
+irm https://sxfescript.github.io/latest/install.ps1 | iex
+```
+
+Both install to `~/.sxn/bin` (`%USERPROFILE%\.sxn\bin` on Windows) and add it
+to your PATH. Swap `latest` for a version tag (`v0.0.1`) in either URL to pin
+a specific release instead of always getting the newest one.
 
 ## Build
 

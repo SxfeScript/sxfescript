@@ -145,7 +145,17 @@
   }
   p.lede { font-size: clamp(17px, 2vw, 19.5px); color: var(--ink-mid); max-width: 58ch; margin: 0 0 30px; }
   .cta-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 44px; }
+  .install-tabs { display: flex; gap: 2px; margin-bottom: 8px; }
+  .install-tab {
+    font-family: "JetBrains Mono", monospace; font-size: 12.5px; font-weight: 600;
+    padding: 7px 14px; border: 1px solid var(--rule); background: var(--card);
+    color: var(--ink-soft); cursor: pointer;
+  }
+  .install-tab:first-child { border-radius: 7px 0 0 7px; }
+  .install-tab:last-child { border-radius: 0 7px 7px 0; border-left: none; }
+  .install-tab.active { background: var(--ink); color: var(--paper); border-color: var(--ink); }
   pre.install-cmd { margin: 0 0 10px; padding: 14px 18px; font-size: 14px; display: inline-block; }
+  pre.install-cmd[hidden] { display: none; }
   pre.install-cmd code { color: var(--safe); }
   p.install-note { font-size: 13px; color: var(--ink-soft); margin: 0 0 44px; }
   .btn {
@@ -267,9 +277,15 @@
           <a class="btn btn-ghost" href="{{REPO_URL}}/blob/main/spec/LANGUAGE.md">Read the language spec</a>
           <a class="btn btn-ghost" href="#contributing">Contribute</a>
         </div>
-        <pre class="install-cmd"><code>curl -fsSL https://sxfescript.github.io/latest/install.sh | bash</code></pre>
-        <p class="install-note">macOS and Linux, arm64 or x64. Windows: grab the
-          <code>.zip</code> from <a href="{{REPO_URL}}/releases">Releases</a>.</p>
+        <div class="install-tabs" role="tablist" aria-label="Install command">
+          <button type="button" class="install-tab active" role="tab" aria-selected="true" data-os="unix">macOS / Linux</button>
+          <button type="button" class="install-tab" role="tab" aria-selected="false" data-os="windows">Windows</button>
+        </div>
+        <pre class="install-cmd" data-os="unix"><code>curl -fsSL https://sxfescript.github.io/latest/install.sh | bash</code></pre>
+        <pre class="install-cmd" data-os="windows" hidden><code>irm https://sxfescript.github.io/latest/install.ps1 | iex</code></pre>
+        <p class="install-note">arm64 or x64, either way. Every release also has a
+          plain <code>.zip</code>/<code>.tar.gz</code> on
+          <a href="{{REPO_URL}}/releases">Releases</a>.</p>
       </div>
 
       <div class="compare-hero">
@@ -533,5 +549,17 @@
   </footer>
 </div>
 
+<script>
+  (function () {
+    var tabs = document.querySelectorAll(".install-tab");
+    var cmds = document.querySelectorAll("pre.install-cmd");
+    function show(os) {
+      tabs.forEach(function (t) { t.classList.toggle("active", t.dataset.os === os); t.setAttribute("aria-selected", t.dataset.os === os); });
+      cmds.forEach(function (c) { c.hidden = c.dataset.os !== os; });
+    }
+    tabs.forEach(function (t) { t.addEventListener("click", function () { show(t.dataset.os); }); });
+    if (/Win/.test(navigator.platform || navigator.userAgent)) show("windows");
+  })();
+</script>
 </body>
 </html>

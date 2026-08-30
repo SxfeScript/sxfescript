@@ -32,6 +32,8 @@ sed "s#{{REPO_URL}}#$REPO_URL#g" docs/index.html > "$tmp/index.html"
 mkdir -p "$tmp/latest" "$tmp/$VERSION"
 cp install.sh "$tmp/latest/install.sh"
 cp install.sh "$tmp/$VERSION/install.sh"
+cp install.ps1 "$tmp/latest/install.ps1"
+cp install.ps1 "$tmp/$VERSION/install.ps1"
 
 cd "$tmp"
 git add -A
@@ -40,6 +42,6 @@ if git diff --cached --quiet; then
   exit 0
 fi
 git -c user.name="$(git -C "$ROOT" config user.name)" -c user.email="$(git -C "$ROOT" config user.email)" \
-  commit -q -m "Publish docs and install.sh for $VERSION"
+  commit -q -m "Publish docs, install.sh and install.ps1 for $VERSION"
 git push -q origin main
-echo "published docs + install.sh ($VERSION and latest) to $DOCS_REPO"
+echo "published docs + install.sh + install.ps1 ($VERSION and latest) to $DOCS_REPO"
