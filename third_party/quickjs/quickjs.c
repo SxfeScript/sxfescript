@@ -5024,6 +5024,7 @@ static JSValue js_concat_values(JSContext *ctx, int n, JSValueConst *vals)
 static size_t js_string_utf8_exact(JSString *str);
 
 static JSShapeProperty *find_own_property(JSProperty **ppr, JSObject *p, JSAtom atom);
+static bool dataview_is_oob(JSObject *p);
 static JSShape *js_dup_shape(JSShape *sh);
 static void js_free_shape(JSRuntime *rt, JSShape *sh);
 
@@ -5161,6 +5162,45 @@ void JS_DisableBufferLengthFusion(JSContext *ctx)
     ctx->buf_len_u8_proto = JS_UNDEFINED;
     ctx->buf_len_ta_proto = JS_UNDEFINED;
     ctx->buf_len_getter = NULL;
+}
+
+/* arcsx: byte length of a value Node's Buffer.byteLength accepts as binary
+   data -- Buffer, ArrayBuffer, SharedArrayBuffer, TypedArray or DataView --
+   read from the internal slot, or -1 if the value is none of those. Reading a
+   public `byteLength` property instead would accept any object carrying that
+   name and would run a user-defined getter, neither of which Node does. */
+int64_t JS_BinaryDataByteLength(JSContext *ctx, JSValueConst obj)
+{
+    JSClassID cid = JS_GetClassID(obj);
+    JSObject *p;
+
+    if (cid == JS_CLASS_ARRAY_BUFFER || cid == JS_CLASS_SHARED_ARRAY_BUFFER) {
+        JSArrayBuffer *abuf = JS_GetOpaque(obj, cid);
+        if (!abuf)
+            return -1;
+        return abuf->detached ? 0 : (int64_t)abuf->byte_length;
+    }
+    /* DataView and the typed arrays keep their size in the same slot but have
+       separate out-of-bounds predicates, and each asserts on the other's
+       class, so they are checked apart. A resizable-buffer view tracks the
+       buffer's current length rather than its own. */
+    if (cid == JS_CLASS_DATAVIEW) {
+        JSTypedArray *ta;
+        p = JS_VALUE_GET_OBJ(obj);
+        if (!p->u.typed_array || dataview_is_oob(p))
+            return 0;
+        ta = p->u.typed_array;
+        if (ta->track_rab)
+            return (int64_t)(ta->buffer->u.array_buffer->byte_length - ta->offset);
+        return (int64_t)ta->length;
+    }
+    if (is_typed_array(cid)) {
+        p = JS_VALUE_GET_OBJ(obj);
+        if (!p->u.typed_array || typed_array_is_oob(p))
+            return 0;
+        return (int64_t)p->u.typed_array->length;
+    }
+    return -1;
 }
 
 /* arcsx: exact UTF-8 byte length of a string value, without encoding it.
@@ -38248,8 +38288,11 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
             }
             break;
 
-        case OP_call:
         case OP_get_field2:
+            /* arcsx: only this opcode carries an atom operand; OP_call must
+               not be folded in here, both because its operand is a 16-bit
+               argument count rather than a 32-bit atom and because it shares
+               the tail-call transform below. */
             if (mname_depth < (int)countof(mname_stack))
                 mname_stack[mname_depth++] = get_u32(bc_buf + pos + 1);
             goto no_change;
@@ -38259,6 +38302,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                 mname_stack[mname_depth++] = JS_ATOM_NULL;
             goto no_change;
 
+        case OP_call:
         case OP_call_method:
             {
                 /* detect and transform tail calls */
@@ -38272,7 +38316,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                    aligned; anything that leaves the stack out of step just
                    yields JS_ATOM_NULL and no fusion. */
                 callee_name = JS_ATOM_NULL;
-                if (mname_depth > 0)
+                if (op == OP_call_method && mname_depth > 0)
                     callee_name = mname_stack[--mname_depth];
                 /* arcsx: a two-argument method call whose result feeds only a
                    `.length` read -- the shape of `Buffer.from(s, enc).length`.
@@ -38286,13 +38330,15 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                    nothing is elided here -- the fused path returns the same
                    boolean emit would -- so this only marks the site as worth
                    testing the emit guard on. */
-                if (argc == 2 && callee_name == JS_ATOM_emit) {
+                if (op == OP_call_method && argc == 2 &&
+                    callee_name == JS_ATOM_emit) {
                     if (cc.line_num >= 0) line_num = cc.line_num;
                     add_pc2line_info(s, bc_out.size, line_num, col_num);
                     put_short_code(&bc_out, op, argc | JS_CALL_METHOD_FUSED_EMIT);
                     break;
                 }
-                if (((argc == 2 && callee_name == JS_ATOM_from) ||
+                if (op == OP_call_method &&
+                    ((argc == 2 && callee_name == JS_ATOM_from) ||
                      (argc == 1 && callee_name == JS_ATOM_encode)) &&
                     code_match(&cc, pos_next, OP_get_field, -1) &&
                     cc.atom == JS_ATOM_length) {

@@ -923,20 +923,32 @@ static JSAtom sxn_atom_ucs2, sxn_atom_ucs2_dash, sxn_atom_utf16le, sxn_atom_utf1
 /* Buffer.byteLength(value[, encoding]): how many bytes the value would
    occupy, without producing them. The utf-8 case is the whole point -- it is
    the idiomatic way to ask this question, and encoding the string just to read
-   .length off the result is what it replaces. Views report their own size and
-   the fixed-width encodings are arithmetic; only base64 has to inspect the
+   .length off the result is what it replaces. Binary-data arguments report
+   their own size from their internal slot; only base64 has to inspect the
    input, and it is measured rather than decoded. */
+static bool sxn_enc_is(const char *s, const char *lower) {
+    /* Node matches encoding names case-insensitively. */
+    size_t i;
+    for (i = 0; lower[i]; i++) {
+        char c = s[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != lower[i]) return false;
+    }
+    return s[i] == '\0';
+}
+
 static JSValue js_buffer_byte_length(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
                                      int magic, JSValueConst *func_data) {
     (void)this_val; (void)magic; (void)func_data;
     if (argc < 1) return JS_ThrowTypeError(ctx, "Buffer.byteLength requires a value");
 
-    /* Views and buffers report their own byte size, whatever the encoding. */
+    /* Binary data reports its own size, whatever the encoding. The brand is
+       checked against the internal slot: an ordinary object that happens to
+       carry a byteLength property is not binary data, and its getter must not
+       run. */
     if (JS_VALUE_GET_TAG(argv[0]) != JS_TAG_STRING) {
-        JSValue bl = JS_GetPropertyStr(ctx, argv[0], "byteLength");
-        if (JS_IsException(bl)) return bl;
-        if (JS_IsNumber(bl)) return bl;
-        JS_FreeValue(ctx, bl);
+        int64_t n = JS_BinaryDataByteLength(ctx, argv[0]);
+        if (n >= 0) return JS_NewInt64(ctx, n);
         return JS_ThrowTypeError(ctx,
             "Buffer.byteLength expects a string, Buffer, TypedArray, DataView or ArrayBuffer");
     }
@@ -944,35 +956,43 @@ static JSValue js_buffer_byte_length(JSContext *ctx, JSValueConst this_val, int 
     int64_t slen = 0;
     if (JS_GetLength(ctx, argv[0], &slen) < 0) return JS_EXCEPTION;
 
+    /* utf-8 is the default and by far the common case, so it is settled by
+       atom identity before any string comparison happens. */
     JSAtom enc = JS_ATOM_NULL;
     if (argc > 1 && !JS_IsUndefined(argv[1])) {
         enc = JS_ValueToAtom(ctx, argv[1]);
         if (enc == JS_ATOM_NULL) return JS_EXCEPTION;
     }
-    int64_t out;
     if (enc == JS_ATOM_NULL || enc == sxn_atom_utf8 || enc == sxn_atom_utf8_dash) {
-        out = JS_Utf8ByteLength(ctx, argv[0]);   /* exact, no encoding pass */
-    } else if (enc == sxn_atom_latin1 || enc == sxn_atom_binary || enc == sxn_atom_ascii) {
+        JS_FreeAtom(ctx, enc);
+        return JS_NewInt64(ctx, JS_Utf8ByteLength(ctx, argv[0]));
+    }
+
+    const char *name = JS_AtomToCString(ctx, enc);
+    JS_FreeAtom(ctx, enc);
+    if (!name) return JS_EXCEPTION;
+    int64_t out;
+    if (sxn_enc_is(name, "latin1") || sxn_enc_is(name, "binary") ||
+        sxn_enc_is(name, "ascii")) {
         out = slen;
-    } else if (enc == sxn_atom_ucs2 || enc == sxn_atom_ucs2_dash ||
-               enc == sxn_atom_utf16le || enc == sxn_atom_utf16le_dash) {
+    } else if (sxn_enc_is(name, "ucs2") || sxn_enc_is(name, "ucs-2") ||
+               sxn_enc_is(name, "utf16le") || sxn_enc_is(name, "utf-16le")) {
         out = slen * 2;
-    } else if (enc == sxn_atom_hex) {
+    } else if (sxn_enc_is(name, "hex")) {
         out = slen >> 1;
-    } else if (enc == sxn_atom_base64 || enc == sxn_atom_base64url) {
-        /* Bytes the input would decode to: 3 per full quad, minus padding. */
-        int64_t n = slen, pad = 0;
+    } else if (sxn_enc_is(name, "base64") || sxn_enc_is(name, "base64url")) {
+        /* Bytes the input would decode to, without decoding it. */
         const char *p = JS_ToCString(ctx, argv[0]);
-        if (!p) { JS_FreeAtom(ctx, enc); return JS_EXCEPTION; }
-        while (n > 0 && (p[n - 1] == '=' || p[n - 1] == '\n' || p[n - 1] == '\r')) { if (p[n-1] == '=') pad++; n--; }
+        int64_t n = slen;
+        if (!p) { JS_FreeCString(ctx, name); return JS_EXCEPTION; }
+        while (n > 0 && (p[n - 1] == '=' || p[n - 1] == '\n' || p[n - 1] == '\r'))
+            n--;
         JS_FreeCString(ctx, p);
         out = n * 3 / 4;
-        (void)pad;
     } else {
-        out = JS_Utf8ByteLength(ctx, argv[0]);   /* Node treats unknown as utf-8 */
+        out = JS_Utf8ByteLength(ctx, argv[0]);  /* Node: unknown means utf-8 */
     }
-    JS_FreeAtom(ctx, enc);
-    if (out < 0) return JS_ThrowTypeError(ctx, "Buffer.byteLength expects a string");
+    JS_FreeCString(ctx, name);
     return JS_NewInt64(ctx, out);
 }
 

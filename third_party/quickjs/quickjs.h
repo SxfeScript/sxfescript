@@ -1491,6 +1491,9 @@ JS_EXTERN uintptr_t js_std_cmd(int cmd, ...);
 /* arcsx: exact UTF-8 byte length of a string, without encoding it; -1 if not
    a string. */
 JS_EXTERN int64_t JS_Utf8ByteLength(JSContext *ctx, JSValueConst val);
+/* arcsx: byte length of a Buffer/ArrayBuffer/SharedArrayBuffer/TypedArray/
+   DataView from its internal slot, or -1 if the value is none of those. */
+JS_EXTERN int64_t JS_BinaryDataByteLength(JSContext *ctx, JSValueConst obj);
 
 /* arcsx: enable/disable the guarded `Buffer.from(s, "utf-8").length` fusion. */
 JS_EXTERN void JS_EnableBufferLengthFusion(JSContext *ctx, JSValueConst from_fn,

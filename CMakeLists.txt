@@ -207,6 +207,10 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # The guarded emit fusion: numeric promotion, multiple listeners, once,
   # removal during emit, direct _events mutation, and listener `this`.
   add_test(NAME sxn-emit-fusion COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/emit_fusion.mjs)
+  # The fusion recognizer shares a switch case with plain calls: nested and
+  # computed calls in argument position, and deep recursion that only survives
+  # if the tail-call transform still applies.
+  add_test(NAME sxn-fusion-call-shapes COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/fusion_call_shapes.mjs)
   set_tests_properties(sxn-performance-now PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()
