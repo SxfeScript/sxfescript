@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SxfeScript</title>
-<meta name="description" content="SxfeScript: explicit ownership and real runtime safety on top of ordinary JavaScript, running on ArcSX — a QuickJS-based runtime that never adds a JIT tier, by design, so it runs the same on a phone as it does on a server.">
+<meta name="description" content="SxfeScript: explicit ownership and real runtime safety on top of ordinary JavaScript, running on ArcSX — a QuickJS-based runtime built to run the same on a phone as it does on a server.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Public+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -156,23 +156,6 @@
   td.no { color: var(--ink-soft); }
   td code { background: none; border: 0; padding: 0; }
 
-  /* pull quote / invariant box */
-  .invariant {
-    background: var(--safe-wash); border: 1px solid color-mix(in srgb, var(--safe) 35%, var(--rule));
-    border-radius: 12px; padding: 26px 28px; margin: 30px 0;
-  }
-  .invariant .tag {
-    font-family: "JetBrains Mono", monospace; font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
-    color: var(--safe); font-weight: 700; margin-bottom: 10px; display: block;
-  }
-  .invariant p { margin: 0 0 10px; color: var(--ink); max-width: 66ch; }
-  .invariant p:last-child { margin-bottom: 0; }
-
-  blockquote.pull {
-    font-family: Newsreader, Georgia, serif; font-size: 22px; line-height: 1.45; font-style: italic;
-    color: var(--ink); margin: 20px 0; padding: 0 0 0 20px; border-left: 3px solid var(--accent); max-width: 58ch;
-  }
-
   ul.check, ul.plain { padding-left: 0; list-style: none; margin: 0; }
   ul.check li, ul.plain li { padding: 5px 0 5px 26px; position: relative; font-size: 15px; color: var(--ink-mid); }
   ul.check li::before { content: "\2713"; position: absolute; left: 0; color: var(--safe); font-weight: 700; }
@@ -197,7 +180,6 @@
       <li><a class="navlink" href="#what-is">Overview</a></li>
       <li><a class="navlink" href="#vs-typescript">vs TypeScript</a></li>
       <li><a class="navlink" href="#arcsx">ArcSX runtime</a></li>
-      <li><a class="navlink" href="#no-jit">No JIT</a></li>
       <li><a class="navlink" href="#contributing">Contributing</a></li>
     </ul>
     <a class="gh-link" href="{{REPO_URL}}">GitHub</a>
@@ -417,37 +399,6 @@
     </p>
   </section>
 
-  <section id="no-jit">
-    <h2 class="h">Why there's no JIT</h2>
-    <p class="lede-s">
-      This is the one design decision on this page that isn't up for debate. Everything else
-      is &mdash; see Contributing below.
-    </p>
-    <div class="invariant">
-      <span class="tag">Fixed invariant</span>
-      <p>
-        iOS does not grant W^X / JIT entitlements to third-party apps. A runtime with a
-        machine-code tier is a runtime that doesn't run on iOS at all &mdash; not slower there,
-        <em>absent</em> there. ArcSX exists to run everywhere a mobile app needs it to, so a
-        JIT is not a missing feature; it's a category of solution that was never on the table.
-      </p>
-      <p>
-        A JIT is the usual way an engine closes the gap on call-heavy, allocation-heavy
-        loops, and it's the one tool this project rules out. That doesn't rule out closing
-        the gap some other way &mdash; an arena allocator, polymorphic inline caches, and
-        compile-time call fusions already took this runtime from behind Node and Bun on
-        most rows to ahead of both on seven of eight measured categories, all without
-        generating a single byte of machine code at runtime. Whatever narrows what's left
-        will have to be an interpreter-side idea, not a machine-code one.
-      </p>
-    </div>
-    <blockquote class="pull">
-      The one thing this project won't do to go faster is compile to machine code at
-      runtime. Everything else &mdash; allocator design, inline caches, call fusion, whatever
-      comes next &mdash; is fair game.
-    </blockquote>
-  </section>
-
   <section id="contributing">
     <h2 class="h">Contributing</h2>
     <p class="lede-s">
@@ -470,11 +421,12 @@
       <div class="card">
         <h3>What isn't</h3>
         <ul class="plain">
-          <li>Adding a JIT, or anything that needs runtime-generated machine code</li>
+          <li>Adding a JIT, or anything else that generates machine code at runtime &mdash;
+          iOS won't grant that entitlement to a third-party app, and running there is the point</li>
         </ul>
         <p style="margin-top:14px;">
           Everything above is a real conversation. That one line is a constraint the project
-          is built around, not a preference &mdash; more on <a href="#no-jit">why</a>.
+          is built around, not a preference.
         </p>
       </div>
     </div>
