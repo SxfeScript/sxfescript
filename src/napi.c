@@ -31,10 +31,20 @@
 
 /* ------------------------------------------------------------------ env */
 
+/* A napi_value is a pointer to the slot holding its JSValue, so the slots
+   must never move. A growable array would relocate every handle the addon is
+   still holding the moment it needed one more -- which is exactly what a
+   large addon does. Blocks are allocated and never resized. */
+#define NAPI_SCOPE_BLOCK 64
+typedef struct NapiBlock {
+    struct NapiBlock *next;
+    size_t len;
+    JSValue values[NAPI_SCOPE_BLOCK];
+} NapiBlock;
+
 typedef struct NapiScope {
     struct NapiScope *parent;
-    JSValue *values;
-    size_t len, cap;
+    NapiBlock *blocks;          /* newest first; the one being filled */
     JSValue escaped;            /* escapable scopes: at most one, per spec */
     bool did_escape;
 } NapiScope;
@@ -75,14 +85,15 @@ static napi_status napi_set_error(napi_env env, napi_status code, const char *ms
 static napi_value napi_hold(napi_env env, JSValue v) {
     NapiScope *s = env->scope;
     if (!s) { JS_FreeValue(env->ctx, v); return NULL; }
-    if (s->len == s->cap) {
-        size_t cap = s->cap ? s->cap * 2 : 16;
-        JSValue *grown = realloc(s->values, cap * sizeof(*grown));
-        if (!grown) { JS_FreeValue(env->ctx, v); return NULL; }
-        s->values = grown; s->cap = cap;
+    NapiBlock *b = s->blocks;
+    if (!b || b->len == NAPI_SCOPE_BLOCK) {
+        b = malloc(sizeof(*b));
+        if (!b) { JS_FreeValue(env->ctx, v); return NULL; }
+        b->next = s->blocks; b->len = 0;
+        s->blocks = b;
     }
-    s->values[s->len] = v;
-    return (napi_value)&s->values[s->len++];
+    b->values[b->len] = v;
+    return (napi_value)&b->values[b->len++];
 }
 static JSValue napi_val(napi_value v) { return v ? *(JSValue *)v : JS_UNDEFINED; }
 
@@ -109,8 +120,12 @@ static napi_status napi_push_scope(napi_env env, NapiScope *s) {
 static void napi_pop_scope(napi_env env) {
     NapiScope *s = env->scope;
     if (!s) return;
-    for (size_t i = 0; i < s->len; i++) JS_FreeValue(env->ctx, s->values[i]);
-    free(s->values);
+    for (NapiBlock *b = s->blocks; b; ) {
+        NapiBlock *next = b->next;
+        for (size_t i = 0; i < b->len; i++) JS_FreeValue(env->ctx, b->values[i]);
+        free(b);
+        b = next;
+    }
     env->scope = s->parent;
 }
 
@@ -250,10 +265,12 @@ napi_status napi_escape_handle(napi_env env, napi_escapable_handle_scope scope,
    a weak reference (count 0) is not tracked here -- QuickJS has no weak
    handle that can be resurrected, so it is kept strong and reported as such,
    which leaks rather than dangles. */
-typedef struct {
+typedef struct NapiRef {
     JSValue value;
     uint32_t count;
+    struct NapiRef *next, **prev;   /* every live one, so teardown can free them */
 } NapiRef;
+static NapiRef *napi_refs;
 
 napi_status napi_create_reference(napi_env env, napi_value value,
                                   uint32_t initial, napi_ref *result) {
@@ -262,12 +279,16 @@ napi_status napi_create_reference(napi_env env, napi_value value,
     if (!r) return NAPI_FAIL(env, napi_generic_failure, "out of memory");
     r->value = JS_DupValue(env->ctx, napi_val(value));
     r->count = initial;
+    r->next = napi_refs; r->prev = &napi_refs;
+    if (napi_refs) napi_refs->prev = &r->next;
+    napi_refs = r;
     *result = (napi_ref)r;
     return NAPI_OK(env);
 }
 napi_status napi_delete_reference(napi_env env, napi_ref ref) {
     CHECK_ENV(env); CHECK_ARG(env, ref);
     NapiRef *r = (NapiRef *)ref;
+    if (r->prev) { *r->prev = r->next; if (r->next) r->next->prev = r->prev; }
     JS_FreeValue(env->ctx, r->value);
     free(r);
     return NAPI_OK(env);
@@ -732,6 +753,25 @@ napi_status napi_call_function(napi_env env, napi_value recv, napi_value func,
     if (result) *result = napi_hold(env, out); else JS_FreeValue(env->ctx, out);
     return NAPI_OK(env);
 }
+/* The async-context variant of call_function. There is no async_hooks here
+   for the context to mean anything to, so it is the plain call. */
+napi_status napi_make_callback(napi_env env, napi_async_context ctx_,
+                               napi_value recv, napi_value func,
+                               size_t argc, const napi_value *argv, napi_value *result) {
+    (void)ctx_;
+    return napi_call_function(env, recv, func, argc, argv, result);
+}
+napi_status napi_async_init(napi_env env, napi_value resource,
+                            napi_value resource_name, napi_async_context *result) {
+    (void)resource; (void)resource_name;
+    CHECK_ENV(env); CHECK_ARG(env, result);
+    *result = (napi_async_context)env;      /* an opaque token; nothing reads it */
+    return NAPI_OK(env);
+}
+napi_status napi_async_destroy(napi_env env, napi_async_context c) {
+    (void)c; CHECK_ENV(env); return NAPI_OK(env);
+}
+
 napi_status napi_new_instance(napi_env env, napi_value ctor, size_t argc,
                               const napi_value *argv, napi_value *result) {
     CHECK_ENV(env); CHECK_ARG(env, result);
@@ -862,9 +902,9 @@ napi_status napi_set_instance_data(napi_env env, void *data,
                                    napi_finalize finalize_cb, void *hint) {
     (void)finalize_cb; (void)hint;
     CHECK_ENV(env);
-    /* One addon per process here, so instance data is a single slot. */
-    static void *slot; slot = data;
-    JS_SetContextOpaque(env->ctx, slot);
+    /* Nothing else in this runtime uses the context opaque, and there is one
+       addon per process here, so it is the natural single slot. */
+    JS_SetContextOpaque(env->ctx, data);
     return NAPI_OK(env);
 }
 napi_status napi_get_instance_data(napi_env env, void **data) {
@@ -995,6 +1035,74 @@ napi_status napi_create_typedarray(napi_env env, napi_typedarray_type type, size
     return NAPI_OK(env);
 }
 
+/* A Buffer over memory the addon owns. QuickJS can adopt a pointer with a
+   free callback, which is exactly the contract: the finalizer runs when the
+   last view goes away. */
+typedef struct { napi_env env; napi_finalize cb; void *hint; } NapiExtBuf;
+static void napi_ext_buf_free(JSRuntime *rt, void *opaque, void *ptr) {
+    (void)rt;
+    NapiExtBuf *e = opaque;
+    if (e) { if (e->cb) e->cb(e->env, ptr, e->hint); free(e); }
+}
+napi_status napi_create_external_arraybuffer(napi_env env, void *data, size_t len,
+                                             napi_finalize finalize_cb, void *hint,
+                                             napi_value *result) {
+    CHECK_ENV(env); CHECK_ARG(env, result);
+    NapiExtBuf *e = malloc(sizeof(*e));
+    if (!e) return NAPI_FAIL(env, napi_generic_failure, "out of memory");
+    e->env = env; e->cb = finalize_cb; e->hint = hint;
+    JSValue ab = JS_NewArrayBuffer(env->ctx, data, len, napi_ext_buf_free, e, false);
+    if (JS_IsException(ab)) { free(e); return napi_catch(env); }
+    *result = napi_hold(env, ab);
+    return NAPI_OK(env);
+}
+napi_status napi_create_external_buffer(napi_env env, size_t len, void *data,
+                                        napi_finalize finalize_cb, void *hint,
+                                        napi_value *result) {
+    CHECK_ENV(env); CHECK_ARG(env, result);
+    napi_value ab;
+    napi_status st = napi_create_external_arraybuffer(env, data, len, finalize_cb, hint, &ab);
+    if (st != napi_ok) return st;
+    /* Node hands back a Buffer, not a bare ArrayBuffer, and addons index it. */
+    JSValue global = JS_GetGlobalObject(env->ctx);
+    JSValue B = JS_GetPropertyStr(env->ctx, global, "Buffer");
+    JS_FreeValue(env->ctx, global);
+    JSValue arg = JS_DupValue(env->ctx, napi_val(ab));
+    JSValue buf = JS_Invoke(env->ctx, B, JS_NewAtom(env->ctx, "from"), 1, (JSValueConst *)&arg);
+    JS_FreeValue(env->ctx, arg);
+    JS_FreeValue(env->ctx, B);
+    NAPI_TRY(env, buf);
+    *result = napi_hold(env, buf);
+    return NAPI_OK(env);
+}
+
+/* napi_define_class: a constructor function with methods on its prototype and
+   statics on itself, which is what a JS class is once the sugar is gone. */
+napi_status napi_define_class(napi_env env, const char *name, size_t name_len,
+                              napi_callback constructor, void *data,
+                              size_t count, const napi_property_descriptor *props,
+                              napi_value *result) {
+    CHECK_ENV(env); CHECK_ARG(env, constructor); CHECK_ARG(env, result);
+    JSValue ctor = napi_make_function(env, name, name_len, constructor, data);
+    NAPI_TRY(env, ctor);
+    JS_SetConstructorBit(env->ctx, ctor, true);
+    JSValue proto = JS_NewObject(env->ctx);
+    JS_SetConstructor(env->ctx, ctor, proto);
+
+    napi_value nctor = napi_hold(env, ctor);
+    napi_value nproto = napi_hold(env, JS_DupValue(env->ctx, proto));
+    JS_FreeValue(env->ctx, proto);
+    for (size_t i = 0; i < count; i++) {
+        /* A static member goes on the constructor, everything else on the
+           prototype -- the one place this differs from define_properties. */
+        napi_value target = (props[i].attributes & napi_static) ? nctor : nproto;
+        napi_status st = napi_define_properties(env, target, 1, &props[i]);
+        if (st != napi_ok) return st;
+    }
+    *result = nctor;
+    return NAPI_OK(env);
+}
+
 /* ------------------------------------------------------------- promises */
 
 typedef struct { JSValue resolve, reject, promise; } NapiDeferred;
@@ -1103,38 +1211,172 @@ napi_status napi_cancel_async_work(node_api_basic_env env, napi_async_work work)
          : NAPI_FAIL((napi_env)env, napi_generic_failure, "work already running");
 }
 
-/* Thread-safe functions let an addon's own threads call into JS. That needs a
-   cross-thread queue draining on the loop thread, which is real work and not
-   yet done -- say so rather than accept the call and drop it. */
+/* Thread-safe functions: an addon's own threads calling into JS. QuickJS is
+   single-threaded, so the call cannot happen where it is made. Each tsfn owns
+   a queue and a uv_async_t; a worker thread appends and wakes the loop, and
+   the loop thread -- the only one allowed to touch the context -- drains it.
+   uv_async_send is the one libuv call that is safe from another thread, which
+   is what makes this shape the obvious one. */
+typedef struct NapiTsfnItem { struct NapiTsfnItem *next; void *data; } NapiTsfnItem;
+
+typedef struct {
+    napi_env env;
+    uv_async_t async;
+    uv_mutex_t lock;
+    uv_cond_t room;                 /* blocking mode waits here when full */
+    NapiTsfnItem *head, *tail;
+    size_t queued, max_queue;
+    size_t thread_count;
+    bool aborted, closing;
+    JSValue func;
+    void *context;
+    napi_threadsafe_function_call_js call_js;
+    napi_finalize finalize_cb;
+    void *finalize_data;
+} NapiTsfn;
+
+static void napi_tsfn_destroy(uv_handle_t *h) {
+    NapiTsfn *t = h->data;
+    if (t->finalize_cb) t->finalize_cb(t->env, t->finalize_data, t->context);
+    JS_FreeValue(t->env->ctx, t->func);
+    uv_mutex_destroy(&t->lock);
+    uv_cond_destroy(&t->room);
+    free(t);
+}
+
+static void napi_tsfn_drain(uv_async_t *async) {
+    NapiTsfn *t = async->data;
+    for (;;) {
+        uv_mutex_lock(&t->lock);
+        NapiTsfnItem *it = t->head;
+        if (it) { t->head = it->next; if (!t->head) t->tail = NULL; t->queued--; }
+        bool done = t->closing && !t->head;
+        uv_mutex_unlock(&t->lock);
+        if (it) uv_cond_signal(&t->room);
+        if (!it) { if (done) uv_close((uv_handle_t *)&t->async, napi_tsfn_destroy); return; }
+
+        NapiScope scope;
+        napi_push_scope(t->env, &scope);
+        if (t->call_js) {
+            napi_value fn = JS_IsUndefined(t->func) ? NULL
+                          : napi_hold(t->env, JS_DupValue(t->env->ctx, t->func));
+            t->call_js(t->env, fn, t->context, it->data);
+        } else if (!JS_IsUndefined(t->func)) {
+            JSValue r = JS_Call(t->env->ctx, t->func, JS_UNDEFINED, 0, NULL);
+            JS_FreeValue(t->env->ctx, r);
+        }
+        /* An exception here has no caller to propagate to -- the JS stack that
+           would have caught it is on another thread and long gone. */
+        if (!JS_IsUninitialized(t->env->pending)) {
+            napi_fatal_exception(t->env, napi_hold(t->env, t->env->pending));
+            t->env->pending = JS_UNINITIALIZED;
+        }
+        napi_pop_scope(t->env);
+        free(it);
+    }
+}
+
 napi_status napi_create_threadsafe_function(
     napi_env env, napi_value func, napi_value async_resource,
     napi_value async_resource_name, size_t max_queue_size, size_t initial_thread_count,
     void *thread_finalize_data, napi_finalize thread_finalize_cb, void *context,
     napi_threadsafe_function_call_js call_js_cb, napi_threadsafe_function *result) {
-    (void)func; (void)async_resource; (void)async_resource_name; (void)max_queue_size;
-    (void)initial_thread_count; (void)thread_finalize_data; (void)thread_finalize_cb;
-    (void)context; (void)call_js_cb; (void)result;
-    CHECK_ENV(env);
-    return NAPI_FAIL(env, napi_generic_failure,
-                     "thread-safe functions are not implemented in this runtime");
+    (void)async_resource; (void)async_resource_name;
+    CHECK_ENV(env); CHECK_ARG(env, result);
+    if (initial_thread_count == 0)
+        return NAPI_FAIL(env, napi_invalid_arg, "initial_thread_count must be at least 1");
+    NapiTsfn *t = calloc(1, sizeof(*t));
+    if (!t) return NAPI_FAIL(env, napi_generic_failure, "out of memory");
+    t->env = env;
+    t->func = func ? JS_DupValue(env->ctx, napi_val(func)) : JS_UNDEFINED;
+    t->context = context;
+    t->call_js = call_js_cb;
+    t->finalize_cb = thread_finalize_cb;
+    t->finalize_data = thread_finalize_data;
+    t->max_queue = max_queue_size;
+    t->thread_count = initial_thread_count;
+    if (uv_mutex_init(&t->lock) != 0 || uv_cond_init(&t->room) != 0 ||
+        uv_async_init(env->loop, &t->async, napi_tsfn_drain) != 0) {
+        JS_FreeValue(env->ctx, t->func);
+        free(t);
+        return NAPI_FAIL(env, napi_generic_failure, "cannot create a thread-safe function");
+    }
+    t->async.data = t;
+    /* A tsfn that has never been called should not hold the process open;
+       napi_ref_threadsafe_function is how an addon asks for the opposite. */
+    uv_unref((uv_handle_t *)&t->async);
+    *result = (napi_threadsafe_function)t;
+    return NAPI_OK(env);
 }
+
 napi_status napi_call_threadsafe_function(napi_threadsafe_function f, void *data,
                                           napi_threadsafe_function_call_mode mode) {
-    (void)f; (void)data; (void)mode; return napi_generic_failure;
+    NapiTsfn *t = (NapiTsfn *)f;
+    if (!t) return napi_invalid_arg;
+    uv_mutex_lock(&t->lock);
+    if (t->aborted || t->closing) { uv_mutex_unlock(&t->lock); return napi_closing; }
+    while (t->max_queue && t->queued >= t->max_queue) {
+        if (mode == napi_tsfn_nonblocking) { uv_mutex_unlock(&t->lock); return napi_queue_full; }
+        uv_cond_wait(&t->room, &t->lock);
+        if (t->aborted || t->closing) { uv_mutex_unlock(&t->lock); return napi_closing; }
+    }
+    NapiTsfnItem *it = malloc(sizeof(*it));
+    if (!it) { uv_mutex_unlock(&t->lock); return napi_generic_failure; }
+    it->data = data; it->next = NULL;
+    if (t->tail) t->tail->next = it; else t->head = it;
+    t->tail = it;
+    t->queued++;
+    uv_mutex_unlock(&t->lock);
+    uv_async_send(&t->async);
+    return napi_ok;
 }
-napi_status napi_acquire_threadsafe_function(napi_threadsafe_function f) { (void)f; return napi_generic_failure; }
+
+napi_status napi_acquire_threadsafe_function(napi_threadsafe_function f) {
+    NapiTsfn *t = (NapiTsfn *)f;
+    if (!t) return napi_invalid_arg;
+    uv_mutex_lock(&t->lock);
+    napi_status st = (t->aborted || t->closing) ? napi_closing : napi_ok;
+    if (st == napi_ok) t->thread_count++;
+    uv_mutex_unlock(&t->lock);
+    return st;
+}
+
 napi_status napi_release_threadsafe_function(napi_threadsafe_function f,
                                              napi_threadsafe_function_release_mode m) {
-    (void)f; (void)m; return napi_generic_failure;
+    NapiTsfn *t = (NapiTsfn *)f;
+    if (!t) return napi_invalid_arg;
+    uv_mutex_lock(&t->lock);
+    if (m == napi_tsfn_abort) t->aborted = true;
+    if (t->thread_count) t->thread_count--;
+    bool finished = t->thread_count == 0;
+    if (finished) t->closing = true;
+    uv_mutex_unlock(&t->lock);
+    uv_cond_broadcast(&t->room);
+    /* The drain runs on the loop thread and is what closes the handle, so the
+       last release only has to wake it. */
+    if (finished) uv_async_send(&t->async);
+    return napi_ok;
 }
-napi_status napi_ref_threadsafe_function(node_api_basic_env e, napi_threadsafe_function f) {
-    (void)e; (void)f; return napi_generic_failure;
+
+napi_status napi_ref_threadsafe_function(node_api_basic_env env, napi_threadsafe_function f) {
+    (void)env;
+    NapiTsfn *t = (NapiTsfn *)f;
+    if (!t) return napi_invalid_arg;
+    uv_ref((uv_handle_t *)&t->async);
+    return napi_ok;
 }
-napi_status napi_unref_threadsafe_function(node_api_basic_env e, napi_threadsafe_function f) {
-    (void)e; (void)f; return napi_generic_failure;
+napi_status napi_unref_threadsafe_function(node_api_basic_env env, napi_threadsafe_function f) {
+    (void)env;
+    NapiTsfn *t = (NapiTsfn *)f;
+    if (!t) return napi_invalid_arg;
+    uv_unref((uv_handle_t *)&t->async);
+    return napi_ok;
 }
 napi_status napi_get_threadsafe_function_context(napi_threadsafe_function f, void **c) {
-    (void)f; (void)c; return napi_generic_failure;
+    NapiTsfn *t = (NapiTsfn *)f;
+    if (!t || !c) return napi_invalid_arg;
+    *c = t->context;
+    return napi_ok;
 }
 
 /* ---------------------------------------------------------- environment */
@@ -1220,7 +1462,10 @@ static JSValue sxn_process_dlopen(JSContext *ctx, JSValueConst this_val,
     if (!path) return JS_EXCEPTION;
 
     dlerror();
-    void *handle = dlopen(path, RTLD_LAZY | RTLD_LOCAL);
+    /* RTLD_NOW, not lazy: an addon that wants a napi_* function this runtime
+       does not implement should fail to load with its name, rather than
+       segfault the first time that path is taken. */
+    void *handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
         const char *why = dlerror();
         JSValue e = JS_ThrowReferenceError(ctx, "cannot load addon '%s': %s",
@@ -1262,6 +1507,29 @@ static JSValue sxn_process_dlopen(JSContext *ctx, JSValueConst this_val,
     }
     JS_SetPropertyStr(ctx, argv[0], "exports", out);
     return JS_UNDEFINED;
+}
+
+/* Node drops an addon's references with the isolate; here the runtime is torn
+   down while they still hold objects, and the debug build asserts on that. So
+   release what the addon left behind before the context goes. */
+void sxn_shutdown_napi(JSContext *ctx) {
+    if (!sxn_env || sxn_env->ctx != ctx) return;
+    for (NapiCleanup *c = napi_cleanups; c; ) {
+        NapiCleanup *next = c->next;
+        if (c->fn) c->fn(c->arg);
+        free(c); c = next;
+    }
+    napi_cleanups = NULL;
+    for (NapiRef *r = napi_refs; r; ) {
+        NapiRef *next = r->next;
+        JS_FreeValue(ctx, r->value);
+        free(r); r = next;
+    }
+    napi_refs = NULL;
+    while (sxn_env->scope) napi_pop_scope(sxn_env);
+    if (!JS_IsUninitialized(sxn_env->pending)) JS_FreeValue(ctx, sxn_env->pending);
+    free(sxn_env);
+    sxn_env = NULL;
 }
 
 /* Installed by the node: layer, never by the runtime's own surface. */

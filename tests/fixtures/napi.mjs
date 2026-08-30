@@ -29,5 +29,13 @@ check("a missing addon is an error",
       (() => { try { require("/nonexistent/nope.node"); return "no throw"; }
                catch (e) { return "threw"; } })(), "threw");
 
+// A real worker thread calling back into JS. The calls have to arrive on the
+// loop thread, in order, and the process has to stay awake until they do.
+const seen = [];
+await new Promise((resolve) => {
+  a.fromThread((n) => { seen.push(n); if (seen.length === 3) resolve(); });
+});
+check("a worker thread reaches JS", seen, [1, 2, 3]);
+
 console.log(bad === 0 ? "ALL PASS" : "FAILURES: " + bad);
 process.exit(bad === 0 ? 0 : 1);

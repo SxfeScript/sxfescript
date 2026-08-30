@@ -118,21 +118,43 @@ imports back to it.
 addon sees exactly the declarations it was compiled against.
 
 A `napi_value` is a JSValue owned by the innermost handle scope. QuickJS is
-refcounted rather than tracing, so a scope is a plain array of values it
-releases on close — simpler than the same thing on V8, and it means an addon
-that leaks handles leaks memory rather than corrupting anything.
+refcounted rather than tracing, so a scope only has to release its values on
+close — simpler than the same thing on V8, and it means an addon that leaks
+handles leaks memory rather than corrupting anything.
+
+One detail is worth writing down because getting it wrong looked like an
+addon bug. A `napi_value` is a pointer to the slot holding its JSValue, so
+slots must never move: a growable array would relocate every handle the addon
+still held the moment it needed one more. Scope storage is therefore fixed
+blocks that are allocated and never resized. Small addons never notice; a
+large one fails immediately and confusingly.
+
+Thread-safe functions are implemented on libuv. Each one owns a queue and a
+`uv_async_t`; a worker thread appends under a mutex and calls `uv_async_send`,
+which is the one libuv call that is safe from another thread, and the loop
+thread -- the only one allowed to touch the context -- drains it. A tsfn is
+unreffed at creation so it does not hold the process open on its own.
 
 Implemented: values and coercions, properties and elements, functions,
-callbacks with their own scope, constructors, errors and the pending-exception
-protocol, handle and escapable scopes, references, `napi_wrap`/`unwrap`,
-externals, ArrayBuffers, typed arrays, Buffers, promises, and async work on
-libuv's thread pool.
+callbacks with their own scope, classes, constructors, errors and the
+pending-exception protocol, handle and escapable scopes, references,
+`napi_wrap`/`unwrap`, externals, external buffers, ArrayBuffers, typed
+arrays, Buffers, promises, async work on libuv's thread pool, and thread-safe
+functions. 120 entry points, which covers every symbol `next-swc` and `sharp`
+import.
+
+That is enough for `next-swc` -- the 130 MB Rust binary Next.js compiles with
+-- to load and compile JSX:
+
+```
+$ sxn -e 'require("./next-swc.darwin-arm64.node").transformSync(...)'
+export default function A() {
+    return /*#__PURE__*/ React.createElement("b", null, "hi");
+}
+```
 
 Not implemented:
 
-- **Thread-safe functions.** An addon's own threads calling into JS needs a
-  cross-thread queue draining on the loop thread. They return a failure with
-  that as the message rather than accepting the call and dropping it.
 - **Weak references.** `napi_create_reference` with a count of zero is kept
   strong, because QuickJS has no weak handle that can be resurrected. That
   leaks rather than dangles.

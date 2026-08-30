@@ -622,6 +622,9 @@ static size_t sxn_js_stack_budget(void) {
     return fallback;
 }
 
+/* Defined in src/napi.c; a no-op when no addon was ever loaded. */
+void sxn_shutdown_napi(JSContext *ctx);
+
 static int execute_file(int argc, char **argv, const char *filename,
                         bool memory_report, bool leak_check) {
     size_t length = 0;
@@ -738,10 +741,12 @@ static int execute_file(int argc, char **argv, const char *filename,
         JS_DumpMemoryUsage(stderr, &usage, runtime);
     }
     sxn_free_node_compat(context);
+    sxn_shutdown_napi(context);
     js_std_free_handlers(runtime); JS_FreeContext(context); JS_FreeRuntime(runtime); return 0;
 failure:
     if (source) js_free(context, source);
     sxn_free_node_compat(context);
+    sxn_shutdown_napi(context);
     js_std_free_handlers(runtime); JS_FreeContext(context); JS_FreeRuntime(runtime); return 1;
 }
 

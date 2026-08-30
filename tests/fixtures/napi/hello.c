@@ -95,6 +95,51 @@ static napi_value ReadCounter(napi_env env, napi_callback_info info) {
   return out;
 }
 
+/* A thread-safe function driven from a real worker thread: the one part of
+   this that cannot be exercised without threads. The worker calls in three
+   times and releases; the JS side counts the calls and resolves. */
+#include <pthread.h>
+
+typedef struct { napi_threadsafe_function tsfn; } Job;
+
+static void *worker(void *arg) {
+  Job *j = arg;
+  for (intptr_t i = 1; i <= 3; i++)
+    napi_call_threadsafe_function(j->tsfn, (void *)i, napi_tsfn_blocking);
+  napi_release_threadsafe_function(j->tsfn, napi_tsfn_release);
+  free(j);
+  return NULL;
+}
+
+static void CallIntoJs(napi_env env, napi_value js_cb, void *context, void *data) {
+  if (env == NULL || js_cb == NULL) return;
+  napi_value undef, arg, ignored;
+  napi_get_undefined(env, &undef);
+  napi_create_int32(env, (int32_t)(intptr_t)data, &arg);
+  napi_call_function(env, undef, js_cb, 1, &arg, &ignored);
+}
+
+static napi_value FromThread(napi_env env, napi_callback_info info) {
+  size_t argc = 1; napi_value argv[1];
+  napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  napi_value name;
+  napi_create_string_utf8(env, "sxn-tsfn-test", NAPI_AUTO_LENGTH, &name);
+  Job *j = malloc(sizeof(Job));
+  if (napi_create_threadsafe_function(env, argv[0], NULL, name, 0, 1,
+                                      NULL, NULL, NULL, CallIntoJs, &j->tsfn) != napi_ok) {
+    free(j);
+    napi_throw_error(env, "ERR_TSFN", "cannot create a thread-safe function");
+    return NULL;
+  }
+  /* The process must stay awake until the worker is done. */
+  napi_ref_threadsafe_function(env, j->tsfn);
+  pthread_t th;
+  pthread_create(&th, NULL, worker, j);
+  pthread_detach(th);
+  napi_value undef; napi_get_undefined(env, &undef);
+  return undef;
+}
+
 static napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor props[] = {
     { "hello", NULL, Hello, NULL, NULL, NULL, napi_default, NULL },
@@ -107,6 +152,7 @@ static napi_value Init(napi_env env, napi_value exports) {
     { "readTyped", NULL, ReadTyped, NULL, NULL, NULL, napi_default, NULL },
     { "makeCounter", NULL, MakeCounter, NULL, NULL, NULL, napi_default, NULL },
     { "readCounter", NULL, ReadCounter, NULL, NULL, NULL, napi_default, NULL },
+    { "fromThread", NULL, FromThread, NULL, NULL, NULL, napi_default, NULL },
   };
   napi_define_properties(env, exports, sizeof(props)/sizeof(props[0]), props);
   return exports;
