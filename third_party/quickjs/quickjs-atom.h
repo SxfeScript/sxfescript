@@ -264,6 +264,7 @@ DEF(AsyncDisposableStack, "AsyncDisposableStack")
 DEF(SuppressedError, "SuppressedError")
 /* arcsx: method names the length fusions recognize at compile time. */
 DEF(encode, "encode")
+DEF(emit, "emit")
 /* private symbols */
 DEF(Private_brand, "<brand>")
 /* symbols */

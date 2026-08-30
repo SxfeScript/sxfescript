@@ -204,6 +204,9 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # The same fusion for encoder.encode(s).length: coercion, surrogates,
   # escaping results, and every guard invalidation.
   add_test(NAME sxn-encode-length-fusion COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/encode_length_fusion.mjs)
+  # The guarded emit fusion: numeric promotion, multiple listeners, once,
+  # removal during emit, direct _events mutation, and listener `this`.
+  add_test(NAME sxn-emit-fusion COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/emit_fusion.mjs)
   set_tests_properties(sxn-performance-now PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()

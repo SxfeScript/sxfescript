@@ -653,6 +653,19 @@ struct JSContext {
        Every entry is compared by identity: a shape pointer catches a property
        added to or removed from a prototype, and the getter value catches
        `length` being redefined in place, which leaves the shape alone. */
+    /* arcsx: `ee.emit("x", n)` where the listener is a captured numeric add.
+       Captured when the listener is registered, because that is the moment the
+       layout is known; validated here by shape and slot identity so a
+       different emitter, a different listener, or a direct write to
+       _events[type] all fail the guard rather than reading stale state.
+       emit_gen_ptr watches the host's listener-mutation counter. */
+    bool emit_fusion_on;
+    JSValue emit_fn, emit_event_str, emit_listener;
+    JSShape *emit_ee_shape, *emit_events_shape;
+    int emit_events_idx, emit_listener_idx;
+    const uint32_t *emit_gen_ptr;
+    uint32_t emit_gen;
+
     bool buf_len_fusion_on;
     bool enc_len_fusion_on;         /* the same, for TextEncoder#encode */
     JSValue enc_len_fn;             /* the exact native encode primitive */
@@ -3055,6 +3068,7 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->buf_len_proto = JS_UNDEFINED;
     ctx->buf_len_u8_proto = JS_UNDEFINED;
     ctx->buf_len_ta_proto = JS_UNDEFINED;
+    ctx->emit_fn = ctx->emit_event_str = ctx->emit_listener = JS_UNDEFINED;
     ctx->enc_len_fn = JS_UNDEFINED;
     ctx->error_stack_trace_limit = js_int32(10);
     init_list_head(&ctx->loaded_modules);
@@ -3192,6 +3206,9 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
     JS_MarkValue(rt, ctx->buf_len_u8_proto, mark_func);
     JS_MarkValue(rt, ctx->buf_len_ta_proto, mark_func);
     JS_MarkValue(rt, ctx->enc_len_fn, mark_func);
+    JS_MarkValue(rt, ctx->emit_fn, mark_func);
+    JS_MarkValue(rt, ctx->emit_event_str, mark_func);
+    JS_MarkValue(rt, ctx->emit_listener, mark_func);
     JS_MarkValue(rt, ctx->error_stack_trace_limit, mark_func);
     for(i = 0; i < rt->class_count; i++) {
         JS_MarkValue(rt, ctx->class_proto[i], mark_func);
@@ -3223,6 +3240,7 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
 
 void JS_DisableBufferLengthFusion(JSContext *ctx);
 void JS_DisableEncodeLengthFusion(JSContext *ctx);
+void JS_DisableEmitFusion(JSContext *ctx);
 
 void JS_FreeContext(JSContext *ctx)
 {
@@ -5006,6 +5024,8 @@ static JSValue js_concat_values(JSContext *ctx, int n, JSValueConst *vals)
 static size_t js_string_utf8_exact(JSString *str);
 
 static JSShapeProperty *find_own_property(JSProperty **ppr, JSObject *p, JSAtom atom);
+static JSShape *js_dup_shape(JSShape *sh);
+static void js_free_shape(JSRuntime *rt, JSShape *sh);
 
 /* arcsx: enable the `Buffer.from(s, "utf-8").length` fusion. Captures the
    exact `from` the guard requires and the prototype chain the elided `.length`
@@ -5048,6 +5068,67 @@ void JS_EnableBufferLengthFusion(JSContext *ctx, JSValueConst from_fn,
 /* arcsx: enable the `encoder.encode(s).length` fusion. Shares the typed-array
    length guard captured by JS_EnableBufferLengthFusion -- both results are
    ordinary Uint8Arrays -- so Buffer must be installed first for this to arm. */
+/* arcsx: arm the emit fusion for one (emitter, event, listener) triple, called
+   by the host when it registers a sole listener. Captures the layout rather
+   than the values: the emitter's shape and the slot its _events sits in, the
+   _events shape and the slot the event sits in. The call site re-reads both
+   slots and compares the listener it finds, so a different emitter of the same
+   shape resolves to its own listener and a direct write to _events[type] is
+   caught even though it bumps no counter. gen_ptr is the host's
+   listener-mutation counter, read on every fused call. */
+void JS_EnableEmitFusion(JSContext *ctx, JSValueConst emit_fn,
+                         JSValueConst emitter, JSValueConst event_str,
+                         JSValueConst listener, JSAtom events_atom,
+                         JSAtom event_atom, const uint32_t *gen_ptr)
+{
+    JSObject *ee, *evs;
+    JSShapeProperty *prs;
+    JSProperty *pr;
+
+    JS_DisableEmitFusion(ctx);
+    if (!gen_ptr || !JS_IsFunction(ctx, emit_fn) || !JS_IsFunction(ctx, listener))
+        return;
+    if (JS_VALUE_GET_TAG(emitter) != JS_TAG_OBJECT ||
+        JS_VALUE_GET_TAG(event_str) != JS_TAG_STRING)
+        return;
+    ee = JS_VALUE_GET_OBJ(emitter);
+    prs = find_own_property(&pr, ee, events_atom);
+    if (!prs || (prs->flags & JS_PROP_TMASK) != 0)   /* plain data slot only */
+        return;
+    if (JS_VALUE_GET_TAG(pr->u.value) != JS_TAG_OBJECT)
+        return;
+    evs = JS_VALUE_GET_OBJ(pr->u.value);
+    ctx->emit_events_idx = (int)(pr - ee->prop);
+    prs = find_own_property(&pr, evs, event_atom);
+    if (!prs || (prs->flags & JS_PROP_TMASK) != 0)
+        return;
+    if (!js_same_value(ctx, pr->u.value, listener))
+        return;
+    ctx->emit_listener_idx = (int)(pr - evs->prop);
+    ctx->emit_ee_shape = js_dup_shape(ee->shape);
+    ctx->emit_events_shape = js_dup_shape(evs->shape);
+    ctx->emit_fn = js_dup(emit_fn);
+    ctx->emit_event_str = js_dup(event_str);
+    ctx->emit_listener = js_dup(listener);
+    ctx->emit_gen_ptr = gen_ptr;
+    ctx->emit_gen = *gen_ptr;
+    ctx->emit_fusion_on = true;
+}
+
+void JS_DisableEmitFusion(JSContext *ctx)
+{
+    if (!ctx->emit_fusion_on) return;
+    ctx->emit_fusion_on = false;
+    js_free_shape(ctx->rt, ctx->emit_ee_shape);
+    js_free_shape(ctx->rt, ctx->emit_events_shape);
+    JS_FreeValue(ctx, ctx->emit_fn);
+    JS_FreeValue(ctx, ctx->emit_event_str);
+    JS_FreeValue(ctx, ctx->emit_listener);
+    ctx->emit_ee_shape = ctx->emit_events_shape = NULL;
+    ctx->emit_fn = ctx->emit_event_str = ctx->emit_listener = JS_UNDEFINED;
+    ctx->emit_gen_ptr = NULL;
+}
+
 void JS_EnableEncodeLengthFusion(JSContext *ctx, JSValueConst encode_fn)
 {
     JS_DisableEncodeLengthFusion(ctx);
@@ -5068,6 +5149,7 @@ void JS_DisableEncodeLengthFusion(JSContext *ctx)
 void JS_DisableBufferLengthFusion(JSContext *ctx)
 {
     JS_DisableEncodeLengthFusion(ctx);
+    JS_DisableEmitFusion(ctx);
     if (!ctx->buf_len_fusion_on) return;
     ctx->buf_len_fusion_on = false;
     JS_FreeValue(ctx, ctx->buf_len_from_fn);
@@ -18897,6 +18979,9 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
    result feeds only a `.length` read that the compiler has elided. Masked off
    everywhere the count is consumed. */
 #define JS_CALL_METHOD_FUSED_LEN 0x8000
+/* arcsx: and on an `emit` call site whose listener may be a captured add. */
+#define JS_CALL_METHOD_FUSED_EMIT 0x4000
+#define JS_CALL_METHOD_FUSED_MASK (JS_CALL_METHOD_FUSED_LEN | JS_CALL_METHOD_FUSED_EMIT)
 
 /* arcsx: "utf8" / "utf-8", the only encodings the length fusion answers for.
    Compared on the string itself so a computed encoding still works. */
@@ -19713,11 +19798,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_call_method):
         CASE(OP_tail_call_method):
             {
-                bool fused_len;
+                bool fused_len, fused_emit;
                 call_argc = get_u16(pc);
                 pc += 2;
                 fused_len = (call_argc & JS_CALL_METHOD_FUSED_LEN) != 0;
-                call_argc &= ~JS_CALL_METHOD_FUSED_LEN;
+                fused_emit = (call_argc & JS_CALL_METHOD_FUSED_EMIT) != 0;
+                call_argc &= ~JS_CALL_METHOD_FUSED_MASK;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
                 /* arcsx: `Buffer.from(s, "utf-8").length`. The trailing
@@ -19725,6 +19811,61 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    leave the number on the stack either way. When the guards
                    hold, the answer comes from the string without building the
                    bytes, the ArrayBuffer or the Buffer. */
+                if (unlikely(fused_emit) && ctx->emit_fusion_on &&
+                    call_argc == 2 &&
+                    *ctx->emit_gen_ptr == ctx->emit_gen &&
+                    /* Pointer identity, not SameValue: the event name is a
+                       literal backed by an atom, so the same string object
+                       arrives every time. SameValue on two strings compares
+                       their contents, which costs more than the whole fused
+                       path. A different pointer simply falls back. */
+                    JS_VALUE_GET_PTR(call_argv[-1]) == JS_VALUE_GET_PTR(ctx->emit_fn) &&
+                    JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_STRING &&
+                    JS_VALUE_GET_PTR(call_argv[0]) == JS_VALUE_GET_PTR(ctx->emit_event_str) &&
+                    JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT) {
+                    JSObject *ee = JS_VALUE_GET_OBJ(call_argv[-2]);
+                    if (ee->shape == ctx->emit_ee_shape) {
+                        JSValue evs = ee->prop[ctx->emit_events_idx].u.value;
+                        if (JS_VALUE_GET_TAG(evs) == JS_TAG_OBJECT &&
+                            JS_VALUE_GET_OBJ(evs)->shape == ctx->emit_events_shape) {
+                            JSValue lst = JS_VALUE_GET_OBJ(evs)->prop[ctx->emit_listener_idx].u.value;
+                            /* The slot is compared, not trusted: a direct
+                               `ee._events.x = f` leaves the generation alone
+                               but not this. */
+                            if (JS_VALUE_GET_PTR(lst) == JS_VALUE_GET_PTR(ctx->emit_listener) &&
+                                JS_VALUE_GET_TAG(lst) == JS_TAG_OBJECT) {
+                                JSObject *lp = JS_VALUE_GET_OBJ(lst);
+                                JSFunctionBytecode *lb = lp->u.func.function_bytecode;
+                                int handled = 0;
+                                /* The listener was classified as a captured
+                                   numeric add the first time it ran, so the
+                                   int case is inlined here rather than paying
+                                   a call that would re-derive it. Anything
+                                   else defers to the shared implementation. */
+                                if (lp->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+                                    lb->fast_captured_add == 1) {
+                                    JSValue *pv = lp->u.func.var_refs[lb->fast_captured_add_ref]->pvalue;
+                                    if (likely(JS_VALUE_IS_BOTH_INT(*pv, call_argv[1]))) {
+                                        int64_t sum = (int64_t)JS_VALUE_GET_INT(*pv) +
+                                                      JS_VALUE_GET_INT(call_argv[1]);
+                                        *pv = (sum < INT32_MIN || sum > INT32_MAX) ?
+                                            js_float64((double)sum) : js_int32(sum);
+                                        handled = 1;
+                                    }
+                                }
+                                if (!handled)
+                                    handled = JS_TryFastCapturedAddCall(ctx, lst, call_argv[1]) == 1;
+                                if (handled) {
+                                    for (i = -2; i < call_argc; i++)
+                                        JS_FreeValue(ctx, call_argv[i]);
+                                    sp -= call_argc + 2;
+                                    *sp++ = JS_TRUE;
+                                    BREAK;
+                                }
+                            }
+                        }
+                    }
+                }
                 if (unlikely(fused_len)) {
                     /* Both fusions answer the same question -- how many bytes
                        would this string occupy -- so both skip building the
@@ -34979,8 +35120,9 @@ static void dump_byte_code(JSContext *ctx, int pass,
         case OP_FMT_npop:
             {   /* arcsx: strip the fused-length flag, and say so */
                 int n = get_u16(tab + pos);
-                printf(" %u%s", n & ~JS_CALL_METHOD_FUSED_LEN,
-                       (n & JS_CALL_METHOD_FUSED_LEN) ? "  ; +fused .length" : "");
+                printf(" %u%s%s", n & ~JS_CALL_METHOD_FUSED_MASK,
+                       (n & JS_CALL_METHOD_FUSED_LEN) ? "  ; +fused .length" : "",
+                       (n & JS_CALL_METHOD_FUSED_EMIT) ? "  ; +fused emit" : "");
             }
             break;
         case OP_FMT_npop_u16:
@@ -38140,6 +38282,16 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                    transform below, which cannot apply once the `.length` is
                    there. A label between the two makes code_match fail, so a
                    jump into the middle of the expression cannot be broken. */
+                /* arcsx: `ee.emit(name, value)`. Unlike the length fusions
+                   nothing is elided here -- the fused path returns the same
+                   boolean emit would -- so this only marks the site as worth
+                   testing the emit guard on. */
+                if (argc == 2 && callee_name == JS_ATOM_emit) {
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    put_short_code(&bc_out, op, argc | JS_CALL_METHOD_FUSED_EMIT);
+                    break;
+                }
                 if (((argc == 2 && callee_name == JS_ATOM_from) ||
                      (argc == 1 && callee_name == JS_ATOM_encode)) &&
                     code_match(&cc, pos_next, OP_get_field, -1) &&
@@ -39172,7 +39324,7 @@ static __exception int compute_stack_size(JSContext *ctx,
         n_pop = oi->n_pop;
         /* call pops a variable number of arguments */
         if (oi->fmt == OP_FMT_npop || oi->fmt == OP_FMT_npop_u16) {
-            n_pop += get_u16(bc_buf + pos + 1) & ~JS_CALL_METHOD_FUSED_LEN;
+            n_pop += get_u16(bc_buf + pos + 1) & ~JS_CALL_METHOD_FUSED_MASK;
         } else if (oi->fmt == OP_FMT_npopx) {
             n_pop += op - OP_call0;
         }

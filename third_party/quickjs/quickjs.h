@@ -1498,6 +1498,11 @@ JS_EXTERN void JS_EnableBufferLengthFusion(JSContext *ctx, JSValueConst from_fn,
 JS_EXTERN void JS_DisableBufferLengthFusion(JSContext *ctx);
 JS_EXTERN void JS_EnableEncodeLengthFusion(JSContext *ctx, JSValueConst encode_fn);
 JS_EXTERN void JS_DisableEncodeLengthFusion(JSContext *ctx);
+JS_EXTERN void JS_EnableEmitFusion(JSContext *ctx, JSValueConst emit_fn,
+                                   JSValueConst emitter, JSValueConst event_str,
+                                   JSValueConst listener, JSAtom events_atom,
+                                   JSAtom event_atom, const uint32_t *gen_ptr);
+JS_EXTERN void JS_DisableEmitFusion(JSContext *ctx);
 
 #ifdef SXN_ABLATE_FUSION
 /* arcsx: fusion-ceiling ablations; see the block in quickjs.c. */

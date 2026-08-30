@@ -90,6 +90,7 @@ static int execute_file(int argc, char **argv, const char *filename,
     JS_SetMaxStackSize(runtime, sxn_js_stack_budget());
     if (leak_check) JS_SetDumpFlags(runtime, JS_ABORT_ON_LEAKS | JS_DUMP_MEM);
     if (getenv("SXN_DUMP_BYTECODE")) JS_SetDumpFlags(runtime, JS_GetDumpFlags(runtime) | JS_DUMP_BYTECODE_FINAL);
+    if (getenv("SXN_DUMP_LEAKS")) JS_SetDumpFlags(runtime, JS_GetDumpFlags(runtime) | JS_DUMP_LEAKS);
     js_std_init_handlers(runtime);
     JSContext *context = JS_NewContext(runtime);
     if (!context) { JS_FreeRuntime(runtime); return 2; }

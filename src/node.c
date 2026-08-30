@@ -314,6 +314,21 @@ static JSValue js_ee_on(JSContext *ctx, JSValueConst this_val, int argc, JSValue
         JS_SetPropertyUint32(ctx, list, sxn_ee_length(ctx, list), JS_DupValue(ctx, argv[1]));
     }
     JS_FreeValue(ctx, list);
+    /* Arm the call-site emit fusion for the sole-listener case, the only shape
+       it handles. Registration is where the layout is known; the call site
+       re-validates it by shape and slot on every call, and reads sxn_ee_gen,
+       which every later mutation bumps, so this never needs explicit
+       clearing. */
+    if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_STRING) {
+        JSValue cur = JS_GetProperty(ctx, events, type);
+        if (JS_IsFunction(ctx, cur)) {
+            JSValue emit_fn = JS_GetPropertyStr(ctx, this_val, "emit");
+            JS_EnableEmitFusion(ctx, emit_fn, this_val, argv[0], cur,
+                                sxn_atom_events, type, &sxn_ee_gen);
+            JS_FreeValue(ctx, emit_fn);
+        }
+        JS_FreeValue(ctx, cur);
+    }
     JS_FreeValue(ctx, events);
     JS_FreeAtom(ctx, type);
     return JS_DupValue(ctx, this_val);
@@ -1336,6 +1351,11 @@ static JSModuleDef *sxn_init_module_node_process(JSContext *ctx, const char *nam
 }
 
 void sxn_free_node_compat(JSContext *ctx) {
+    /* Release the call-site fusion caches here rather than leaving them to
+       JS_FreeContext, which returns early when anything still holds a context
+       reference and would leave the cached shapes outstanding. */
+    JS_DisableEmitFusion(ctx);
+    JS_DisableBufferLengthFusion(ctx);
     /* The cached atoms below hold real references for the life of the
        context; without this they show up as leaks under --leak-check (only
        visible in builds where the runtime's leak dumps are compiled in).
