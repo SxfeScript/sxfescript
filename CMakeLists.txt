@@ -318,22 +318,28 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # by it.
   add_test(NAME sxn-sxbc COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/sxbc_roundtrip.sh $<TARGET_FILE:sxn>)
   # A real Node-API addon, compiled here against Node's own headers so the
-  # thing under test is the same binary shape npm ships.
-  add_library(sxn_test_addon MODULE ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/napi/hello.c)
-  set_target_properties(sxn_test_addon PROPERTIES
-    PREFIX "" OUTPUT_NAME "hello" SUFFIX ".node"
-    C_VISIBILITY_PRESET default)
-  target_include_directories(sxn_test_addon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/node-api)
-  target_compile_definitions(sxn_test_addon PRIVATE NODE_GYP_MODULE_NAME=hello)
-  if(APPLE)
-    target_link_options(sxn_test_addon PRIVATE -undefined dynamic_lookup)
-  elseif(UNIX)
-    target_link_options(sxn_test_addon PRIVATE -Wl,--unresolved-symbols=ignore-all)
+  # thing under test is the same binary shape npm ships. Its napi_* symbols
+  # resolve against whichever process loads it, which ELF/Mach-O allow
+  # unresolved at link time (APPLE/UNIX below) but PE does not without an
+  # import library sxn.exe doesn't generate yet, so this is skipped on
+  # Windows rather than shipping a addon-loading path nothing has verified.
+  if(NOT WIN32)
+    add_library(sxn_test_addon MODULE ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/napi/hello.c)
+    set_target_properties(sxn_test_addon PROPERTIES
+      PREFIX "" OUTPUT_NAME "hello" SUFFIX ".node"
+      C_VISIBILITY_PRESET default)
+    target_include_directories(sxn_test_addon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/node-api)
+    target_compile_definitions(sxn_test_addon PRIVATE NODE_GYP_MODULE_NAME=hello)
+    if(APPLE)
+      target_link_options(sxn_test_addon PRIVATE -undefined dynamic_lookup)
+    elseif(UNIX)
+      target_link_options(sxn_test_addon PRIVATE -Wl,--unresolved-symbols=ignore-all)
+    endif()
+    add_test(NAME sxn-napi-addon COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/napi.mjs)
+    set_tests_properties(sxn-napi-addon PROPERTIES
+      ENVIRONMENT "SXN_TEST_ADDON=$<TARGET_FILE:sxn_test_addon>")
+    add_dependencies(sxn sxn_test_addon)
   endif()
-  add_test(NAME sxn-napi-addon COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/napi.mjs)
-  set_tests_properties(sxn-napi-addon PROPERTIES
-    ENVIRONMENT "SXN_TEST_ADDON=$<TARGET_FILE:sxn_test_addon>")
-  add_dependencies(sxn sxn_test_addon)
   set_tests_properties(sxn-node-http PROPERTIES TIMEOUT 40 FAIL_REGULAR_EXPRESSION "FAIL")
   add_test(NAME sxn-web-streams COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/web_streams.mjs)
   # Crypto/SubtleCrypto brands, and MessageChannel's two ports.
