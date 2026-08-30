@@ -91,7 +91,7 @@ A `.sx` file is the same language with mutation and aliasing made explicit.
 `let mut` is a mutable owner, `let` an immutable one, `&` borrows a value
 shared, and `&mut` borrows it exclusively:
 
-```sx
+```ts
 interface Counter {
   hits: i32;
 }

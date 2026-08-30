@@ -19,7 +19,6 @@ Usage: scripts/build-docs.py <output-dir> [repo-url]
 """
 
 import html
-import json
 import pathlib
 import re
 import subprocess
@@ -67,6 +66,22 @@ PAGES = [
 ]
 
 BY_SOURCE = {source: (slug, title) for source, slug, title, _, _ in PAGES}
+
+
+INCLUDE_RE = re.compile(r"^<!-- include: (\S+) as (\S+) -->$", re.M)
+
+
+def expand_includes(text):
+    """`<!-- include: examples/server.mjs as js -->` becomes that file inside a
+    fenced block. The examples page quotes six programs in full, and a copy
+    pasted into the markdown goes stale the moment the program is edited --
+    silently, since nothing checks the two against each other."""
+
+    def one(m):
+        source = (ROOT / m.group(1)).read_text().rstrip()
+        return f"```{m.group(2)}\n{source}\n```"
+
+    return INCLUDE_RE.sub(one, text)
 
 
 def render_markdown(text):
@@ -174,7 +189,7 @@ def build(out_dir, repo_url):
     rendered = []
 
     for index, (source, slug, title, _, description) in enumerate(PAGES):
-        text = (ROOT / source).read_text()
+        text = expand_includes((ROOT / source).read_text())
         # Depth from /docs/<slug>/ back to the site root.
         root = "../../"
         body = render_markdown(text)
