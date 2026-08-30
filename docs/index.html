@@ -70,11 +70,11 @@
   ::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: padding-box; }
   body {
     margin: 0; color: var(--ink); overflow-x: hidden;
-    /* A soft warm glow behind the hero, contrasting with the teal used for
-       text and accents rather than repeating it, fading to the flat page
-       color by the time content scrolls past it. */
+    /* A bright violet-blue glow top-left, a faint warm counterpoint
+       top-right, fading to the flat page color by the time content
+       scrolls past them. */
     background:
-      radial-gradient(1100px 620px at 15% -12%, color-mix(in srgb, var(--unsafe) 20%, transparent), transparent 60%),
+      radial-gradient(1100px 620px at 15% -12%, color-mix(in srgb, #7c6cff 26%, transparent), transparent 60%),
       radial-gradient(900px 520px at 105% -6%, color-mix(in srgb, var(--unsafe) 10%, transparent), transparent 55%),
       var(--paper);
     background-repeat: no-repeat;
