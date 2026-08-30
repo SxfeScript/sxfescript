@@ -265,6 +265,14 @@ DEF(SuppressedError, "SuppressedError")
 /* arcsx: method names the length fusions recognize at compile time. */
 DEF(encode, "encode")
 DEF(emit, "emit")
+/* arcsx: TypeScript pseudo-keywords erased by the parser. `enum` and `as`
+   already exist above and are reused; defining them twice corrupts the atom
+   table. */
+DEF(ts_type, "type")
+DEF(ts_declare, "declare")
+DEF(ts_abstract, "abstract")
+DEF(ts_namespace, "namespace")
+DEF(ts_satisfies, "satisfies")
 /* private symbols */
 DEF(Private_brand, "<brand>")
 /* symbols */

@@ -29777,6 +29777,36 @@ static __exception int js_parse_type_annotation(JSParseState *s, bool return_typ
     }
 }
 
+/* arcsx: skip a type expression that is not introduced by ':' -- the operand
+   of `as` or `satisfies`. Same bracket tracking as js_parse_type_annotation,
+   but starting on the type's first token and stopping before anything that
+   can only belong to the surrounding expression. */
+static __exception int js_parse_ts_skip_type(JSParseState *s)
+{
+    int depth = 0;
+    if (next_token(s)) return -1;            /* step past as/satisfies */
+    for (;;) {
+        if (s->token.val == TOK_EOF) return 0;
+        if (s->token.val == '<' || s->token.val == '[' ||
+            s->token.val == '{' || s->token.val == '(')
+            depth++;
+        else if (s->token.val == '>' || s->token.val == ']' ||
+                 s->token.val == '}' || s->token.val == ')') {
+            if (!depth) return 0;            /* closes an enclosing form */
+            depth--;
+        }
+        if (!depth) {
+            int v = peek_token(s, false);
+            /* A type continues across '.', '|', '&', '[' and identifiers;
+               anything else ends it. */
+            if (!(v == '.' || v == '|' || v == '&' || v == '<' || v == '[' ||
+                  v == '(' || v == '{' || token_is_ident(v)))
+                { if (next_token(s)) return -1; return 0; }
+        }
+        if (next_token(s)) return -1;
+    }
+}
+
 /* allowed parse_flags: PF_IN_ACCEPTED */
 static __exception int js_parse_expr_binary(JSParseState *s, int level,
                                             int parse_flags)
@@ -29784,7 +29814,15 @@ static __exception int js_parse_expr_binary(JSParseState *s, int level,
     int op, opcode;
 
     if (level == 0) {
-        return js_parse_unary(s, PF_POW_ALLOWED);
+        if (js_parse_unary(s, PF_POW_ALLOWED)) return -1;
+        /* arcsx: `expr as T` and `expr satisfies T` are assertions for the
+           type checker and produce no code, so the operand is erased. Bound
+           tighter than any binary operator, which is where TS puts them. */
+        while (token_is_pseudo_keyword(s, JS_ATOM_as) ||
+               token_is_pseudo_keyword(s, JS_ATOM_ts_satisfies)) {
+            if (js_parse_ts_skip_type(s)) return -1;
+        }
+        return 0;
     } else if (s->token.val == TOK_PRIVATE_NAME &&
                (parse_flags & PF_IN_ACCEPTED) && level == 4 &&
                peek_token(s, false) == TOK_IN) {
@@ -34415,6 +34453,8 @@ static bool has_unmatched_surrogate(const uint16_t *s, size_t n)
     return false;
 }
 
+static int js_parse_ts_type_decl(JSParseState *s);
+
 static __exception int js_parse_export(JSParseState *s)
 {
     JSContext *ctx = s->ctx;
@@ -34425,6 +34465,31 @@ static __exception int js_parse_export(JSParseState *s)
 
     if (next_token(s))
         return -1;
+
+    /* arcsx: `export interface X {}`, `export type X = ...`, `export enum`,
+       `export declare ...` and `export type { X }` are type-only: erase the
+       whole declaration, exporting nothing. */
+    {
+        int erased = js_parse_ts_type_decl(s);
+        if (erased < 0) return -1;
+        if (erased) return 0;
+    }
+    if (token_is_pseudo_keyword(s, JS_ATOM_ts_type) && peek_token(s, false) == '{') {
+        /* `export type { A, B }` -- a type-only re-export. */
+        int depth = 0;
+        for (;;) {
+            if (next_token(s)) return -1;
+            if (s->token.val == TOK_EOF) break;
+            if (s->token.val == '{') depth++;
+            else if (s->token.val == '}') { if (--depth <= 0) { if (next_token(s)) return -1; break; } }
+        }
+        if (token_is_pseudo_keyword(s, JS_ATOM_from)) {
+            if (next_token(s)) return -1;              /* the module specifier */
+            if (next_token(s)) return -1;
+        }
+        if (s->token.val == ';' && next_token(s)) return -1;
+        return 0;
+    }
 
     tok = s->token.val;
     if (tok == TOK_CLASS) {
@@ -34648,6 +34713,29 @@ static __exception int js_parse_import(JSParseState *s)
     if (next_token(s))
         return -1;
 
+    /* arcsx: `import type ...` imports nothing at runtime. Distinguished from
+       a value named `type` (`import type from "m"`) by what follows: a
+       type-only import is `type {`, `type *` or `type Ident from`. */
+    if (token_is_pseudo_keyword(s, JS_ATOM_ts_type)) {
+        JSParsePos tpos;
+        js_parse_get_pos(s, &tpos);
+        if (next_token(s)) return -1;
+        bool type_only = (s->token.val == '{' || s->token.val == '*');
+        if (!type_only && token_is_ident(s->token.val)) {
+            if (next_token(s)) return -1;
+            type_only = token_is_pseudo_keyword(s, JS_ATOM_from) || s->token.val == ',';
+        }
+        if (type_only) {
+            while (s->token.val != TOK_EOF && s->token.val != ';') {
+                if (s->token.val == TOK_STRING) { if (next_token(s)) return -1; break; }
+                if (next_token(s)) return -1;
+            }
+            if (s->token.val == ';' && next_token(s)) return -1;
+            return 0;
+        }
+        if (js_parse_seek_token(s, &tpos)) return -1;
+    }
+
     first_import = m->import_entries_count;
     if (s->token.val == TOK_STRING) {
         module_name = JS_ValueToAtom(ctx, s->token.u.str.str);
@@ -34761,38 +34849,86 @@ static __exception int js_parse_import(JSParseState *s)
     return js_parse_expect_semi(s);
 }
 
+/* arcsx: erase a type-only declaration if one starts here.
+   Handles `interface X {...}`, `type X = ...;`, `enum X {...}`,
+   `declare ...`, `namespace X {...}` and `abstract class`. Each is contextual
+   -- they are all valid identifiers -- so every one backtracks unless the
+   following tokens confirm a declaration, leaving `type.foo()` or
+   `let enum = 1` to parse as ordinary code. Returns 1 if it erased
+   something, 0 if not, -1 on error. */
+static int js_parse_ts_type_decl(JSParseState *s)
+{
+    JSParsePos start;
+    bool matched = false;
+
+    js_parse_get_pos(s, &start);
+
+    /* `enum` and `namespace` are deliberately NOT erased: both emit a runtime
+       object in TypeScript, so dropping them would silently turn every use of
+       their members into undefined. They stay rejected, which is honest. */
+    if (token_is_pseudo_keyword(s, JS_ATOM_interface)) {
+        if (next_token(s)) return -1;
+        matched = token_is_ident(s->token.val);
+    } else if (token_is_pseudo_keyword(s, JS_ATOM_ts_type)) {
+        /* `type X =` or `type X<...> =`; anything else is an identifier. */
+        if (next_token(s)) return -1;
+        if (token_is_ident(s->token.val)) {
+            if (next_token(s)) return -1;
+            matched = (s->token.val == '=' || s->token.val == '<');
+        }
+    } else if (token_is_pseudo_keyword(s, JS_ATOM_ts_declare)) {
+        if (next_token(s)) return -1;
+        matched = (s->token.val == TOK_CONST || s->token.val == TOK_VAR ||
+                   s->token.val == TOK_LET || s->token.val == TOK_FUNCTION ||
+                   s->token.val == TOK_CLASS ||
+                   token_is_pseudo_keyword(s, JS_ATOM_ts_type) ||
+                   token_is_pseudo_keyword(s, JS_ATOM_interface) ||
+                   s->token.val == TOK_ENUM ||        /* `declare enum` is type-only */
+                   token_is_pseudo_keyword(s, JS_ATOM_ts_namespace));
+    } else if (token_is_pseudo_keyword(s, JS_ATOM_ts_abstract)) {
+        /* `abstract class X` keeps its class -- only the modifier goes. */
+        if (next_token(s)) return -1;
+        if (s->token.val == TOK_CLASS)
+            return 0;                     /* leave the class to the caller */
+        matched = false;
+    }
+
+    if (!matched) return js_parse_seek_token(s, &start) ? -1 : 0;
+
+    /* Consume to the end of the declaration: either a balanced brace body or
+       a statement terminated by ';' or a newline. */
+    if (js_parse_seek_token(s, &start)) return -1;
+    int depth = 0;
+    bool saw_body = false;
+    for (;;) {
+        if (next_token(s)) return -1;
+        if (s->token.val == TOK_EOF) break;
+        if (s->token.val == '{' || s->token.val == '(' || s->token.val == '[') {
+            depth++; if (s->token.val == '{') saw_body = true;
+        } else if (s->token.val == '}' || s->token.val == ')' || s->token.val == ']') {
+            if (depth) depth--;
+            if (!depth && saw_body) { if (next_token(s)) return -1; break; }
+        } else if (!depth && s->token.val == ';') {
+            if (next_token(s)) return -1;
+            break;
+        } else if (!depth && !saw_body && s->got_lf) {
+            break;                        /* ASI ends an unbraced `type X = Y` */
+        }
+    }
+    if (s->token.val == ';' && next_token(s)) return -1;
+    return 1;
+}
+
 static __exception int js_parse_source_element(JSParseState *s)
 {
     JSFunctionDef *fd = s->cur_func;
     int tok;
 
-    /* Type-only interface declarations are erased at parse time.
-       `interface` is contextual: only erase on the real `interface Name {`
-       shape, otherwise backtrack and fall through (see the matching
-       lookahead in js_parse_statement_or_decl). */
-    if (token_is_pseudo_keyword(s, JS_ATOM_interface)) {
-        JSParsePos iface_pos;
-        bool is_decl;
-        js_parse_get_pos(s, &iface_pos);
-        if (next_token(s)) return -1;
-        is_decl = token_is_ident(s->token.val);
-        if (is_decl) {
-            if (next_token(s)) return -1;
-            is_decl = (s->token.val == '{');
-        }
-        if (js_parse_seek_token(s, &iface_pos)) return -1;
-        if (is_decl) {
-            int depth = 0;
-            bool saw_body = false;
-            do {
-                if (next_token(s)) return -1;
-                if (s->token.val == '{') { depth++; saw_body = true; }
-                else if (s->token.val == '}' && depth) depth--;
-            } while ((!saw_body || depth > 0) && s->token.val != TOK_EOF);
-            if (next_token(s)) return -1;
-            if (s->token.val == ';' && next_token(s)) return -1;
-            return 0;
-        }
+    /* Type-only declarations have no runtime representation. */
+    {
+        int erased = js_parse_ts_type_decl(s);
+        if (erased < 0) return -1;
+        if (erased) return 0;
     }
 
     if (s->token.val == TOK_FUNCTION ||
@@ -40044,6 +40180,17 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                 JS_FreeAtom(ctx, func_name);
                 return -1;
             }
+            /* arcsx: a type parameter list, `function id<T, U extends V>(...)`.
+               Erased; the '<' here cannot be a comparison because a function
+               name is always followed by '(' in JavaScript. */
+            if (s->token.val == '<') {
+                int depth = 0;
+                do {
+                    if (s->token.val == '<') depth++;
+                    else if (s->token.val == '>') depth--;
+                    if (next_token(s)) { JS_FreeAtom(ctx, func_name); return -1; }
+                } while (depth > 0 && s->token.val != TOK_EOF);
+            }
         } else {
             if (func_type != JS_PARSE_FUNC_EXPR &&
                 export_flag != JS_PARSE_EXPORT_DEFAULT) {
@@ -40247,6 +40394,10 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                 if (idx < 0)
                     goto fail;
                 if (next_token(s))
+                    goto fail;
+                /* arcsx: `a?: T` -- optionality is a type-checker concern,
+                   and an absent argument is already undefined here. */
+                if (s->token.val == '?' && next_token(s))
                     goto fail;
                 if (s->token.val == ':' && js_parse_type_annotation(s, false))
                     goto fail;

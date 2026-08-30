@@ -1,0 +1,12 @@
+import { scale, pick, pair, widened, checked, union, arithmetic, compared, localUse } from "./types.ts";
+const L = [];
+L.push("scale=" + JSON.stringify(scale({ x: 2, y: "s" }, 3)));
+L.push("generic=" + pick(1) + "," + pick(1, 2));
+L.push("two params=" + JSON.stringify(pair("a", 1)));
+L.push("as=" + widened);
+L.push("satisfies=" + JSON.stringify(checked));
+L.push("as union=" + union);
+L.push("as in expr=" + arithmetic);
+L.push("comparison still works=" + compared);
+L.push("local interface=" + localUse);
+console.log(L.join("\n"));

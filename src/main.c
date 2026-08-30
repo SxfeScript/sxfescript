@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <errno.h>
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
@@ -506,7 +507,12 @@ static int execute_file(int argc, char **argv, const char *filename,
     JS_SetHostPromiseRejectionTracker(runtime, js_std_promise_rejection_tracker, NULL);
 
     source = sxn_load_file(context, &length, filename);
-    if (!source) { js_std_dump_error(context); goto failure; }
+    if (!source) {
+        /* js_load_file reports failure without setting an exception, so
+           dumping one printed "[uninitialized]" instead of naming the file. */
+        fprintf(stderr, "sxn: cannot open '%s': %s\n", filename, strerror(errno));
+        goto failure;
+    }
     /* A CommonJS entry point needs require/module/exports/__dirname in scope,
        and every module needs a require bound to its own directory. Install a
        global one anchored at the entry file's directory so ESM can use it too,
