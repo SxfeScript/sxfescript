@@ -1178,8 +1178,13 @@ static JSValue js_sxn_fetch_raw(JSContext *ctx, JSValueConst this_val, int argc,
     if (headers) curl_easy_setopt(easy, CURLOPT_HTTPHEADER, headers);
     if (method) curl_easy_setopt(easy, CURLOPT_CUSTOMREQUEST, method);
     if (request_body) {
-        curl_easy_setopt(easy, CURLOPT_COPYPOSTFIELDS, request_body);
+        /* POSTFIELDSIZE must be set BEFORE COPYPOSTFIELDS: libcurl reads the
+           size at the moment the fields are copied. Setting it afterwards
+           left curl expecting an upload it had no read callback for, so it
+           connected and then sent nothing at all -- every POST, PUT and PATCH
+           hung until it timed out. */
         curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, (long)strlen(request_body));
+        curl_easy_setopt(easy, CURLOPT_COPYPOSTFIELDS, request_body);
     }
     JS_FreeCString(ctx, url); JS_FreeCString(ctx, method);
 

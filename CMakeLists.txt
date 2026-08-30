@@ -242,6 +242,9 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   add_test(NAME sxn-node-builtins COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_builtins.mjs)
   # File and FormData, the multi-map fetch bodies are built on.
   add_test(NAME sxn-formdata COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/formdata.mjs)
+  # fetch with a request body: POST/PUT/PATCH, empty, JSON and large bodies.
+  add_test(NAME sxn-fetch-body COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/fetch_body.mjs)
+  set_tests_properties(sxn-fetch-body PROPERTIES TIMEOUT 40 FAIL_REGULAR_EXPRESSION "FAIL")
   add_test(NAME sxn-serve-handle COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_handle.mjs)
   set_tests_properties(sxn-serve-handle PROPERTIES TIMEOUT 30 FAIL_REGULAR_EXPRESSION "FAIL")
   add_test(NAME sxn-serve-headers COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_headers.mjs)
