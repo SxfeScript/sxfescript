@@ -126,7 +126,25 @@ endif()
 # private. Without this the addon loads and then cannot find napi_get_cb_info.
 set_target_properties(sxn PROPERTIES ENABLE_EXPORTS ON)
 if(WIN32)
-  target_compile_definitions(sxn PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
+  # 0x0A00 = Windows 10. GetCurrentThreadStackLimits (src/main.c) needs at
+  # least 0x0602 (Windows 8) per mingw-w64's own processthreadsapi.h - 0x0600
+  # (Vista) still leaves it undeclared, found by checking that header, not by
+  # guessing. Set as a compile definition rather than in-source:
+  # third_party/quickjs's cutils.h includes <windows.h> itself, before any
+  # #define in main.c would take effect, and windows.h only honors the first
+  # inclusion's API level.
+  target_compile_definitions(sxn PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
+  # MinGW's linker default stack reserve is 2MB; sxn_js_stack_budget()
+  # (src/main.c) already reserves 2MB of that for native frames beyond the
+  # interpreter's own checks, leaving nothing and forcing the 1MB floor.
+  # 8MB (glibc/Darwin's usual default, and what that budget was sized
+  # against) still wasn't enough here: the same bounded-recursion fixtures
+  # that pass comfortably on macOS/Linux need more headroom on Windows,
+  # most likely the x64 calling convention's mandatory 32-byte shadow space
+  # per call adding up over a few thousand frames. 32MB is a reserve, not a
+  # commit - Windows only pages it in as the stack actually grows - so the
+  # cost of the difference is address space, not memory.
+  target_link_options(sxn PRIVATE -Wl,--stack,33554432)
 endif()
 
 include(CTest)

@@ -14,6 +14,11 @@
 #endif
 
 #ifdef _WIN32
+/* _WIN32_WINNT is set by CMakeLists (needed before quickjs/cutils.h's own
+   <windows.h> include, which locks the API level in on first inclusion). */
+#include <windows.h>
+#include <io.h>
+#include <fcntl.h>
 #define strcasecmp _stricmp
 #endif
 
@@ -849,7 +854,15 @@ static JSModuleDef *sxn_module_loader(JSContext *ctx, const char *name, void *op
 static size_t sxn_js_stack_budget(void) {
     const size_t reserve = 2u * 1024 * 1024;
     const size_t fallback = 1u * 1024 * 1024;
-#ifndef _WIN32
+#ifdef _WIN32
+    /* getrlimit's equivalent: the current thread's actual reserved stack
+       region, not the PE header's default (which GetCurrentThreadStackLimits
+       reports correctly even when the linker or a caller changed it). */
+    ULONG_PTR low = 0, high = 0;
+    GetCurrentThreadStackLimits(&low, &high);
+    size_t real = (size_t)(high - low);
+    if (real > reserve + fallback) return real - reserve;
+#else
     struct rlimit rl;
     if (getrlimit(RLIMIT_STACK, &rl) == 0 &&
         rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur > reserve + fallback)
