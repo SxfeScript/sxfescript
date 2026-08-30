@@ -33,6 +33,7 @@ The `spec/` directory is the actual design surface, not settled history:
 - [`spec/RUNTIME.md`](spec/RUNTIME.md) / [`spec/NODE.md`](spec/NODE.md) — what's supported, as a runtime and as a Node alternative
 - [`spec/IMPLEMENTATION.md`](spec/IMPLEMENTATION.md) — what's real today, what's measured, what's still open
 - [`spec/BYTECODE.md`](spec/BYTECODE.md) — precompiled `.sxbc` bytecode
+- [`spec/PERFORMANCE.md`](spec/PERFORMANCE.md) — the benchmark numbers in the README, explained
 
 ## Working in the repo
 
