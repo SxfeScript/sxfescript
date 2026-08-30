@@ -268,6 +268,12 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # Every Buffer encoding in both directions, including Node's lenient hex and
   # base64 readers. Expectations are Node's own output, so a divergence fails.
   add_test(NAME sxn-buffer-encodings COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/buffer_encodings.mjs)
+  # Node decides module-vs-CommonJS from the nearest package.json's "type", and
+  # runs any file it is handed whatever it is called. These three run
+  # identically under node, which is the point of them.
+  add_test(NAME sxn-entry-commonjs COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/cjsentry/plain.js)
+  add_test(NAME sxn-entry-esm-package COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/cjsentry/esmpkg/mod.js)
+  add_test(NAME sxn-entry-extensionless COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/cjsentry/tool)
   set_tests_properties(sxn-node-http PROPERTIES TIMEOUT 40 FAIL_REGULAR_EXPRESSION "FAIL")
   add_test(NAME sxn-web-streams COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/web_streams.mjs)
   # Crypto/SubtleCrypto brands, and MessageChannel's two ports.

@@ -162,6 +162,49 @@ static JSValue sxn_pick_condition(JSContext *ctx, JSValueConst node, int depth) 
 /* Pull a usable entry path out of a package.json. Prefers "exports" for the
    "." subpath (string form, or an object keyed by condition, checking import
    then default then require), then "module", then "main". */
+/* Node's rule for what a file is: .mjs/.mts are modules, .cjs is CommonJS,
+   and everything else -- .js and the extensionless CLIs every npm package
+   ships -- is decided by the nearest package.json's "type", defaulting to
+   CommonJS. Treating every .js as a module is why `sxn ./node_modules/.bin/x`
+   died on `exports is not defined`. The extensions this runtime owns, .sx and
+   .ts, stay modules regardless: type stripping here is this project's own
+   feature rather than Node's, and it has always been ESM. */
+static bool sxn_entry_is_commonjs(JSContext *ctx, const char *filename) {
+    if (suffix(filename, ".cjs")) return true;
+    if (suffix(filename, ".mjs") || suffix(filename, ".mts") ||
+        suffix(filename, ".sx") || suffix(filename, ".ts"))
+        return false;
+
+    char dir[PATH_MAX];
+    if (filename[0] == '/') snprintf(dir, sizeof(dir), "%s", filename);
+    else {
+        char cwd[PATH_MAX];
+        if (!getcwd(cwd, sizeof(cwd))) return true;
+        snprintf(dir, sizeof(dir), "%s/%s", cwd, filename);
+    }
+    for (;;) {
+        char *sl = strrchr(dir, '/');
+        if (!sl || sl == dir) return true;          /* reached the root: CommonJS */
+        *sl = 0;
+        char manifest[PATH_MAX];
+        if (snprintf(manifest, sizeof(manifest), "%s/package.json", dir) >= (int)sizeof(manifest))
+            return true;
+        size_t len = 0;
+        uint8_t *buf = js_load_file(ctx, &len, manifest);
+        if (!buf) continue;                          /* keep walking up */
+        JSValue json = JS_ParseJSON(ctx, (const char *)buf, len, manifest);
+        js_free(ctx, buf);
+        if (JS_IsException(json)) { JS_FreeValue(ctx, json); return true; }
+        JSValue type = JS_GetPropertyStr(ctx, json, "type");
+        const char *t = JS_ToCString(ctx, type);
+        bool cjs = !t || strcmp(t, "module") != 0;
+        if (t) JS_FreeCString(ctx, t);
+        JS_FreeValue(ctx, type);
+        JS_FreeValue(ctx, json);
+        return cjs;                                  /* nearest manifest decides */
+    }
+}
+
 static char *sxn_pkg_entry(JSContext *ctx, const char *pkg_dir) {
     char manifest[PATH_MAX], cand[PATH_MAX];
     if (snprintf(manifest, sizeof(manifest), "%s/package.json", pkg_dir) >= (int)sizeof(manifest))
@@ -365,6 +408,15 @@ static JSValue sxn_require_fn(JSContext *ctx, JSValueConst this_val,
     snprintf(mdir, sizeof(mdir), "%s", path);
     char *sl = strrchr(mdir, '/'); if (sl) *sl = 0; else snprintf(mdir, sizeof(mdir), ".");
 
+    /* A leading #! line is not JavaScript. Node strips it from every file it
+       loads, which is what makes the extensionless CLIs in node_modules/.bin
+       runnable at all. Blank it rather than remove it, so reported line
+       numbers still match the file. */
+    if (len >= 2 && src[0] == '#' && src[1] == '!') {
+        size_t i = 0;
+        while (i < len && src[i] != '\n') src[i++] = ' ';
+    }
+
     /* Wrap exactly the way Node does, so the file's own `this` is exports. */
     static const char *pre = "(function (exports, require, module, __filename, __dirname) {";
     static const char *post = "\n});";
@@ -404,10 +456,54 @@ static JSValue sxn_require_fn(JSContext *ctx, JSValueConst this_val,
     return final;
 }
 
+/* require.resolve(spec): the path require() would load, without loading it.
+   Packages use it to find a sibling's files -- Next reads styled-jsx's
+   package.json this way before it will start. */
+static JSValue sxn_require_resolve_fn(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv,
+                                      int magic, JSValueConst *func_data) {
+    (void)this_val; (void)magic;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "require.resolve needs a specifier");
+    const char *dir = JS_ToCString(ctx, func_data[0]);
+    const char *name = JS_ToCString(ctx, argv[0]);
+    JSValue out = JS_EXCEPTION;
+    if (dir && name) {
+        char *path = sxn_require_resolve(ctx, dir, name);
+        if (path) { out = JS_NewString(ctx, path); js_free(ctx, path); }
+        else out = JS_ThrowReferenceError(ctx, "cannot resolve module '%s'", name);
+    }
+    if (dir) JS_FreeCString(ctx, dir);
+    if (name) JS_FreeCString(ctx, name);
+    return out;
+}
+
+/* module.createRequire(path): a require rooted at that path's directory,
+   rather than the entry file's. ESM code uses it to reach CommonJS, and a
+   require anchored at the wrong directory resolves the wrong siblings. */
+static JSValue sxn_make_require_fn(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv) {
+    (void)this_val;
+    const char *from = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+    char dir[PATH_MAX];
+    if (!from) return JS_ThrowTypeError(ctx, "createRequire needs a path or file: URL");
+    const char *p = has_prefix(from, "file://") ? from + 7 : from;
+    snprintf(dir, sizeof(dir), "%s", p);
+    JS_FreeCString(ctx, from);
+    /* Node accepts the file itself or its directory; both anchor at the
+       directory, and a trailing slash means it was already one. */
+    if (sxn_is_file(dir)) {
+        char *sl = strrchr(dir, '/');
+        if (sl && sl != dir) *sl = 0;
+    }
+    return sxn_make_require(ctx, dir);
+}
+
 static JSValue sxn_make_require(JSContext *ctx, const char *dir) {
     JSValue d = JS_NewString(ctx, dir);
     JSValueConst data[1] = { d };
     JSValue fn = JS_NewCFunctionData(ctx, sxn_require_fn, 1, 0, 1, data);
+    JS_SetPropertyStr(ctx, fn, "resolve",
+                      JS_NewCFunctionData(ctx, sxn_require_resolve_fn, 1, 0, 1, data));
     JS_FreeValue(ctx, d);
     return fn;
 }
@@ -549,9 +645,12 @@ static int execute_file(int argc, char **argv, const char *filename,
         if (sl) *sl = 0; else snprintf(entry_dir, sizeof(entry_dir), ".");
         JSValue g = JS_GetGlobalObject(context);
         JS_SetPropertyStr(context, g, "require", sxn_make_require(context, entry_dir));
+        JS_SetPropertyStr(context, g, "__sxnMakeRequire",
+                          JS_NewCFunction(context, sxn_make_require_fn, "createRequire", 1));
         JS_FreeValue(context, g);
     }
-    int flags = suffix(filename, ".cjs") ? JS_EVAL_TYPE_GLOBAL : JS_EVAL_TYPE_MODULE;
+    int flags = sxn_entry_is_commonjs(context, filename) ? JS_EVAL_TYPE_GLOBAL
+                                                        : JS_EVAL_TYPE_MODULE;
     JSValue value;
     if (flags == JS_EVAL_TYPE_GLOBAL) {
         /* Run the entry through require() rather than as bare global code, so
@@ -636,7 +735,13 @@ int main(int argc, char **argv) {
         ++file_index;
     }
     if (file_index >= argc) { usage(); return 2; }
-    if (!suffix(argv[file_index], ".sx") && !suffix(argv[file_index], ".js") && !suffix(argv[file_index], ".mjs") && !suffix(argv[file_index], ".cjs") && !suffix(argv[file_index], ".ts") && !suffix(argv[file_index], ".mts")) {
+    /* An argument that names a real file is a file to run, whatever it is
+       called. Node and Bun both run `./node_modules/.bin/whatever`, and every
+       CLI shipped by an npm package is extensionless, so requiring a known
+       suffix here sent them all to `npm run` and reported a missing script.
+       A name that is not a file is still a package script. */
+    if (!sxn_is_file(argv[file_index]) &&
+        !suffix(argv[file_index], ".sx") && !suffix(argv[file_index], ".js") && !suffix(argv[file_index], ".mjs") && !suffix(argv[file_index], ".cjs") && !suffix(argv[file_index], ".ts") && !suffix(argv[file_index], ".mts")) {
         char **run_argv = calloc((size_t)argc + 1, sizeof(*run_argv));
         if (!run_argv) return 2;
         run_argv[0] = argv[0]; run_argv[1] = "run";

@@ -1,0 +1,3 @@
+#!/usr/bin/env node
+// Extensionless, with a shebang: the shape every npm CLI ships.
+console.log("tool " + (typeof require === "function"));

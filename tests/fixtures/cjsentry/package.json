@@ -1,0 +1,1 @@
+{ "name": "cjsentry-fixture", "private": true, "scripts": { "afixture": "echo script-name-still-works" } }

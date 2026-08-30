@@ -1469,12 +1469,30 @@
   globalThis.__sxnPerfHooks = perfHooks;
 
   // node:module -- createRequire is what ESM code uses to reach CommonJS.
-  const moduleModule = {
-    createRequire: () => globalThis.require,
+  // Packages read `require('module').prototype.require` -- Next does it on its
+  // first line -- so node:module has to be the Module constructor with the
+  // rest hung off it, the same shape as node:events.
+  //
+  // Replacing Module.prototype.require does NOT redirect this runtime's
+  // require(): the loader is native and does not consult it. A package that
+  // aliases dependencies that way will find its aliases quietly ignored.
+  function Module(id, parent) {
+    this.id = id; this.filename = id; this.exports = {};
+    this.parent = parent || null; this.loaded = false;
+    this.children = []; this.paths = [];
+  }
+  Module.prototype.require = function (spec) {
+    return (this.filename ? __sxnMakeRequire(this.filename) : globalThis.require)(spec);
+  };
+  Module._cache = Object.create(null);
+  Module._resolveFilename = (spec) => globalThis.require.resolve(spec);
+  const moduleModule = Object.assign(Module, {
+    Module,
+    createRequire: (from) => __sxnMakeRequire(String(from)),
     builtinModules: ["assert","buffer","events","fs","http","os","path","process",
                      "querystring","stream","string_decoder","timers","tty","url","util"],
     isBuiltin: (n) => moduleModule.builtinModules.includes(String(n).replace(/^node:/, "")),
-  };
+  });
   globalThis.__sxnModule = moduleModule;
 
   // CommonJS reaches the builtins through require(), which is synchronous, so
