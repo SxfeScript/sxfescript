@@ -5,10 +5,10 @@ let bad = 0;
 const check = (n, got, want) => { const ok = got === want; if (!ok) bad++;
   console.log((ok?"ok   ":"FAIL ") + n + " got=" + JSON.stringify(got) + " want=" + JSON.stringify(want)); };
 
-const server = Sxn.serve({ port: 8973 }, (req) => ({
+const server = Sxn.serve({ port: 8973 }, async (req) => ({
   statusCode: 200,
   headers: { "content-type": "text/plain" },
-  body: (req.method || "?") + ":" + (req.body || ""),
+  body: (req.method || "?") + ":" + (await req.text()),
 }));
 
 check("POST", await (await fetch(server.url + "/", { method: "POST", body: "one" })).text(), "POST:one");

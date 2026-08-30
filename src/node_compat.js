@@ -1097,7 +1097,10 @@
     if (typeof hostOrCb === "function") { cb = hostOrCb; }
     if (typeof port === "object" && port !== null) port = port.port;
     const self = this;
-    this._native = Sxn.serve({ port: Number(port) || 0 }, (raw) =>
+    // __sxnServe, not Sxn.serve: IncomingMessage wants the native layer's
+    // plain {method, url, headers, body} object, and a Node req.url is a
+    // path. Sxn.serve now hands its handler a Fetch Request instead.
+    this._native = __sxnServe({ port: Number(port) || 0 }, (raw) =>
       new Promise((resolve) => {
         const req = new IncomingMessage(raw);
         const res = new ServerResponse(resolve);

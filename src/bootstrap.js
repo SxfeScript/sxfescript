@@ -684,6 +684,31 @@
   }
   Object.defineProperty(Request.prototype, "body", { get: function () { return null; } });
   Request.prototype.clone = function () { return new Request(this); };
+  // A Request had no way to read its own body, so `await req.json()` -- the
+  // first thing any POST handler does -- threw "not a function". The body is
+  // whatever was handed to the constructor: a string, bytes, or nothing.
+  Object.defineProperty(Request.prototype, "bodyUsed", { get: function () { return !!this._bodyUsed; } });
+  Request.prototype._readBytes = function () {
+    this._bodyUsed = true;
+    var b = this._body;
+    if (b === null || b === undefined) return new Uint8Array(0);
+    if (b instanceof Uint8Array) return b;
+    if (b instanceof ArrayBuffer) return new Uint8Array(b);
+    if (b instanceof Blob) return b._bytes;
+    return new TextEncoder().encode(String(b));
+  };
+  Request.prototype.text = async function () {
+    var b = this._body;
+    // Skip the encode/decode round trip when the body arrived as a string,
+    // which is every request Sxn.serve builds.
+    if (typeof b === "string") { this._bodyUsed = true; return b; }
+    return new TextDecoder().decode(this._readBytes());
+  };
+  Request.prototype.json = async function () { return JSON.parse(await this.text()); };
+  Request.prototype.arrayBuffer = async function () { return this._readBytes().slice().buffer; };
+  Request.prototype.blob = async function () {
+    return new Blob([this._readBytes()], { type: this.headers.get("content-type") || "" });
+  };
   globalThis.Request = Request;
 
   function Response(body, init) {
@@ -1574,4 +1599,65 @@
   // holds the way the standard describes.
   Object.setPrototypeOf(globalThis.crypto, Crypto.prototype);
   if (globalThis.crypto.subtle) Object.setPrototypeOf(globalThis.crypto.subtle, SubtleCrypto.prototype);
+
+  // ---------------- Sxn.serve, in Request/Response terms ----------------
+  // The native server speaks a plain {method, url, headers, body} object in
+  // and a plain {statusCode, headers, body} object out. That shape stays --
+  // node:http is built directly on it through __sxnServe, and Node's own
+  // req.url is a path, not an absolute URL -- but it is not what
+  // spec/RUNTIME.md documents or what a handler written for any other
+  // WinterCG runtime expects. Returning a Response used to write a garbled
+  // reply, and `new URL(req.url)` threw, so the documented example did not
+  // run. This adapts both ends in one place.
+  (function () {
+    var rawServe = globalThis.__sxnServe;
+    if (typeof rawServe !== "function") return;
+
+    function toRequest(raw, origin) {
+      // Node hands a handler the path; the Fetch standard requires an
+      // absolute URL, and the Host header is what makes it absolute.
+      var host = (raw.headers && raw.headers.host) || origin;
+      var url = new URL(raw.url || "/", "http://" + String(host).replace(/^https?:\/\//, ""));
+      var init = { method: raw.method || "GET", headers: raw.headers || {} };
+      // A GET/HEAD request may not carry a body, and the native layer sends
+      // "" rather than nothing when there is none.
+      if (raw.body !== undefined && raw.body !== null && raw.body !== "") init.body = raw.body;
+      return new Request(url.href, init);
+    }
+
+    function toNative(result) {
+      // An SSE or WebSocket-upgrade result, or a handler already written to
+      // the plain shape, passes straight through.
+      if (!(result instanceof Response)) return result;
+      var headers = {};
+      result.headers.forEach(function (value, name) {
+        // Repeated Set-Cookie stays repeated: the native layer emits an
+        // array value as one header line each.
+        if (name === "set-cookie") {
+          var all = result.headers.getSetCookie();
+          headers[name] = all.length > 1 ? all : value;
+        } else {
+          headers[name] = value;
+        }
+      });
+      // Hand a text body over as a string so the native layer's own
+      // text/plain default applies; bytes go over as bytes.
+      var body = result._staticBody !== undefined ? result._staticBody : null;
+      if (body === null) {
+        return result.arrayBuffer().then(function (buf) {
+          return { statusCode: result.status, headers: headers, body: new Uint8Array(buf) };
+        });
+      }
+      return { statusCode: result.status, headers: headers, body: body };
+    }
+
+    Sxn.serve = function serve(options, handler) {
+      var origin = "127.0.0.1:" + ((options && options.port) || 3000);
+      var handle = rawServe(options, function (raw) {
+        var out = handler(toRequest(raw, origin));
+        return out && typeof out.then === "function" ? out.then(toNative) : toNative(out);
+      });
+      return handle;
+    };
+  })();
 })();

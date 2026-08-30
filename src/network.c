@@ -599,6 +599,16 @@ static JSValue js_serve(JSContext *ctx, JSValueConst this_val, int argc, JSValue
         free(server); JS_FreeValue(ctx, serve->handler); free(serve);
         return JS_ThrowInternalError(ctx, "listen on %d: %s", port, uv_strerror(rc));
     }
+    /* `port: 0` asks the OS to choose a free port, which is the only way to
+       write a test or an example that can't collide with whatever else is
+       already listening. Read back what it chose: reporting the requested 0
+       left `handle.port` and `handle.url` naming a port nothing can connect
+       to, so the documented `Sxn.serve({ port: 0 }, ...)` was unusable. */
+    struct sockaddr_in bound;
+    int bound_len = (int)sizeof(bound);
+    if (uv_tcp_getsockname(server, (struct sockaddr *)&bound, &bound_len) == 0)
+        port = ntohs(bound.sin_port);
+
     /* Hand back a handle: without one a server can never be stopped, which
        makes it impossible to run a server and anything else in one process. */
     JSValue handle = JS_NewObjectClass(ctx, sxn_serverhandle_class_id);
@@ -608,8 +618,6 @@ static JSValue js_serve(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     JS_SetPropertyStr(ctx, handle, "stop",
                       JS_NewCFunctionData(ctx, js_serve_stop, 0, 0, 1, data));
     JS_SetPropertyStr(ctx, handle, "port", JS_NewInt32(ctx, port));
-    JS_SetPropertyStr(ctx, handle, "url",
-                      JS_NewString(ctx, ""));
     {
         char u[64];
         snprintf(u, sizeof(u), "http://127.0.0.1:%d", port);

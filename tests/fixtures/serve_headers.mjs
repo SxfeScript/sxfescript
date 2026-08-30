@@ -10,7 +10,7 @@ const check = (name, got, want) => {
 
 const PORT = 8991;
 Sxn.serve({ port: PORT }, (req) => {
-  const path = (req.url || "/").split("?")[0];
+  const path = new URL(req.url).pathname;
   if (path === "/plain") return { statusCode: 200, body: "hi" };
   return {
     statusCode: 201,

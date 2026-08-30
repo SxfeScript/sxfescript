@@ -45,18 +45,27 @@ explicit about where it's calling.
 ## Sxn.serve — the HTTP server
 
 ```js
-const server = Sxn.serve({ port: 0 }, (req) => new Response("hi"));
-server.url;      // "http://localhost:PORT/"
+const server = Sxn.serve({ port: 0 }, async (req) => {
+  const url = new URL(req.url);
+  if (url.pathname === "/echo") return Response.json(await req.json());
+  return new Response("hi");
+});
+server.port;     // the port the OS chose, since `port: 0` asked it to pick
+server.url;      // "http://127.0.0.1:PORT"
 server.stop();
 ```
 
-The handler receives a `Request` and returns a `Response`, `Sxn.serve`'s own
-SSE helper, or a WebSocket upgrade. Response headers are emitted in
-declaration order; an array value repeats the header (the multi-`Set-Cookie`
-case), and `Content-Length`/`Connection` are filtered since those describe
-the framing rather than the payload the handler wrote. The returned handle
-reports `port`, `url`, and a `stop()` that lets a process serve and then do
-something else, rather than block forever the way a bare listener would.
+The handler receives a `Request` — `req.url` is absolute, so `new URL(req.url)`
+gives you the path and query, and `req.text()`/`req.json()`/`req.arrayBuffer()`
+read the body. It returns a `Response`, `Sxn.serve`'s own SSE helper, a
+WebSocket upgrade, or a plain `{ statusCode, headers, body }` object, which is
+the shape the native layer speaks and `node:http` is built on directly.
+Response headers are emitted in declaration order; an array value repeats the
+header (the multi-`Set-Cookie` case), and `Content-Length`/`Connection` are
+filtered since those describe the framing rather than the payload the handler
+wrote. The returned handle reports `port`, `url`, and a `stop()` that lets a
+process serve and then do something else, rather than block forever the way a
+bare listener would.
 
 ## Web Streams
 
