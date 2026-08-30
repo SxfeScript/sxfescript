@@ -57,6 +57,11 @@ if(SXN_ENABLE_POISON)
   target_compile_definitions(sxfe PUBLIC SXN_ENABLE_POISON=1)
 endif()
 
+# Both qjsc-generated headers below land in generated/; create it at
+# configure time so whichever custom command runs first doesn't fail
+# writing to a directory the other one hasn't created yet.
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated)
+
 # WinterCG globals (TextEncoder, URL, Headers, fetch's JS glue, ...) are
 # authored as plain JS in src/bootstrap.js and compiled to bytecode at build
 # time, so startup reads a prepared function instead of parsing 140KB of
