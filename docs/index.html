@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SxfeScript</title>
-<meta name="description" content="SxfeScript: explicit ownership and real runtime safety on top of ordinary JavaScript, running on ArcSX — a QuickJS-based runtime built to run the same on a phone as it does on a server.">
+<meta name="description" content="SxfeScript: explicit ownership and real runtime safety on top of ordinary JavaScript, running on ArcSX, a QuickJS-based runtime built to run the same on a phone as it does on a server.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Public+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -252,8 +252,8 @@
         <h1 class="title">Ownership and borrows, on top of ordinary JavaScript.</h1>
         <p class="lede">
           SxfeScript is JavaScript with an explicit <span class="kw-safe">safe</span> and
-          <span class="kw-unsafe">unsafe</span> boundary, affine values, and lexical borrows
-          &mdash; parsed natively, with no build step, and run by <strong>ArcSX</strong>, a
+          <span class="kw-unsafe">unsafe</span> boundary, affine values, and lexical borrows,
+          parsed natively, with no build step, and run by <strong>ArcSX</strong>, a
           QuickJS-based runtime built to run the same on a phone as it does on a server.
         </p>
         <div class="cta-row">
@@ -265,7 +265,7 @@
 
       <div class="compare-hero">
         <div>
-          <p class="compare-label">TypeScript &mdash; erased at build time</p>
+          <p class="compare-label">TypeScript: erased at build time</p>
           <pre><code>function withdraw(acct: Account, n: number) {
   // nothing here is true at runtime.
   // acct could be null. n could be NaN.
@@ -274,7 +274,7 @@
 }</code></pre>
         </div>
         <div>
-          <p class="compare-label">SxfeScript &mdash; checked, then run</p>
+          <p class="compare-label">SxfeScript: checked, then run</p>
           <pre><code>function withdraw(<span class="kw-unsafe">&mut</span> acct: Account, n: i32) {
   // acct is a live, exclusive borrow --
   // checked at parse time, not hoped for.
@@ -289,7 +289,7 @@
     <h2 class="h">What SxfeScript actually adds</h2>
     <p class="lede-s">
       Every ordinary JavaScript value keeps its ordinary semantics. SxfeScript layers four
-      things on top, and all four are optional &mdash; a file that uses none of them is a
+      things on top, and all four are optional. A file that uses none of them is a
       normal <code>.js</code> file that happens to have a <code>.sx</code> extension.
     </p>
     <div class="grid-2">
@@ -298,27 +298,27 @@
         <p><code>let mut</code> creates a mutable owner, <code>let</code> an immutable one.
         <code>&amp;value</code> borrows it shared; <code>&amp;mut value</code> borrows it
         exclusively and requires a mutable owner. A borrow can't be returned, stored somewhere
-        longer-lived, or carried across an <code>await</code> &mdash; checked before the code runs,
-        not documented and hoped for.</p>
+        longer-lived, or carried across an <code>await</code>. Each rule is checked before the
+        code runs, not documented and hoped for.</p>
       </div>
       <div class="card">
         <h3>The <span class="kw-safe">safe</span> / <span class="kw-unsafe">unsafe</span> boundary</h3>
         <p><code>safe let</code> marks a binding as type-stable: the object shape it points to
-        rejects property addition, deletion, and incompatible writes. Reaching outside that &mdash;
-        a raw pointer, an FFI call &mdash; means writing <code>unsafe</code> and meaning it,
+        rejects property addition, deletion, and incompatible writes. Reaching outside that
+        (a raw pointer, an FFI call) means writing <code>unsafe</code> and meaning it,
         the same contract Rust makes explicit.</p>
       </div>
       <div class="card">
         <h3>Erasable TypeScript annotations</h3>
         <p>Type aliases, interfaces, <code>declare</code>, generics on functions, optional
-        parameters, <code>as</code>/<code>satisfies</code>, union types &mdash; parsed and
+        parameters, <code>as</code>/<code>satisfies</code>, union types: all of it parsed and
         stripped natively, no <code>tsc</code>, no bundler, no separate compile step.</p>
       </div>
       <div class="card">
         <h3>Fixed-layout structs</h3>
         <p>A primitive-only interface (<code>i32</code>, <code>f32</code>, <code>f64</code>,
         <code>bool</code>) defines an affine struct with declared field order and natural
-        alignment &mdash; the same layout on every supported target, for code that has to cross
+        alignment: the same layout on every supported target, for code that has to cross
         into native memory.</p>
       </div>
     </div>
@@ -328,7 +328,7 @@
     <h2 class="h">SxfeScript vs. TypeScript</h2>
     <p class="lede-s">
       TypeScript's types exist for the compiler and your editor, and stop existing the moment
-      <code>tsc</code> finishes &mdash; a null you were promised isn't there can still be null.
+      <code>tsc</code> finishes. A null you were promised isn't there can still be null.
       SxfeScript's <span class="kw-safe">safe</span> qualifier is the same idea pushed one layer
       deeper: the guarantee is checked before the code runs, and object shapes that would
       violate it are rejected rather than merely un-typed.
@@ -339,36 +339,36 @@
         <tbody>
           <tr>
             <td>What happens to the types at runtime?</td>
-            <td class="no">Erased entirely &mdash; a type is a compile-time fiction</td>
+            <td class="no">Erased entirely: a type is a compile-time fiction</td>
             <td class="yes"><code>safe</code> bindings keep a runtime descriptor; incompatible writes are rejected, not silently accepted</td>
           </tr>
           <tr>
             <td>Do you need a build step to run a file?</td>
             <td class="no"><code>tsc</code>, or a bundler standing in for it</td>
-            <td class="yes">No &mdash; <code>sxn app.ts</code> strips and runs it directly</td>
+            <td class="yes">No. <code>sxn app.ts</code> strips and runs it directly</td>
           </tr>
           <tr>
             <td>Aliasing and mutation</td>
             <td class="no">Not modeled at all</td>
-            <td class="yes">Explicit: an owner, a shared borrow, or an exclusive borrow &mdash; one at a time, checked</td>
+            <td class="yes">Explicit: an owner, a shared borrow, or an exclusive borrow, one at a time, checked</td>
           </tr>
           <tr>
             <td>Calling into native code</td>
-            <td class="no">Whatever your runtime's FFI story is &mdash; TypeScript has no opinion</td>
+            <td class="no">Whatever your runtime's FFI story is. TypeScript has no opinion</td>
             <td class="yes">An explicit <code>unsafe extern</code> boundary; everywhere else stays safe by default</td>
           </tr>
           <tr>
             <td>Can a "safe" line still corrupt memory?</td>
-            <td class="no">Not applicable &mdash; there's no runtime safety claim to keep</td>
+            <td class="no">Not applicable. There's no runtime safety claim to keep</td>
             <td class="yes">Not while it stays <code>safe</code>; <code>unsafe</code> is the one place that trust is spent explicitly</td>
           </tr>
         </tbody>
       </table>
     </div>
     <p style="margin-top:18px; color:var(--ink-mid); font-size:14.5px; max-width:66ch;">
-      Read plainly: this isn't "TypeScript, but stricter." It's a different claim. TypeScript
-      documents intent for humans and tooling. SxfeScript's safe subset is a runtime contract &mdash;
-      smaller in scope than TypeScript's type system today (see the honest gap list in
+      TypeScript documents intent for humans and tooling. SxfeScript's safe subset makes a
+      narrower, different claim: a runtime contract, smaller in scope than TypeScript's type
+      system today (see the honest gap list in
       <a href="{{REPO_URL}}/blob/main/spec/IMPLEMENTATION.md">spec/IMPLEMENTATION.md</a>), and
       still growing, but real where it applies rather than a promise the runtime never checks.
     </p>
@@ -379,8 +379,8 @@
     <p class="lede-s">
       ArcSX is a QuickJS-ng fork, built as <code>sxn</code>. It runs <code>.sx</code>,
       <code>.ts</code>, and ordinary <code>.js</code>/<code>.mjs</code>/<code>.cjs</code>
-      directly, with two compatibility layers built on top of the same engine core &mdash;
-      one for the browser-shaped WinterCG web APIs, one for Node.
+      directly, with two compatibility layers built on top of the same engine core: one for the
+      browser-shaped WinterCG web APIs, one for Node.
     </p>
 
     <p style="color:var(--ink-mid); font-size:14.5px; max-width:68ch; margin-bottom:12px;">
@@ -395,7 +395,7 @@
           <tr>
             <td>Starting a new process</td>
             <td class="num yes">8.4 ms</td><td class="num">41.6 ms</td><td class="num">9.2 ms</td>
-            <td>About 5x faster than Node to start, and a hair ahead of Bun &mdash; matters for a CLI tool or a serverless cold start</td>
+            <td>About 5x faster than Node to start, and a hair ahead of Bun. Matters for a CLI tool or a serverless cold start</td>
           </tr>
           <tr>
             <td>Processing binary data (<code>Buffer</code>)</td>
@@ -410,19 +410,19 @@
           <tr>
             <td>Worst single GC-style pause</td>
             <td class="num yes">0.04 ms</td><td class="num">0.36 ms</td><td class="num">2.59 ms</td>
-            <td>No JIT means no warm-up stalls &mdash; the most predictable of the three, which is what a real-time or low-latency workload actually needs</td>
+            <td>No JIT means no warm-up stalls. The most predictable of the three, which is what a real-time or low-latency workload actually needs</td>
           </tr>
           <tr>
             <td>Firing many event listeners</td>
             <td class="num">6.6 ms</td><td class="num yes">5.1 ms</td><td class="num">9.3 ms</td>
-            <td>The one row Node wins, narrowly &mdash; its JIT inlines the hot path in a way an interpreter structurally can't</td>
+            <td>The one row Node wins, narrowly. Its JIT inlines the hot path in a way an interpreter structurally can't</td>
           </tr>
         </tbody>
       </table>
     </div>
     <p style="color:var(--ink-soft); font-size:13px; margin: 10px 0 30px;">
       All five rows, every runtime, same machine, same workload, run side by side by
-      <code>benchmarks/wintercg/run.sh</code> in the repo &mdash; nothing here is cherry-picked
+      <code>benchmarks/wintercg/run.sh</code> in the repo. Nothing here is cherry-picked
       or estimated.
     </p>
 
@@ -431,31 +431,31 @@
         <h3>WinterCG surface <span class="badge">45 / 55</span></h3>
         <p><code>fetch</code>, <code>Sxn.serve</code> (HTTP, SSE, WebSocket upgrade), Web
         Streams, Web Crypto, <code>structuredClone</code>. This half travels wherever the
-        engine is embedded &mdash; it's not tied to Node emulation.</p>
+        engine is embedded. It's not tied to Node emulation.</p>
       </div>
       <div class="card">
         <h3>Node compatibility <span class="badge">24 / ~37</span></h3>
         <p>CommonJS, <code>node:</code> builtins, and <code>.node</code> native addons through
-        a from-scratch Node-API implementation &mdash; real enough that <code>next-swc</code>,
+        a from-scratch Node-API implementation, real enough that <code>next-swc</code>,
         the Rust binary Next.js compiles JSX with, loads and runs under it.</p>
       </div>
       <div class="card">
         <h3>Calling native code</h3>
         <p><code>Sxn.ffi</code> calls a C function through libffi. It's an engine capability,
-        not a Node one &mdash; the design reasoning for that split, and what it means for
+        not a Node one. The design reasoning for that split, and what it means for
         mobile, is in <a href="{{REPO_URL}}/blob/main/spec/NATIVE.md">spec/NATIVE.md</a>.</p>
       </div>
       <div class="card">
         <h3>Precompiled bytecode</h3>
         <p><code>sxn compile app.js</code> writes a <code>.sxbc</code> file that skips
-        parsing entirely on later runs &mdash; measured 12% faster on a one-line script, 37%
+        parsing entirely on later runs, measured 12% faster on a one-line script, 37%
         on a 618&nbsp;KB generated file. <code>--compile-cache</code> does the same thing
         automatically, on every launch. <a href="{{REPO_URL}}/blob/main/spec/BYTECODE.md">spec/BYTECODE.md</a>.</p>
       </div>
     </div>
 
     <p style="margin-top:26px; color:var(--ink-mid); font-size:14.5px; max-width:66ch;">
-      Every number above is measured, not estimated &mdash; the full benchmark methodology,
+      Every number above is measured, not estimated. The full benchmark methodology,
       both test machines' specs, and the interpreter-level optimizations behind them are in
       the <a href="{{REPO_URL}}/blob/main/README.md">project README</a>.
     </p>
@@ -483,7 +483,7 @@
       <div class="card">
         <h3>What isn't</h3>
         <ul class="plain">
-          <li>Adding a JIT, or anything else that generates machine code at runtime &mdash;
+          <li>Adding a JIT, or anything else that generates machine code at runtime.
           iOS won't grant that entitlement to a third-party app, and running there is the point</li>
         </ul>
         <p style="margin-top:14px;">
@@ -494,16 +494,16 @@
     </div>
 
     <p style="margin-top:8px;">
-      Ideological disagreement is welcome too &mdash; if you think the ownership model is solving
+      Ideological disagreement is welcome too. If you think the ownership model is solving
       the wrong problem, or that the safe/unsafe split should work differently, open an issue
       and make the case. The specs in <code>spec/</code> are the actual design surface of this
       project, not settled history:
     </p>
     <ul class="plain" style="margin-bottom: 20px;">
-      <li><a href="{{REPO_URL}}/blob/main/spec/LANGUAGE.md">spec/LANGUAGE.md</a> &mdash; the language contract</li>
-      <li><a href="{{REPO_URL}}/blob/main/spec/ABI.md">spec/ABI.md</a> &mdash; the native/JS boundary</li>
-      <li><a href="{{REPO_URL}}/blob/main/spec/IMPLEMENTATION.md">spec/IMPLEMENTATION.md</a> &mdash; what's real today, and what isn't yet</li>
-      <li><a href="{{REPO_URL}}/blob/main/spec/RUNTIME.md">spec/RUNTIME.md</a> &amp; <a href="{{REPO_URL}}/blob/main/spec/NODE.md">spec/NODE.md</a> &mdash; the two compatibility surfaces</li>
+      <li><a href="{{REPO_URL}}/blob/main/spec/LANGUAGE.md">spec/LANGUAGE.md</a>: the language contract</li>
+      <li><a href="{{REPO_URL}}/blob/main/spec/ABI.md">spec/ABI.md</a>: the native/JS boundary</li>
+      <li><a href="{{REPO_URL}}/blob/main/spec/IMPLEMENTATION.md">spec/IMPLEMENTATION.md</a>: what's real today, and what isn't yet</li>
+      <li><a href="{{REPO_URL}}/blob/main/spec/RUNTIME.md">spec/RUNTIME.md</a> &amp; <a href="{{REPO_URL}}/blob/main/spec/NODE.md">spec/NODE.md</a>: the two compatibility surfaces</li>
     </ul>
     <div class="cta-row">
       <a class="btn btn-primary" href="{{REPO_URL}}/issues/new">Open an issue</a>
