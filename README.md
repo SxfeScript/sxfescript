@@ -84,26 +84,37 @@ throughput rows are the harness's own 1,000-run medians:
 
 | Category | sxn | Node | Bun | Winner |
 |---|---|---|---|---|
-| Real-world end-to-end task (wall clock, as invoked) | **8.7 ms** | 72.0 ms | 14.9 ms | sxn |
-| Cold start | **8.1 ms** | 39.4 ms | 8.5 ms | sxn / Bun tie |
-| Sustained throughput: Buffer ops | **21.5 ms** | 24.1 ms | 27.2 ms | sxn |
-| Sustained throughput: TextEncoder | 14.1 ms | 39.4 ms | **6.2 ms** | Bun |
-| Sustained throughput: EventEmitter | 9.1 ms | **5.1 ms** | 9.2 ms | Node |
-| Pause consistency: total time | **131.2 ms** | 245.1 ms | 276.3 ms | sxn |
-| Pause consistency: worst single pause | **0.04 ms** | 0.20 ms | 2.77 ms | sxn |
-| Parse 32k-line generated file | **16 ms** | 53 ms | 24 ms | sxn |
+| Real-world end-to-end task (wall clock, as invoked) | **9.7 ms** | 74.7 ms | 15.4 ms | sxn |
+| Cold start | **8.8 ms** | 41.4 ms | 9.4 ms | sxn / Bun tie |
+| Sustained throughput: Buffer ops | **21.9 ms** | 24.2 ms | 27.2 ms | sxn |
+| Sustained throughput: TextEncoder | 14.2 ms | 39.5 ms | **6.2 ms** | Bun |
+| Sustained throughput: EventEmitter | 9.7 ms | **5.1 ms** | 9.2 ms | Node |
+| Pause consistency: total time | **134.6 ms** | 253.1 ms | 293.6 ms | sxn |
+| Pause consistency: worst single pause | **0.04 ms** | 0.31 ms | 3.25 ms | sxn |
+| Parse 32k-line generated file | **15.3 ms** | 49.7 ms | 24.0 ms | sxn |
 
-The EventEmitter row is a tie with Bun, not a win: 9.1 ms against 9.2 is
-inside the run-to-run swing, and both trail Node by roughly 2x. The two
+The EventEmitter row is Bun's by a nose and Node's outright: 9.7 ms against
+9.2 and 5.1, so read it as a tie with Bun and a 2x loss to Node. The two
 pause rows are single-process maximums, the noisiest kind of sample there
 is, so both are medians of 7 interleaved runs rather than one reading;
-individual worst-pause samples ranged 0.03-5.94 ms here, 0.18-0.73 for Node
-and 2.43-19.22 for Bun. On a workload that keeps objects live instead of
+individual worst-pause samples ranged 0.02-0.06 ms here, 0.20-5.15 for Node
+and 2.78-8.57 for Bun -- and note which of those three is the stable one. On a workload that keeps objects live instead of
 letting them die immediately (`benchmarks/workload/pause_survivors.js`: 2000
-survivors while churning 2M allocations) the worst pause is 0.041 ms here
-against Node's 0.197 and Bun's 0.316, and that is the number to quote when
+survivors while churning 2M allocations) the worst pause is 0.040 ms here
+against Node's 0.197 and Bun's 0.344, and this runtime finishes that workload
+with no pause over 100 us at all where Node has 14-18 and Bun 4-6, and that is the number to quote when
 the question is "how bad can a pause get" -- the bare-pause row above
 measures the allocation pattern most favourable to refcounting.
+
+The table is macOS arm64. The same tree also builds and passes all 36 tests
+on Ubuntu 6.5 x86_64 with gcc 13.2, where the ordering holds against the
+Node available there (v18): Buffer 40.2 ms against 73.8, TextEncoder 28.7
+against 88.0, EventEmitter 20.9 against 12.8, and both pause rows won. Those
+absolute numbers are not comparable to the ones above -- different
+architecture, different libc, an older Node, and a `performance.now` that
+costs far more per call on that kernel, which inflates the pause row's total
+for both runtimes about twentyfold. What the Linux run establishes is that
+the wins are not macOS-specific, not a second set of headline figures.
 
 A note on the comparison: this runtime deliberately has no JIT, because iOS
 withholds JIT entitlements from third-party apps and a machine-code tier
