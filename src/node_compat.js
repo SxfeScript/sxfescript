@@ -388,6 +388,54 @@
   process.arch = __sxnArch();
   process.version = "v" + (Sxn && Sxn.version ? Sxn.version : "0.0.0");
   process.versions = { sxn: (Sxn && Sxn.version) || "0.0.0" };
+  // process.stdout / stderr: Writable enough for the logging that packages do
+  // on the way past, and carrying the fd and isTTY they branch on.
+  function makeStdio(fd, sink) {
+    return {
+      fd: fd,
+      // Node leaves this undefined rather than false on a non-tty.
+      isTTY: undefined,
+      writable: true,
+      columns: undefined,
+      rows: undefined,
+      write(chunk, enc, cb) {
+        if (typeof enc === "function") { cb = enc; }
+        sink(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk));
+        if (cb) cb();
+        return true;
+      },
+      end(chunk) { if (chunk !== undefined && chunk !== null) this.write(chunk); },
+      on() { return this; },
+      once() { return this; },
+      off() { return this; },
+      removeListener() { return this; },
+      emit() { return false; },
+      setEncoding() { return this; },
+      cork() {}, uncork() {},
+    };
+  }
+  // console.log appends its own newline, so the raw writes trim one to avoid
+  // doubling it.
+  const stripNL = (s) => (s.endsWith("\n") ? s.slice(0, -1) : s);
+  process.stdout = makeStdio(1, (t) => { if (t) console.log(stripNL(t)); });
+  process.stderr = makeStdio(2, (t) => { if (t) console.error(stripNL(t)); });
+  process.stdin = { fd: 0, isTTY: false, readable: false,
+                    on() { return this; }, once() { return this; }, off() { return this; },
+                    resume() { return this; }, pause() { return this; },
+                    setEncoding() { return this; }, read() { return null; } };
+  process.hrtime = Object.assign(
+    function hrtime(prev) {
+      const ns = BigInt(Math.round(performance.now() * 1e6));
+      const s = Number(ns / 1000000000n), n = Number(ns % 1000000000n);
+      if (!prev) return [s, n];
+      let ds = s - prev[0], dn = n - prev[1];
+      if (dn < 0) { ds -= 1; dn += 1e9; }
+      return [ds, dn];
+    },
+    { bigint: () => BigInt(Math.round(performance.now() * 1e6)) });
+  process.emitWarning = function (w) { console.error("Warning: " + (w && w.message ? w.message : w)); };
+  process.uptime = function () { return performance.now() / 1000; };
+  process.pid = 0;
   process.cwd = function () { return __sxnCwd(); };
   process.exit = function (code) { __sxnExit(code === undefined ? 0 : code); };
   // A genuine job-queue microtask (queueMicrotask is itself a thin JS_EnqueueJob
@@ -785,6 +833,7 @@
   };
   streamModule.Stream = Readable;
   globalThis.__sxnStream = streamModule;
+  globalThis.__sxnStreamPromises = streamModule.promises;
 
 
   // ---------------- node:http ----------------
@@ -969,6 +1018,110 @@
     get(options, cb) { const r = new ClientRequest(options, cb); r.end(); return r; },
   };
   globalThis.__sxnHttp = http;
+
+
+  // ---------------- small node builtins ----------------
+  // Enough of each for the packages that reach for them in passing: `debug`
+  // wants tty.isatty, body-parser wants string_decoder, and so on.
+  const tty = {
+    isatty: () => false,
+    ReadStream: function ReadStream() { throw new Error("tty.ReadStream is not supported"); },
+    WriteStream: function WriteStream() { throw new Error("tty.WriteStream is not supported"); },
+  };
+  globalThis.__sxnTty = tty;
+
+  // Decodes byte chunks to text without splitting a multi-byte character
+  // across a chunk boundary -- which is the entire reason it exists.
+  function StringDecoder(encoding) {
+    this.encoding = (encoding || "utf8").toLowerCase();
+    this._dec = new TextDecoder(this.encoding === "utf8" ? "utf-8" : this.encoding);
+  }
+  StringDecoder.prototype.write = function (buf) {
+    if (typeof buf === "string") return buf;
+    return this._dec.decode(buf, { stream: true });
+  };
+  StringDecoder.prototype.end = function (buf) {
+    let out = buf ? this.write(buf) : "";
+    out += this._dec.decode();
+    return out;
+  };
+  globalThis.__sxnStringDecoder = { StringDecoder };
+
+  const timers = {
+    setTimeout: (...a) => globalThis.setTimeout(...a),
+    clearTimeout: (...a) => globalThis.clearTimeout(...a),
+    setInterval: (...a) => globalThis.setInterval(...a),
+    clearInterval: (...a) => globalThis.clearInterval(...a),
+    setImmediate: (fn, ...a) => globalThis.setTimeout(() => fn(...a), 0),
+    clearImmediate: (id) => globalThis.clearTimeout(id),
+    promises: {
+      setTimeout: (ms, value) => new Promise((r) => globalThis.setTimeout(() => r(value), ms)),
+      setImmediate: (value) => new Promise((r) => globalThis.setTimeout(() => r(value), 0)),
+    },
+  };
+  globalThis.__sxnTimers = timers;
+  globalThis.__sxnTimersPromises = timers.promises;
+  if (typeof globalThis.setImmediate === "undefined") globalThis.setImmediate = timers.setImmediate;
+  if (typeof globalThis.clearImmediate === "undefined") globalThis.clearImmediate = timers.clearImmediate;
+
+  const perfHooks = {
+    performance: globalThis.performance,
+    PerformanceObserver: function PerformanceObserver() {
+      throw new Error("PerformanceObserver is not supported");
+    },
+  };
+  globalThis.__sxnPerfHooks = perfHooks;
+
+  // node:module -- createRequire is what ESM code uses to reach CommonJS.
+  const moduleModule = {
+    createRequire: () => globalThis.require,
+    builtinModules: ["assert","buffer","events","fs","http","os","path","process",
+                     "querystring","stream","string_decoder","timers","tty","url","util"],
+    isBuiltin: (n) => moduleModule.builtinModules.includes(String(n).replace(/^node:/, "")),
+  };
+  globalThis.__sxnModule = moduleModule;
+
+  // CommonJS reaches the builtins through require(), which is synchronous, so
+  // it cannot go through import(). Every builtin is already a plain object on
+  // a global; this maps a specifier to it, with or without the node: prefix.
+  globalThis.__sxnBuiltinRequire = function (specifier) {
+    const name = String(specifier).replace(/^node:/, "");
+    const table = {
+      buffer: { Buffer, default: Buffer },
+      events: globalThis.__sxnEventEmitter,
+      path: globalThis.__sxnPath,
+      process: globalThis.process,
+      fs: globalThis.__sxnFs,
+      "fs/promises": globalThis.__sxnFsPromises,
+      util: globalThis.__sxnUtil,
+      os: globalThis.__sxnOs,
+      url: globalThis.__sxnUrl,
+      querystring: globalThis.__sxnQuerystring,
+      assert: globalThis.__sxnAssert,
+      "assert/strict": globalThis.__sxnAssert,
+      stream: globalThis.__sxnStream,
+      "stream/promises": globalThis.__sxnStream && globalThis.__sxnStream.promises,
+      http: globalThis.__sxnHttp,
+      tty: globalThis.__sxnTty,
+      string_decoder: globalThis.__sxnStringDecoder,
+      timers: globalThis.__sxnTimers,
+      "timers/promises": globalThis.__sxnTimers && globalThis.__sxnTimers.promises,
+      perf_hooks: globalThis.__sxnPerfHooks,
+      module: globalThis.__sxnModule,
+    };
+    const m = table[name];
+    if (m === undefined) {
+      const e = new Error("Cannot find module '" + specifier + "'");
+      e.code = "MODULE_NOT_FOUND";
+      throw e;
+    }
+    // events exports the constructor itself, and Node lets you reach the
+    // named helpers off it either way.
+    return m;
+  };
+  globalThis.__sxnIsBuiltin = function (specifier) {
+    try { globalThis.__sxnBuiltinRequire(specifier); return true; } catch { return false; }
+  };
 
   // ---------------- node:util ----------------
   // The parts packages actually import: promisify, callbackify, inherits,

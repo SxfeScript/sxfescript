@@ -262,8 +262,33 @@ static JSValue sxn_require_fn(JSContext *ctx, JSValueConst this_val,
     const char *name = JS_ToCString(ctx, argv[0]);
     if (!name) return JS_EXCEPTION;
 
-    /* node: builtins are ES modules here; hand back their namespace so
-       `const path = require("node:path")` behaves like the import. */
+    /* Builtins are reachable by bare name as well as with the node: prefix,
+       and require() is synchronous so it cannot go through import(). The JS
+       side owns the mapping; ask it first, and only fall through to
+       node_modules when it says the name is not a builtin. */
+    {
+        JSValue g = JS_GetGlobalObject(ctx);
+        JSValue isb = JS_GetPropertyStr(ctx, g, "__sxnIsBuiltin");
+        bool builtin = false;
+        if (JS_IsFunction(ctx, isb)) {
+            JSValueConst a[1] = { argv[0] };
+            JSValue r = JS_Call(ctx, isb, JS_UNDEFINED, 1, a);
+            builtin = JS_ToBool(ctx, r);
+            JS_FreeValue(ctx, r);
+        }
+        JS_FreeValue(ctx, isb);
+        JS_FreeValue(ctx, g);
+        if (builtin) {
+            JSValue g2 = JS_GetGlobalObject(ctx);
+            JSValue reg = JS_GetPropertyStr(ctx, g2, "__sxnBuiltinRequire");
+            JS_FreeValue(ctx, g2);
+            JSValueConst a[1] = { argv[0] };
+            JSValue r = JS_Call(ctx, reg, JS_UNDEFINED, 1, a);
+            JS_FreeValue(ctx, reg);
+            JS_FreeCString(ctx, name);
+            return r;
+        }
+    }
     if (has_prefix(name, "node:") || has_prefix(name, "qjs:")) {
         JSValue g = JS_GetGlobalObject(ctx);
         JSValue reg = JS_GetPropertyStr(ctx, g, "__sxnBuiltinRequire");

@@ -66064,6 +66064,70 @@ static JSValue js_callsite_getnumber(JSContext *ctx, JSValueConst this_val, int 
     return js_int32(*field);
 }
 
+/* arcsx: the rest of V8's CallSite surface. Packages that inspect stack
+   frames -- depd, and the deprecation paths inside Express -- call these and
+   fail on a missing method rather than a falsy answer. This engine has no
+   eval-origin, receiver or constructor information per frame, so each of
+   those reports the honest empty answer instead of guessing. */
+static JSValue js_callsite_false(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    if (!JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE)) return JS_EXCEPTION;
+    return js_bool(false);
+}
+
+static JSValue js_callsite_undefined(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    if (!JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE)) return JS_EXCEPTION;
+    return JS_UNDEFINED;
+}
+
+static JSValue js_callsite_null(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    if (!JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE)) return JS_EXCEPTION;
+    return JS_NULL;
+}
+
+/* A frame with no function name is top-level code. */
+static JSValue js_callsite_istoplevel(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
+    if (!csd) return JS_EXCEPTION;
+    return js_bool(JS_IsUndefined(csd->func_name) || JS_IsNull(csd->func_name));
+}
+
+/* "name (file:line:col)", or "file:line:col" when the frame is anonymous --
+   the format V8 produces and error reporters concatenate. */
+static JSValue js_callsite_tostring(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
+    if (!csd) return JS_EXCEPTION;
+    StringBuffer b_s, *b = &b_s;
+    if (string_buffer_init(ctx, b, 64)) return JS_EXCEPTION;
+    if (!JS_IsUndefined(csd->func_name) && !JS_IsNull(csd->func_name)) {
+        string_buffer_concat_value(b, csd->func_name);
+        string_buffer_puts8(b, " (");
+    }
+    if (JS_IsUndefined(csd->filename)) string_buffer_puts8(b, "<anonymous>");
+    else string_buffer_concat_value(b, csd->filename);
+    string_buffer_putc8(b, ':');
+    string_buffer_concat_value(b, js_int32(csd->line_num));
+    string_buffer_putc8(b, ':');
+    string_buffer_concat_value(b, js_int32(csd->col_num));
+    if (!JS_IsUndefined(csd->func_name) && !JS_IsNull(csd->func_name))
+        string_buffer_putc8(b, ')');
+    return string_buffer_end(b);
+}
+
 static const JSCFunctionListEntry js_callsite_proto_funcs[] = {
     JS_CFUNC_DEF("isNative", 0, js_callsite_isnative),
     JS_CFUNC_MAGIC_DEF("getFileName", 0, js_callsite_getfield, offsetof(JSCallSiteData, filename)),
@@ -66071,6 +66135,17 @@ static const JSCFunctionListEntry js_callsite_proto_funcs[] = {
     JS_CFUNC_MAGIC_DEF("getFunctionName", 0, js_callsite_getfield, offsetof(JSCallSiteData, func_name)),
     JS_CFUNC_MAGIC_DEF("getColumnNumber", 0, js_callsite_getnumber, offsetof(JSCallSiteData, col_num)),
     JS_CFUNC_MAGIC_DEF("getLineNumber", 0, js_callsite_getnumber, offsetof(JSCallSiteData, line_num)),
+    JS_CFUNC_DEF("isEval", 0, js_callsite_false),
+    JS_CFUNC_DEF("isConstructor", 0, js_callsite_false),
+    JS_CFUNC_DEF("isAsync", 0, js_callsite_false),
+    JS_CFUNC_DEF("isPromiseAll", 0, js_callsite_false),
+    JS_CFUNC_DEF("isToplevel", 0, js_callsite_istoplevel),
+    JS_CFUNC_DEF("getEvalOrigin", 0, js_callsite_undefined),
+    JS_CFUNC_DEF("getThis", 0, js_callsite_undefined),
+    JS_CFUNC_DEF("getPromiseIndex", 0, js_callsite_null),
+    JS_CFUNC_DEF("getTypeName", 0, js_callsite_null),
+    JS_CFUNC_MAGIC_DEF("getMethodName", 0, js_callsite_getfield, offsetof(JSCallSiteData, func_name)),
+    JS_CFUNC_DEF("toString", 0, js_callsite_tostring),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "CallSite", JS_PROP_CONFIGURABLE ),
 };
 

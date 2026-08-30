@@ -1367,6 +1367,14 @@ static const char *node_querystring_names[] = { "parse", "stringify", "escape", 
 static const char *node_url_names[] = {
     "URL", "URLSearchParams", "fileURLToPath", "pathToFileURL", "format", "parse",
 };
+static const char *node_tty_names[] = { "isatty", "ReadStream", "WriteStream" };
+static const char *node_string_decoder_names[] = { "StringDecoder" };
+static const char *node_timers_names[] = {
+    "setTimeout", "clearTimeout", "setInterval", "clearInterval",
+    "setImmediate", "clearImmediate", "promises",
+};
+static const char *node_perf_hooks_names[] = { "performance", "PerformanceObserver" };
+static const char *node_module_names[] = { "createRequire", "builtinModules", "isBuiltin" };
 static const char *node_http_names[] = {
     "createServer", "request", "get", "Server", "IncomingMessage",
     "ServerResponse", "STATUS_CODES", "METHODS",
@@ -1414,6 +1422,15 @@ NODE_SIMPLE_MODULE(url, "__sxnUrl", node_url_names)
 NODE_SIMPLE_MODULE(assert, "__sxnAssert", node_assert_names)
 NODE_SIMPLE_MODULE(stream, "__sxnStream", node_stream_names)
 NODE_SIMPLE_MODULE(http, "__sxnHttp", node_http_names)
+NODE_SIMPLE_MODULE(tty, "__sxnTty", node_tty_names)
+NODE_SIMPLE_MODULE(string_decoder, "__sxnStringDecoder", node_string_decoder_names)
+NODE_SIMPLE_MODULE(timers, "__sxnTimers", node_timers_names)
+NODE_SIMPLE_MODULE(perf_hooks, "__sxnPerfHooks", node_perf_hooks_names)
+NODE_SIMPLE_MODULE(module, "__sxnModule", node_module_names)
+static const char *node_timers_promises_names[] = { "setTimeout", "setImmediate" };
+NODE_SIMPLE_MODULE(timers_promises, "__sxnTimersPromises", node_timers_promises_names)
+static const char *node_stream_promises_names[] = { "pipeline", "finished" };
+NODE_SIMPLE_MODULE(stream_promises, "__sxnStreamPromises", node_stream_promises_names)
 
 static const char *node_fs_export_names[] = { "readFileSync", "writeFileSync", "existsSync" };
 
@@ -1569,5 +1586,14 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
     if (!sxn_init_module_node_assert(ctx, "node:assert/strict")) return -1;
     if (!sxn_init_module_node_stream(ctx, "node:stream")) return -1;
     if (!sxn_init_module_node_http(ctx, "node:http")) return -1;
+    if (!sxn_init_module_node_tty(ctx, "node:tty")) return -1;
+    if (!sxn_init_module_node_string_decoder(ctx, "node:string_decoder")) return -1;
+    if (!sxn_init_module_node_timers(ctx, "node:timers")) return -1;
+    /* The promises sub-path is a distinct specifier; register the object it
+       names directly rather than re-exporting the parent. */
+    if (!sxn_init_module_node_timers_promises(ctx, "node:timers/promises")) return -1;
+    if (!sxn_init_module_node_stream_promises(ctx, "node:stream/promises")) return -1;
+    if (!sxn_init_module_node_perf_hooks(ctx, "node:perf_hooks")) return -1;
+    if (!sxn_init_module_node_module(ctx, "node:module")) return -1;
     return 0;
 }

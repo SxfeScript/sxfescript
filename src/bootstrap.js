@@ -385,6 +385,69 @@
   };
   globalThis.Headers = Headers;
 
+  // ---------------- Error.prepareStackTrace ----------------
+  // V8's structured stack API. Packages that inspect call sites -- depd, and
+  // the deprecation paths inside Express -- set Error.prepareStackTrace and
+  // expect CallSite objects rather than a string. The frames are parsed back
+  // out of the engine's own stack text, so the information is real, just
+  // recovered rather than captured natively.
+  const FRAME_RE = /^\s*at\s+(?:(.*?)\s+\()?([^()]*?):(\d+):(\d+)\)?$/;
+  function parseCallSites(stackText) {
+    const sites = [];
+    for (const line of String(stackText || "").split("\n")) {
+      const m = FRAME_RE.exec(line);
+      if (!m) continue;
+      const fn = m[1] || null, file = m[2], ln = Number(m[3]), col = Number(m[4]);
+      sites.push({
+        getFileName: () => (file === "native" ? null : file),
+        getLineNumber: () => ln,
+        getColumnNumber: () => col,
+        getFunctionName: () => fn,
+        getMethodName: () => fn,
+        getTypeName: () => null,
+        getThis: () => undefined,
+        getFunction: () => undefined,
+        getEvalOrigin: () => undefined,
+        isEval: () => false,
+        isNative: () => file === "native",
+        isConstructor: () => false,
+        isToplevel: () => !fn,
+        isAsync: () => false,
+        toString: () => (fn ? fn + " (" + file + ":" + ln + ":" + col + ")"
+                            : file + ":" + ln + ":" + col),
+      });
+    }
+    return sites;
+  }
+
+  const nativeCapture = Error.captureStackTrace;
+  Error.captureStackTrace = function (target, constructorOpt) {
+    if (typeof nativeCapture === "function") {
+      // Pass the second argument only when there is one: the native form
+      // treats an explicit undefined differently from an absent argument.
+      try {
+        if (constructorOpt === undefined) nativeCapture(target);
+        else nativeCapture(target, constructorOpt);
+      } catch { /* keep going */ }
+    }
+    // Only take over when the program has asked for structured frames.
+    if (typeof Error.prepareStackTrace === "function") {
+      const raw = target.stack;
+      let sites = parseCallSites(raw);
+      if (constructorOpt && constructorOpt.name) {
+        const cut = sites.findIndex((s) => s.getFunctionName() === constructorOpt.name);
+        if (cut >= 0) sites = sites.slice(cut + 1);
+      }
+      // If nothing parsed, leave the string alone rather than handing the
+      // program an empty array it will index into.
+      if (sites.length > 0) {
+        try { target.stack = Error.prepareStackTrace(target, sites); }
+        catch { target.stack = raw; }
+      }
+    }
+    return target;
+  };
+
   // ---------------- Event / EventTarget / CustomEvent ----------------
   // The DOM event pattern, which plenty of runtime-agnostic packages expect
   // even outside a browser: tinybench extends EventTarget to report progress.

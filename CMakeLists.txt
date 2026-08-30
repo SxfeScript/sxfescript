@@ -251,6 +251,9 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   set_tests_properties(sxn-node-stream PROPERTIES TIMEOUT 40)
   # node:http: the (req, res) server, headers, chunked writes, request bodies
   # and a response finished after the handler returns.
+  # string_decoder, tty, module, timers/promises, the V8 CallSite API that
+  # stack-inspecting packages need, and process stdio.
+  add_test(NAME sxn-node-misc COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_misc.mjs)
   add_test(NAME sxn-node-http COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_http.mjs)
   set_tests_properties(sxn-node-http PROPERTIES TIMEOUT 40 FAIL_REGULAR_EXPRESSION "FAIL")
   add_test(NAME sxn-web-streams COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/web_streams.mjs)
