@@ -1,5 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 project(sxn VERSION 0.0.1 LANGUAGES C)
+# Every other dependency here (curl, zlib, libuv, libffi) resolves to a
+# dylib under /usr/lib on macOS - part of the OS, present on every Mac.
+# OpenSSL doesn't ship there anymore, so find_package(OpenSSL) resolves to
+# Homebrew's dylib instead, which isn't present on a Mac without Homebrew
+# and that exact formula installed. Statically linking it here is what
+# actually makes the release binary run on a plain Mac, not just this one.
+if(APPLE)
+  set(OPENSSL_USE_STATIC_LIBS TRUE)
+endif()
 find_package(OpenSSL REQUIRED)
 find_package(CURL REQUIRED)
 # libuv ships a CMake config package from Homebrew and vcpkg, but Ubuntu's
