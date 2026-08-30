@@ -106,15 +106,33 @@ with no pause over 100 us at all where Node has 14-18 and Bun 4-6, and that is t
 the question is "how bad can a pause get" -- the bare-pause row above
 measures the allocation pattern most favourable to refcounting.
 
-The table is macOS arm64. The same tree also builds and passes all 36 tests
-on Ubuntu 6.5 x86_64 with gcc 13.2, where the ordering holds against the
-Node available there (v18): Buffer 40.2 ms against 73.8, TextEncoder 28.7
-against 88.0, EventEmitter 20.9 against 12.8, and both pause rows won. Those
-absolute numbers are not comparable to the ones above -- different
-architecture, different libc, an older Node, and a `performance.now` that
-costs far more per call on that kernel, which inflates the pause row's total
-for both runtimes about twentyfold. What the Linux run establishes is that
-the wins are not macOS-specific, not a second set of headline figures.
+The table above is macOS arm64. The same tree builds and passes all 36 tests
+on Ubuntu 6.5 x86_64 (gcc 13.2, Ryzen 7 5700G), and the standings are
+identical there -- the same six rows, won and lost for the same reasons:
+
+| Category | sxn | Node 18.13 | Bun 1.2.17 | Winner |
+|---|---|---|---|---|
+| Real-world end-to-end task | **9.6 ms** | 231.4 ms | 23.3 ms | sxn |
+| Cold start | **9.6 ms** | 120.4 ms | 14.3 ms | sxn |
+| Sustained throughput: Buffer ops | **40.1 ms** | 74.0 ms | 82.1 ms | sxn |
+| Sustained throughput: TextEncoder | 28.9 ms | 88.7 ms | **16.0 ms** | Bun |
+| Sustained throughput: EventEmitter | 20.7 ms | **12.9 ms** | 23.5 ms | Node |
+| Pause consistency: total time | **2838.9 ms** | 3489.5 ms | 3244.6 ms | sxn |
+| Pause consistency: worst single pause | **0.09 ms** | 2.78 ms | 5.69 ms | sxn |
+| Parse 32k-line generated file | **27.4 ms** | 147.0 ms | 53.5 ms | sxn |
+
+Do not read those numbers against the macOS ones: different architecture and
+libc, an older Node, and a `performance.now` that costs far more per call on
+that kernel, which inflates both pause totals about twentyfold and is why
+that row reads in seconds. Within the platform they are unusually clean --
+the machine is idle, and sxn's five throughput samples spanned 0.3 ms. On the
+survivors workload there the worst pause is 0.080 ms against Node's 2.882 and
+Bun's 0.703, with 0 pauses over 100 us against 40 and 6.
+
+What the Linux run establishes is that the wins are not macOS-specific. It
+also found the only two portability defects in the tree: strict `-std=c17`
+hid `pthread_rwlock_t` and `PATH_MAX` behind glibc's feature-test macros,
+where Apple's headers expose both regardless.
 
 A note on the comparison: this runtime deliberately has no JIT, because iOS
 withholds JIT entitlements from third-party apps and a machine-code tier
