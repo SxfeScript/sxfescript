@@ -245,6 +245,14 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # fetch with a request body: POST/PUT/PATCH, empty, JSON and large bodies.
   # Web Streams: reading, locking, backpressure, tee, cancel, pipeTo/Through,
   # async iteration, the text transforms, and streams as response bodies.
+  # node:stream: flowing and paused modes, pipe, transform, pipeline, the
+  # Buffer conversion outside objectMode, and the Web Streams bridges.
+  add_test(NAME sxn-node-stream COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_stream.mjs)
+  set_tests_properties(sxn-node-stream PROPERTIES TIMEOUT 40)
+  # node:http: the (req, res) server, headers, chunked writes, request bodies
+  # and a response finished after the handler returns.
+  add_test(NAME sxn-node-http COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_http.mjs)
+  set_tests_properties(sxn-node-http PROPERTIES TIMEOUT 40 FAIL_REGULAR_EXPRESSION "FAIL")
   add_test(NAME sxn-web-streams COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/web_streams.mjs)
   # Crypto/SubtleCrypto brands, and MessageChannel's two ports.
   add_test(NAME sxn-message-channel COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/message_channel.mjs)

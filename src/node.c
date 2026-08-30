@@ -1310,7 +1310,12 @@ static JSModuleDef *sxn_init_module_node_buffer(JSContext *ctx, const char *name
 static int node_events_init(JSContext *ctx, JSModuleDef *m) {
     JSValue ee = node_global_lookup(ctx, "__sxnEventEmitter");
     JS_SetModuleExport(ctx, m, "default", JS_DupValue(ctx, ee));
-    JS_SetModuleExport(ctx, m, "EventEmitter", ee);
+    JS_SetModuleExport(ctx, m, "EventEmitter", JS_DupValue(ctx, ee));
+    /* events.once / events.on are module-level helpers in Node, and are
+       carried on the constructor here. */
+    JS_SetModuleExport(ctx, m, "once", JS_GetPropertyStr(ctx, ee, "once"));
+    JS_SetModuleExport(ctx, m, "on", JS_GetPropertyStr(ctx, ee, "on"));
+    JS_FreeValue(ctx, ee);
     return 0;
 }
 
@@ -1319,6 +1324,8 @@ static JSModuleDef *sxn_init_module_node_events(JSContext *ctx, const char *name
     if (!m) return NULL;
     JS_AddModuleExport(ctx, m, "default");
     JS_AddModuleExport(ctx, m, "EventEmitter");
+    JS_AddModuleExport(ctx, m, "once");
+    JS_AddModuleExport(ctx, m, "on");
     return m;
 }
 
@@ -1360,6 +1367,14 @@ static const char *node_querystring_names[] = { "parse", "stringify", "escape", 
 static const char *node_url_names[] = {
     "URL", "URLSearchParams", "fileURLToPath", "pathToFileURL", "format", "parse",
 };
+static const char *node_http_names[] = {
+    "createServer", "request", "get", "Server", "IncomingMessage",
+    "ServerResponse", "STATUS_CODES", "METHODS",
+};
+static const char *node_stream_names[] = {
+    "Readable", "Writable", "Duplex", "Transform", "PassThrough",
+    "Stream", "pipeline", "finished", "promises",
+};
 static const char *node_assert_names[] = {
     "ok", "equal", "notEqual", "strictEqual", "notStrictEqual", "deepEqual",
     "deepStrictEqual", "notDeepStrictEqual", "fail", "throws", "doesNotThrow",
@@ -1397,6 +1412,8 @@ NODE_SIMPLE_MODULE(os, "__sxnOs", node_os_names)
 NODE_SIMPLE_MODULE(querystring, "__sxnQuerystring", node_querystring_names)
 NODE_SIMPLE_MODULE(url, "__sxnUrl", node_url_names)
 NODE_SIMPLE_MODULE(assert, "__sxnAssert", node_assert_names)
+NODE_SIMPLE_MODULE(stream, "__sxnStream", node_stream_names)
+NODE_SIMPLE_MODULE(http, "__sxnHttp", node_http_names)
 
 static const char *node_fs_export_names[] = { "readFileSync", "writeFileSync", "existsSync" };
 
@@ -1550,5 +1567,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
     if (!sxn_init_module_node_url(ctx, "node:url")) return -1;
     if (!sxn_init_module_node_assert(ctx, "node:assert")) return -1;
     if (!sxn_init_module_node_assert(ctx, "node:assert/strict")) return -1;
+    if (!sxn_init_module_node_stream(ctx, "node:stream")) return -1;
+    if (!sxn_init_module_node_http(ctx, "node:http")) return -1;
     return 0;
 }

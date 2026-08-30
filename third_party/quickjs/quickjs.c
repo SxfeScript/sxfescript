@@ -660,7 +660,7 @@ struct JSContext {
        _events[type] all fail the guard rather than reading stale state.
        emit_gen_ptr watches the host's listener-mutation counter. */
     bool emit_fusion_on;
-    JSValue emit_fn, emit_event_str, emit_listener;
+    JSValue emit_fn, emit_event_str, emit_listener, emit_emitter, emit_events;
     JSShape *emit_ee_shape, *emit_events_shape;
     int emit_events_idx, emit_listener_idx;
     const uint32_t *emit_gen_ptr;
@@ -3069,6 +3069,7 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->buf_len_u8_proto = JS_UNDEFINED;
     ctx->buf_len_ta_proto = JS_UNDEFINED;
     ctx->emit_fn = ctx->emit_event_str = ctx->emit_listener = JS_UNDEFINED;
+    ctx->emit_emitter = ctx->emit_events = JS_UNDEFINED;
     ctx->enc_len_fn = JS_UNDEFINED;
     ctx->error_stack_trace_limit = js_int32(10);
     init_list_head(&ctx->loaded_modules);
@@ -3209,6 +3210,8 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
     JS_MarkValue(rt, ctx->emit_fn, mark_func);
     JS_MarkValue(rt, ctx->emit_event_str, mark_func);
     JS_MarkValue(rt, ctx->emit_listener, mark_func);
+    JS_MarkValue(rt, ctx->emit_emitter, mark_func);
+    JS_MarkValue(rt, ctx->emit_events, mark_func);
     JS_MarkValue(rt, ctx->error_stack_trace_limit, mark_func);
     for(i = 0; i < rt->class_count; i++) {
         JS_MarkValue(rt, ctx->class_proto[i], mark_func);
@@ -5106,8 +5109,17 @@ void JS_EnableEmitFusion(JSContext *ctx, JSValueConst emit_fn,
     if (!js_same_value(ctx, pr->u.value, listener))
         return;
     ctx->emit_listener_idx = (int)(pr - evs->prop);
-    ctx->emit_ee_shape = js_dup_shape(ee->shape);
-    ctx->emit_events_shape = js_dup_shape(evs->shape);
+    /* Hold the objects, not their shapes. Taking a shape reference makes it
+       shared, and add_property's in-place transition path requires the shape
+       it mutates to be exclusively owned -- pinning one here tripped that
+       assertion. Holding the emitter is enough: if ee->shape still equals the
+       pointer recorded now, that shape is alive because the object we hold
+       references it, so the comparison can never match a freed-and-reused
+       address. */
+    ctx->emit_emitter = js_dup(emitter);
+    ctx->emit_events = js_dup(JS_MKPTR(JS_TAG_OBJECT, evs));
+    ctx->emit_ee_shape = ee->shape;
+    ctx->emit_events_shape = evs->shape;
     ctx->emit_fn = js_dup(emit_fn);
     ctx->emit_event_str = js_dup(event_str);
     ctx->emit_listener = js_dup(listener);
@@ -5120,13 +5132,15 @@ void JS_DisableEmitFusion(JSContext *ctx)
 {
     if (!ctx->emit_fusion_on) return;
     ctx->emit_fusion_on = false;
-    js_free_shape(ctx->rt, ctx->emit_ee_shape);
-    js_free_shape(ctx->rt, ctx->emit_events_shape);
+    JS_FreeValue(ctx, ctx->emit_emitter);
+    JS_FreeValue(ctx, ctx->emit_events);
+    ctx->emit_emitter = ctx->emit_events = JS_UNDEFINED;
     JS_FreeValue(ctx, ctx->emit_fn);
     JS_FreeValue(ctx, ctx->emit_event_str);
     JS_FreeValue(ctx, ctx->emit_listener);
     ctx->emit_ee_shape = ctx->emit_events_shape = NULL;
     ctx->emit_fn = ctx->emit_event_str = ctx->emit_listener = JS_UNDEFINED;
+    ctx->emit_emitter = ctx->emit_events = JS_UNDEFINED;
     ctx->emit_gen_ptr = NULL;
 }
 
@@ -19864,7 +19878,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_VALUE_GET_PTR(call_argv[0]) == JS_VALUE_GET_PTR(ctx->emit_event_str) &&
                     JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT) {
                     JSObject *ee = JS_VALUE_GET_OBJ(call_argv[-2]);
-                    if (ee->shape == ctx->emit_ee_shape) {
+                    /* Same emitter, same layout: only then are the recorded
+                       slot indices meaningful. */
+                    if (JS_VALUE_GET_PTR(call_argv[-2]) == JS_VALUE_GET_PTR(ctx->emit_emitter) &&
+                        ee->shape == ctx->emit_ee_shape) {
                         JSValue evs = ee->prop[ctx->emit_events_idx].u.value;
                         if (JS_VALUE_GET_TAG(evs) == JS_TAG_OBJECT &&
                             JS_VALUE_GET_OBJ(evs)->shape == ctx->emit_events_shape) {

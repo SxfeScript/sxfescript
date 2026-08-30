@@ -222,7 +222,43 @@ typedef struct ServeState { JSContext *ctx; JSValue handler; } ServeState;
 
 /* Per-connection state: outlives the read/parse/dispatch step so the
    assembled response survives until the uv_write completes. */
-typedef struct ConnState { ServeState *serve; uv_tcp_t handle; char *write_data; } ConnState;
+typedef struct ConnState {
+    ServeState *serve; uv_tcp_t handle; char *write_data;
+    /* Held across an async handler: the upgrade bits belong to the request
+       that is still being answered, and the read buffer is long gone. */
+    char *pending_upgrade; char *pending_ws_key;
+} ConnState;
+
+static void conn_deliver(JSContext *ctx, ConnState *conn, JSValue result,
+                         const char *upgrade, const char *ws_key);
+
+/* Resolution and rejection of a handler's promise. The connection travels
+   through the closure as an integer because it outlives the JS values. */
+static void conn_finish_pending(JSContext *ctx, ConnState *conn, JSValue result) {
+    conn_deliver(ctx, conn, result, conn->pending_upgrade, conn->pending_ws_key);
+    free(conn->pending_upgrade); conn->pending_upgrade = NULL;
+    free(conn->pending_ws_key); conn->pending_ws_key = NULL;
+}
+
+static JSValue conn_promise_done(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv,
+                                 int magic, JSValueConst *func_data) {
+    (void)this_val; (void)magic;
+    int64_t p = 0; JS_ToInt64(ctx, &p, func_data[0]);
+    conn_finish_pending(ctx, (ConnState *)(intptr_t)p,
+                        argc > 0 ? JS_DupValue(ctx, argv[0]) : JS_UNDEFINED);
+    return JS_UNDEFINED;
+}
+
+static JSValue conn_promise_fail(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv,
+                                 int magic, JSValueConst *func_data) {
+    (void)this_val; (void)magic; (void)argc; (void)argv;
+    int64_t p = 0; JS_ToInt64(ctx, &p, func_data[0]);
+    /* A rejected handler is a 500, same as a thrown one. */
+    conn_finish_pending(ctx, (ConnState *)(intptr_t)p, JS_EXCEPTION);
+    return JS_UNDEFINED;
+}
 
 static void conn_close_cb(uv_handle_t *handle) {
     ConnState *conn = (ConnState *)handle->data;
@@ -240,24 +276,13 @@ static void conn_alloc_cb(uv_handle_t *handle, size_t suggested, uv_buf_t *buf) 
     buf->base = malloc(65536); buf->len = buf->base ? 65535 : 0; /* room for a trailing NUL */
 }
 
-static void conn_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
-    ConnState *conn = (ConnState *)stream->data;
-    uv_read_stop(stream);
-    if (nread <= 0) { free(buf->base); uv_close((uv_handle_t *)&conn->handle, conn_close_cb); return; }
-    JSContext *ctx = conn->serve->ctx;
-    char *request = buf->base; request[nread] = 0;
-    char method[16] = {0}, url[4096] = {0}; sscanf(request, "%15s %4095s", method, url);
-    char *body = strstr(request, "\r\n\r\n"); body = body ? body + 4 : request + nread;
-    char *ws_key = header_value(request, "Sec-WebSocket-Key");
-    char *upgrade = header_value(request, "Upgrade");
-    JSValue req_obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, req_obj, "method", JS_NewString(ctx, method));
-    JS_SetPropertyStr(ctx, req_obj, "url", JS_NewString(ctx, url));
-    JS_SetPropertyStr(ctx, req_obj, "body", JS_NewString(ctx, body));
-    JSValue headers = JS_NewObject(ctx);
-    if (upgrade) JS_SetPropertyStr(ctx, headers, "upgrade", JS_NewString(ctx, upgrade));
-    JS_SetPropertyStr(ctx, req_obj, "headers", headers);
-    JSValue result = JS_Call(ctx, conn->serve->handler, JS_UNDEFINED, 1, &req_obj); JS_FreeValue(ctx, req_obj);
+/* arcsx: turn a handler's return value into bytes and write them. Split out
+   of conn_read_cb so a handler may also return a promise -- node:http's
+   (req, res) model finishes the response long after the handler returns, and
+   a promise is the only way to express that here. */
+static void conn_deliver(JSContext *ctx, ConnState *conn, JSValue result,
+                         const char *upgrade, const char *ws_key) {
+    uv_stream_t *stream = (uv_stream_t *)&conn->handle;
 
     DynBuf out = {0};
     if (JS_IsException(result)) {
@@ -427,12 +452,94 @@ static void conn_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf
         }
         JS_FreeCString(ctx, mode); JS_FreeValue(ctx, mode_value); JS_FreeValue(ctx, result);
     }
-    free(buf->base);
 
     conn->write_data = out.data;
     uv_write_t *write_req = malloc(sizeof(*write_req)); write_req->data = conn;
     uv_buf_t write_buf = uv_buf_init(out.data, (unsigned)out.length);
     uv_write(write_req, stream, &write_buf, 1, conn_write_cb);
+}
+
+static void conn_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
+    ConnState *conn = (ConnState *)stream->data;
+    uv_read_stop(stream);
+    if (nread <= 0) { free(buf->base); uv_close((uv_handle_t *)&conn->handle, conn_close_cb); return; }
+    JSContext *ctx = conn->serve->ctx;
+    char *request = buf->base; request[nread] = 0;
+    char method[16] = {0}, url[4096] = {0}; sscanf(request, "%15s %4095s", method, url);
+    char *body = strstr(request, "\r\n\r\n"); body = body ? body + 4 : request + nread;
+    char *ws_key = header_value(request, "Sec-WebSocket-Key");
+    char *upgrade = header_value(request, "Upgrade");
+    JSValue req_obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, req_obj, "method", JS_NewString(ctx, method));
+    JS_SetPropertyStr(ctx, req_obj, "url", JS_NewString(ctx, url));
+    JS_SetPropertyStr(ctx, req_obj, "body", JS_NewString(ctx, body));
+    /* Every request header, lowercased, the way Node presents them. Only
+       `upgrade` used to be exposed, so a handler could not read an
+       Authorization, Content-Type or Cookie header at all. */
+    JSValue headers = JS_NewObject(ctx);
+    {
+        const char *line = strstr(request, "\r\n");
+        while (line) {
+            line += 2;
+            if (line[0] == '\r' || line[0] == 0) break;      /* end of the head */
+            const char *colon = strchr(line, ':');
+            const char *eol = strstr(line, "\r\n");
+            if (!colon || (eol && colon > eol)) { line = eol; continue; }
+            size_t nlen = (size_t)(colon - line);
+            char name[256];
+            if (nlen >= sizeof(name)) { line = eol; continue; }
+            for (size_t i = 0; i < nlen; i++) {
+                char c = line[i];
+                name[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+            }
+            name[nlen] = 0;
+            const char *v = colon + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            size_t vlen = eol ? (size_t)(eol - v) : strlen(v);
+            JSValue existing = JS_GetPropertyStr(ctx, headers, name);
+            if (JS_IsString(existing)) {
+                /* A repeated header joins with ", ", except set-cookie. */
+                const char *prev = JS_ToCString(ctx, existing);
+                size_t plen = prev ? strlen(prev) : 0;
+                char *joined = malloc(plen + vlen + 3);
+                if (joined) {
+                    memcpy(joined, prev ? prev : "", plen);
+                    memcpy(joined + plen, ", ", 2);
+                    memcpy(joined + plen + 2, v, vlen);
+                    joined[plen + 2 + vlen] = 0;
+                    JS_SetPropertyStr(ctx, headers, name, JS_NewString(ctx, joined));
+                    free(joined);
+                }
+                if (prev) JS_FreeCString(ctx, prev);
+            } else {
+                JS_SetPropertyStr(ctx, headers, name, JS_NewStringLen(ctx, v, vlen));
+            }
+            JS_FreeValue(ctx, existing);
+            line = eol;
+        }
+    }
+    if (upgrade) JS_SetPropertyStr(ctx, headers, "upgrade", JS_NewString(ctx, upgrade));
+    JS_SetPropertyStr(ctx, req_obj, "headers", headers);
+    JSValue result = JS_Call(ctx, conn->serve->handler, JS_UNDEFINED, 1, &req_obj); JS_FreeValue(ctx, req_obj);
+
+    /* A handler may return a promise; wait for it before writing. */
+    if (!JS_IsException(result) && JS_PromiseState(ctx, result) != -1) {
+        conn->pending_upgrade = upgrade ? strdup(upgrade) : NULL;
+        conn->pending_ws_key = ws_key ? strdup(ws_key) : NULL;
+        JSValue data = JS_NewInt64(ctx, (int64_t)(intptr_t)conn);
+        JSValueConst d[1] = { data };
+        JSValue on_ok = JS_NewCFunctionData(ctx, conn_promise_done, 1, 0, 1, d);
+        JSValue on_err = JS_NewCFunctionData(ctx, conn_promise_fail, 1, 0, 1, d);
+        JSValue chained = JS_Invoke(ctx, result, JS_NewAtom(ctx, "then"), 1, (JSValueConst *)&on_ok);
+        JSValue caught = JS_Invoke(ctx, chained, JS_NewAtom(ctx, "catch"), 1, (JSValueConst *)&on_err);
+        JS_FreeValue(ctx, caught); JS_FreeValue(ctx, chained);
+        JS_FreeValue(ctx, on_ok); JS_FreeValue(ctx, on_err);
+        JS_FreeValue(ctx, data); JS_FreeValue(ctx, result);
+        free(buf->base);
+        return;
+    }
+    free(buf->base);
+    conn_deliver(ctx, conn, result, upgrade, ws_key);
 }
 
 static void on_connection_cb(uv_stream_t *server_handle, int status) {

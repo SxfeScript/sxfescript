@@ -34,6 +34,42 @@
   EventEmitter.prototype.emit = __sxnEeEmit;
   EventEmitter.prototype.listenerCount = __sxnEeListenerCount;
   EventEmitter.prototype.listeners = __sxnEeListeners;
+  // events.once(emitter, name): resolves with the emitted arguments, or
+  // rejects if the emitter emits 'error' first. Widely used to await a
+  // one-shot lifecycle event such as 'listening'.
+  EventEmitter.once = function (emitter, name, options) {
+    return new Promise((resolve, reject) => {
+      const onEvent = (...args) => { cleanup(); resolve(args); };
+      const onError = (err) => { cleanup(); reject(err); };
+      const cleanup = () => {
+        emitter.off(name, onEvent);
+        if (name !== "error") emitter.off("error", onError);
+        if (signal) signal.removeEventListener("abort", onAbort);
+      };
+      const signal = options && options.signal;
+      const onAbort = () => { cleanup(); reject(signal.reason || new Error("aborted")); };
+      emitter.on(name, onEvent);
+      if (name !== "error") emitter.on("error", onError);
+      if (signal) {
+        if (signal.aborted) return onAbort();
+        signal.addEventListener("abort", onAbort);
+      }
+    });
+  };
+  EventEmitter.on = function (emitter, name) {
+    const queue = [], waiting = [];
+    emitter.on(name, (...args) => {
+      if (waiting.length) waiting.shift()({ value: args, done: false });
+      else queue.push(args);
+    });
+    return {
+      next() {
+        if (queue.length) return Promise.resolve({ value: queue.shift(), done: false });
+        return new Promise((res) => waiting.push(res));
+      },
+      [Symbol.asyncIterator]() { return this; },
+    };
+  };
   globalThis.__sxnEventEmitter = EventEmitter;
   delete globalThis.__sxnEeOn;
   delete globalThis.__sxnEeOff;
@@ -128,6 +164,10 @@
       if (Array.isArray(data) || (data && typeof data.length === "number")) return new Buffer(data); // copies, matching Node
       throw new TypeError("Buffer.from: unsupported argument");
     }
+    // Node serializes a Buffer as { type: "Buffer", data: [...] }, and code
+    // round-trips through that shape.
+    toJSON() { return { type: "Buffer", data: Array.from(this) }; }
+
     static concat(list, totalLength) {
       if (totalLength === undefined) {
         totalLength = 0;
@@ -413,6 +453,522 @@
     writeFile: __sxnWriteFileAsync,
   };
   globalThis.__sxnFsPromises = fsPromises;
+
+
+  // ---------------- node:stream ----------------
+  // Node's EventEmitter-shaped streams, on top of the same EventEmitter this
+  // runtime already ships. Flowing mode ('data' listeners and resume) and
+  // paused mode (read()) both work, as do pipe, backpressure through the
+  // write callback, and the Web Streams bridges.
+  const EE = globalThis.__sxnEventEmitter;
+
+  function inheritEE(Ctor) {
+    Ctor.prototype = Object.create(EE.prototype);
+    Ctor.prototype.constructor = Ctor;
+  }
+
+  function Readable(options) {
+    EE.call(this);
+    options = options || {};
+    this._buf = [];
+    this._flowing = false;
+    this._ended = false;
+    this._endEmitted = false;
+    this._destroyed = false;
+    this.readable = true;
+    this._readableObjectMode = !!options.objectMode;
+    this._encoding = options.encoding || null;
+    if (typeof options.read === "function") this._read = options.read;
+    if (typeof options.destroy === "function") this._destroyImpl = options.destroy;
+  }
+  inheritEE(Readable);
+  Readable.prototype._read = function () {};
+  Readable.prototype.push = function (chunk) {
+    if (chunk !== null && badChunk(this, chunk)) throw chunkTypeError(chunk);
+    if (chunk === null) {
+      this._ended = true;
+      maybeEndReadable(this);
+      return false;
+    }
+    if (this._encoding && chunk instanceof Uint8Array) {
+      chunk = new TextDecoder(this._encoding).decode(chunk);
+    } else if (!this._readableObjectMode) {
+      // Outside objectMode a stream carries bytes, so a string becomes a
+      // Buffer -- consumers call chunk.toString() and expect one.
+      if (typeof chunk === "string") chunk = Buffer.from(chunk, "utf-8");
+      else if (chunk instanceof ArrayBuffer) chunk = Buffer.from(chunk);
+      else if (chunk instanceof Uint8Array && !Buffer.isBuffer(chunk))
+        chunk = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+    }
+    this._buf.push(chunk);
+    if (this._flowing) drainReadable(this);
+    else this.emit("readable");
+    return this._buf.length < 16;      // a coarse high-water mark
+  };
+  function drainReadable(r) {
+    while (r._flowing && r._buf.length > 0) r.emit("data", r._buf.shift());
+    maybeEndReadable(r);
+    if (r._flowing && !r._ended) r._read();
+  }
+  function maybeEndReadable(r) {
+    if (r._ended && r._buf.length === 0 && !r._endEmitted) {
+      r._endEmitted = true;
+      r.readable = false;
+      queueMicrotask(() => { r.emit("end"); r.emit("close"); });
+    }
+  }
+  Readable.prototype.read = function () {
+    if (this._buf.length === 0) { this._read(); }
+    if (this._buf.length === 0) { maybeEndReadable(this); return null; }
+    let c;
+    if (this._readableObjectMode || this._encoding || this._buf.length === 1) {
+      c = this._buf.shift();
+    } else {
+      // Node hands back everything buffered as one Buffer.
+      c = Buffer.concat(this._buf.splice(0));
+    }
+    maybeEndReadable(this);
+    return c;
+  };
+  Readable.prototype.pause = function () { this._flowing = false; return this; };
+  Readable.prototype.resume = function () {
+    if (!this._flowing) { this._flowing = true; queueMicrotask(() => drainReadable(this)); }
+    return this;
+  };
+  Readable.prototype.setEncoding = function (enc) { this._encoding = enc; return this; };
+  Readable.prototype.destroy = function (err) {
+    if (this._destroyed) return this;
+    this._destroyed = true;
+    this.readable = false;
+    if (this._destroyImpl) this._destroyImpl(err || null, () => {});
+    queueMicrotask(() => { if (err) this.emit("error", err); this.emit("close"); });
+    return this;
+  };
+  Readable.prototype.pipe = function (dest, options) {
+    this.on("data", (chunk) => { if (dest.write(chunk) === false) this.pause(); });
+    dest.on("drain", () => this.resume());
+    this.on("end", () => { if (!options || options.end !== false) dest.end(); });
+    this.on("error", (e) => dest.emit("error", e));
+    this.resume();
+    return dest;
+  };
+  // `on('data')` is what switches a stream into flowing mode in Node.
+  const readableOn = Readable.prototype.on;
+  Readable.prototype.on = function (event, fn) {
+    const r = EE.prototype.on.call(this, event, fn);
+    if (event === "data") this.resume();
+    return r;
+  };
+  void readableOn;
+  Readable.prototype[Symbol.asyncIterator] = function () {
+    const self = this;
+    return {
+      next() {
+        if (self._buf.length > 0) return Promise.resolve({ value: self._buf.shift(), done: false });
+        if (self._ended) return Promise.resolve({ value: undefined, done: true });
+        return new Promise((resolve, reject) => {
+          const onData = (c) => { cleanup(); resolve({ value: c, done: false }); };
+          const onEnd = () => { cleanup(); resolve({ value: undefined, done: true }); };
+          const onErr = (e) => { cleanup(); reject(e); };
+          const cleanup = () => {
+            self.off("data", onData); self.off("end", onEnd); self.off("error", onErr);
+          };
+          self.on("data", onData); self.on("end", onEnd); self.on("error", onErr);
+        });
+      },
+      [Symbol.asyncIterator]() { return this; },
+    };
+  };
+  Readable.from = function (iterable, options) {
+    const it = iterable[Symbol.asyncIterator]
+      ? iterable[Symbol.asyncIterator]() : iterable[Symbol.iterator]();
+    const r = new Readable(Object.assign({ objectMode: true }, options));
+    let pulling = false;
+    r._read = function () {
+      if (pulling) return;
+      pulling = true;
+      Promise.resolve(it.next()).then(({ value, done }) => {
+        pulling = false;
+        if (done) r.push(null); else r.push(value);
+      }, (e) => { pulling = false; r.destroy(e); });
+    };
+    return r;
+  };
+  Readable.fromWeb = function (webStream, options) {
+    const reader = webStream.getReader();
+    const r = new Readable(options);
+    let pulling = false;
+    r._read = function () {
+      if (pulling) return;
+      pulling = true;
+      reader.read().then(({ value, done }) => {
+        pulling = false;
+        if (done) r.push(null); else r.push(value);
+      }, (e) => { pulling = false; r.destroy(e); });
+    };
+    return r;
+  };
+  Readable.toWeb = function (nodeStream) {
+    return new ReadableStream({
+      start(c) {
+        nodeStream.on("data", (chunk) => c.enqueue(chunk));
+        nodeStream.on("end", () => { try { c.close(); } catch {} });
+        nodeStream.on("error", (e) => c.error(e));
+      },
+      cancel() { nodeStream.destroy(); },
+    });
+  };
+
+  function Writable(options) {
+    EE.call(this);
+    options = options || {};
+    this._writableObjectMode = !!options.objectMode;
+    this.writable = true;
+    this._destroyed = false;
+    this._finished = false;
+    this._corked = 0;
+    if (typeof options.write === "function") this._write = options.write;
+    if (typeof options.final === "function") this._final = options.final;
+    if (typeof options.destroy === "function") this._destroyImpl = options.destroy;
+  }
+  inheritEE(Writable);
+  Writable.prototype._write = function (chunk, enc, cb) { cb(); };
+  function chunkTypeError(chunk) {
+    const e = new TypeError(
+      'The "chunk" argument must be of type string or an instance of Buffer, ' +
+      "TypedArray, or DataView. Received type " + typeof chunk + " (" + String(chunk) + ")");
+    e.code = "ERR_INVALID_ARG_TYPE";
+    return e;
+  }
+  function badChunk(stream, chunk) {
+    // Outside objectMode a stream carries bytes, and Node refuses anything
+    // else rather than stringifying it silently.
+    if (stream._writableObjectMode || stream._readableObjectMode) return false;
+    return !(typeof chunk === "string" || chunk instanceof Uint8Array ||
+             chunk instanceof ArrayBuffer || ArrayBuffer.isView(chunk));
+  }
+  Writable.prototype.write = function (chunk, enc, cb) {
+    if (typeof enc === "function") { cb = enc; enc = undefined; }
+    if (badChunk(this, chunk)) throw chunkTypeError(chunk);
+    if (!this.writable) {
+      const e = new Error("write after end");
+      queueMicrotask(() => this.emit("error", e));
+      if (cb) cb(e);
+      return false;
+    }
+    let sync = true, backpressure = false;
+    this._write(chunk, enc || "utf8", (err) => {
+      if (err) { this.emit("error", err); if (cb) cb(err); return; }
+      if (cb) cb(null);
+      if (backpressure) queueMicrotask(() => this.emit("drain"));
+    });
+    sync = false; void sync;
+    return !backpressure;
+  };
+  Writable.prototype.cork = function () { this._corked++; };
+  Writable.prototype.uncork = function () { if (this._corked) this._corked--; };
+  Writable.prototype.end = function (chunk, enc, cb) {
+    if (typeof chunk === "function") { cb = chunk; chunk = undefined; }
+    if (typeof enc === "function") { cb = enc; enc = undefined; }
+    if (chunk !== undefined && chunk !== null) this.write(chunk, enc);
+    if (!this.writable) { if (cb) cb(); return this; }
+    this.writable = false;
+    const done = () => {
+      this._finished = true;
+      if (cb) cb();
+      this.emit("finish");
+      this.emit("close");
+    };
+    if (this._final) this._final((err) => { if (err) this.emit("error", err); else done(); });
+    else queueMicrotask(done);
+    return this;
+  };
+  Writable.prototype.destroy = function (err) {
+    if (this._destroyed) return this;
+    this._destroyed = true;
+    this.writable = false;
+    if (this._destroyImpl) this._destroyImpl(err || null, () => {});
+    queueMicrotask(() => { if (err) this.emit("error", err); this.emit("close"); });
+    return this;
+  };
+  Writable.toWeb = function (nodeWritable) {
+    return new WritableStream({
+      write(chunk) { return new Promise((res, rej) => nodeWritable.write(chunk, (e) => e ? rej(e) : res())); },
+      close() { return new Promise((res) => nodeWritable.end(res)); },
+      abort(reason) { nodeWritable.destroy(reason); },
+    });
+  };
+
+  // Duplex is both halves on one object; Transform is a Duplex whose write
+  // feeds its own readable side through _transform.
+  function Duplex(options) {
+    Readable.call(this, options);
+    Writable.call(this, options);
+    if (options && typeof options.write === "function") this._write = options.write;
+    if (options && typeof options.read === "function") this._read = options.read;
+  }
+  Duplex.prototype = Object.create(Readable.prototype);
+  Duplex.prototype.constructor = Duplex;
+  for (const k of ["write", "end", "cork", "uncork", "_write"])
+    Duplex.prototype[k] = Writable.prototype[k];
+  Object.defineProperty(Duplex.prototype, "writable", {
+    get() { return this._writable !== false; },
+    set(v) { this._writable = v; },
+    configurable: true,
+  });
+
+  function Transform(options) {
+    Duplex.call(this, options);
+    this._writableObjectMode = !!(options && options.objectMode);
+    this._readableObjectMode = !!(options && options.objectMode);
+    if (options && typeof options.transform === "function") this._transform = options.transform;
+    if (options && typeof options.flush === "function") this._flush = options.flush;
+  }
+  Transform.prototype = Object.create(Duplex.prototype);
+  Transform.prototype.constructor = Transform;
+  Transform.prototype._transform = function (chunk, enc, cb) { cb(null, chunk); };
+  Transform.prototype._write = function (chunk, enc, cb) {
+    this._transform(chunk, enc, (err, out) => {
+      if (err) return cb(err);
+      if (out !== undefined && out !== null) this.push(out);
+      cb();
+    });
+  };
+  Transform.prototype.end = function (chunk, enc, cb) {
+    if (typeof chunk === "function") { cb = chunk; chunk = undefined; }
+    if (chunk !== undefined && chunk !== null) this.write(chunk, enc);
+    const finish = () => { this.push(null); if (cb) cb(); this.emit("finish"); };
+    if (this._flush) this._flush((err, out) => {
+      if (err) return this.emit("error", err);
+      if (out !== undefined && out !== null) this.push(out);
+      finish();
+    });
+    else queueMicrotask(finish);
+    return this;
+  };
+
+  function PassThrough(options) { Transform.call(this, options); }
+  PassThrough.prototype = Object.create(Transform.prototype);
+  PassThrough.prototype.constructor = PassThrough;
+
+  function finished(stream, cb) {
+    const done = (err) => { cleanup(); cb ? cb(err) : undefined; if (!cb) throw err; };
+    const onEnd = () => { cleanup(); if (cb) cb(null); };
+    const onErr = (e) => { cleanup(); if (cb) cb(e); };
+    const cleanup = () => {
+      stream.off && stream.off("end", onEnd);
+      stream.off && stream.off("finish", onEnd);
+      stream.off && stream.off("error", onErr);
+    };
+    void done;
+    stream.on("end", onEnd); stream.on("finish", onEnd); stream.on("error", onErr);
+  }
+
+  function pipeline(...args) {
+    let cb = typeof args[args.length - 1] === "function" ? args.pop() : null;
+    const streams = args;
+    let cur = streams[0];
+    for (let i = 1; i < streams.length; i++) cur = cur.pipe(streams[i]);
+    const last = streams[streams.length - 1];
+    if (cb) finished(last, cb);
+    return last;
+  }
+
+  const streamModule = {
+    Readable, Writable, Duplex, Transform, PassThrough,
+    pipeline, finished,
+    promises: {
+      pipeline: (...a) => new Promise((res, rej) =>
+        pipeline(...a, (e) => (e ? rej(e) : res(undefined)))),
+      finished: (s) => new Promise((res, rej) => finished(s, (e) => (e ? rej(e) : res(undefined)))),
+    },
+  };
+  streamModule.Stream = Readable;
+  globalThis.__sxnStream = streamModule;
+
+
+  // ---------------- node:http ----------------
+  // Node's (req, res) server on top of Sxn.serve. The handler here returns a
+  // promise that settles when res.end() runs, which is what lets an
+  // application write its response whenever it likes rather than returning
+  // one -- the shape Express and everything like it is built around.
+  const STATUS_CODES = {
+    200: "OK", 201: "Created", 202: "Accepted", 204: "No Content",
+    301: "Moved Permanently", 302: "Found", 303: "See Other", 304: "Not Modified",
+    307: "Temporary Redirect", 308: "Permanent Redirect",
+    400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
+    405: "Method Not Allowed", 409: "Conflict", 410: "Gone",
+    413: "Payload Too Large", 415: "Unsupported Media Type", 418: "I'm a Teapot",
+    422: "Unprocessable Entity", 429: "Too Many Requests",
+    500: "Internal Server Error", 501: "Not Implemented", 502: "Bad Gateway",
+    503: "Service Unavailable", 504: "Gateway Timeout",
+  };
+
+  function IncomingMessage(raw) {
+    Readable.call(this, {});
+    this.method = raw.method || "GET";
+    this.url = raw.url || "/";
+    this.headers = {};
+    for (const k of Object.keys(raw.headers || {}))
+      this.headers[k.toLowerCase()] = raw.headers[k];
+    this.httpVersion = "1.1";
+    this.rawHeaders = [];
+    for (const k of Object.keys(this.headers)) this.rawHeaders.push(k, this.headers[k]);
+    this.socket = { remoteAddress: "127.0.0.1", encrypted: false };
+    this.connection = this.socket;
+    this.complete = true;
+    // The body has already been read off the wire, so it arrives as one chunk.
+    const body = raw.body;
+    queueMicrotask(() => {
+      if (body) this.push(body);
+      this.push(null);
+    });
+  }
+  IncomingMessage.prototype = Object.create(Readable.prototype);
+  IncomingMessage.prototype.constructor = IncomingMessage;
+
+  function ServerResponse(settle) {
+    Writable.call(this, {});
+    this.statusCode = 200;
+    this.statusMessage = undefined;
+    this.headersSent = false;
+    this.finished = false;
+    this._headers = {};
+    this._chunks = [];
+    this._settle = settle;
+  }
+  ServerResponse.prototype = Object.create(Writable.prototype);
+  ServerResponse.prototype.constructor = ServerResponse;
+  ServerResponse.prototype.setHeader = function (name, value) {
+    this._headers[String(name).toLowerCase()] = value;
+    return this;
+  };
+  ServerResponse.prototype.getHeader = function (name) { return this._headers[String(name).toLowerCase()]; };
+  ServerResponse.prototype.getHeaders = function () { return Object.assign({}, this._headers); };
+  ServerResponse.prototype.getHeaderNames = function () { return Object.keys(this._headers); };
+  ServerResponse.prototype.hasHeader = function (name) {
+    return Object.prototype.hasOwnProperty.call(this._headers, String(name).toLowerCase());
+  };
+  ServerResponse.prototype.removeHeader = function (name) { delete this._headers[String(name).toLowerCase()]; };
+  ServerResponse.prototype.writeHead = function (status, reasonOrHeaders, maybeHeaders) {
+    this.statusCode = status;
+    let headers = maybeHeaders;
+    if (typeof reasonOrHeaders === "string") this.statusMessage = reasonOrHeaders;
+    else headers = reasonOrHeaders || maybeHeaders;
+    if (headers) for (const k of Object.keys(headers)) this.setHeader(k, headers[k]);
+    this.headersSent = true;
+    return this;
+  };
+  ServerResponse.prototype.write = function (chunk, enc, cb) {
+    if (typeof enc === "function") { cb = enc; enc = undefined; }
+    if (chunk !== undefined && chunk !== null) this._chunks.push(chunk);
+    this.headersSent = true;
+    if (cb) queueMicrotask(cb);
+    return true;
+  };
+  ServerResponse.prototype.end = function (chunk, enc, cb) {
+    if (typeof chunk === "function") { cb = chunk; chunk = undefined; }
+    if (typeof enc === "function") { cb = enc; enc = undefined; }
+    if (this.finished) return this;
+    if (chunk !== undefined && chunk !== null) this._chunks.push(chunk);
+    this.finished = true;
+    this.headersSent = true;
+    // Concatenate once: text chunks join, binary chunks merge into one array.
+    let body;
+    const anyBinary = this._chunks.some((c) => c instanceof Uint8Array || c instanceof ArrayBuffer);
+    if (anyBinary) {
+      const parts = this._chunks.map((c) =>
+        c instanceof Uint8Array ? c
+        : c instanceof ArrayBuffer ? new Uint8Array(c)
+        : new TextEncoder().encode(String(c)));
+      let total = 0; for (const p of parts) total += p.length;
+      body = new Uint8Array(total);
+      let at = 0; for (const p of parts) { body.set(p, at); at += p.length; }
+    } else {
+      body = this._chunks.map((c) => String(c)).join("");
+    }
+    this._settle({ statusCode: this.statusCode, headers: this._headers, body });
+    if (cb) queueMicrotask(cb);
+    this.emit("finish");
+    this.emit("close");
+    return this;
+  };
+
+  function Server(handler) {
+    EE.call(this);
+    this._handler = handler || null;
+    this._native = null;
+    if (handler) this.on("request", handler);
+  }
+  inheritEE(Server);
+  Server.prototype.listen = function (port, hostOrCb, cb) {
+    if (typeof hostOrCb === "function") { cb = hostOrCb; }
+    if (typeof port === "object" && port !== null) port = port.port;
+    const self = this;
+    this._native = Sxn.serve({ port: Number(port) || 0 }, (raw) =>
+      new Promise((resolve) => {
+        const req = new IncomingMessage(raw);
+        const res = new ServerResponse(resolve);
+        self.emit("request", req, res);
+      }));
+    this._port = this._native.port;
+    if (cb) queueMicrotask(() => cb());
+    queueMicrotask(() => self.emit("listening"));
+    return this;
+  };
+  Server.prototype.address = function () {
+    return this._native ? { address: "127.0.0.1", family: "IPv4", port: this._native.port } : null;
+  };
+  Server.prototype.close = function (cb) {
+    if (this._native) { this._native.stop(); this._native = null; }
+    if (cb) queueMicrotask(() => cb());
+    queueMicrotask(() => this.emit("close"));
+    return this;
+  };
+
+  // The client half maps onto fetch, which is the transport this runtime has.
+  function ClientRequest(options, cb) {
+    Writable.call(this, {});
+    const opts = typeof options === "string" ? { url: options } : options || {};
+    this._url = opts.url ||
+      ((opts.protocol || "http:") + "//" + (opts.hostname || opts.host || "localhost") +
+       (opts.port ? ":" + opts.port : "") + (opts.path || "/"));
+    this._method = opts.method || "GET";
+    this._headers = Object.assign({}, opts.headers);
+    this._body = [];
+    if (cb) this.once("response", cb);
+  }
+  ClientRequest.prototype = Object.create(Writable.prototype);
+  ClientRequest.prototype.constructor = ClientRequest;
+  ClientRequest.prototype.setHeader = function (k, v) { this._headers[k] = v; return this; };
+  ClientRequest.prototype.write = function (chunk) { this._body.push(chunk); return true; };
+  ClientRequest.prototype.end = function (chunk) {
+    if (chunk !== undefined && chunk !== null) this._body.push(chunk);
+    const body = this._body.length ? this._body.map(String).join("") : undefined;
+    fetch(this._url, { method: this._method, headers: this._headers, body }).then(async (r) => {
+      const res = new IncomingMessage({
+        method: this._method, url: this._url,
+        headers: Object.fromEntries(r.headers), body: await r.text(),
+      });
+      res.statusCode = r.status;
+      res.statusMessage = r.statusText;
+      this.emit("response", res);
+    }, (e) => this.emit("error", e));
+    return this;
+  };
+
+  const http = {
+    STATUS_CODES,
+    METHODS: ["DELETE","GET","HEAD","OPTIONS","PATCH","POST","PUT"],
+    IncomingMessage, ServerResponse, Server,
+    createServer(opts, handler) {
+      if (typeof opts === "function") { handler = opts; }
+      return new Server(handler);
+    },
+    request(options, cb) { return new ClientRequest(options, cb); },
+    get(options, cb) { const r = new ClientRequest(options, cb); r.end(); return r; },
+  };
+  globalThis.__sxnHttp = http;
 
   // ---------------- node:util ----------------
   // The parts packages actually import: promisify, callbackify, inherits,
