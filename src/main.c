@@ -585,14 +585,14 @@ failure:
 static void usage(void) {
     puts("SXN 0.0.1\n"
          "Usage:\n"
-         "  sxn <file.sx|file.js|file.mjs|file.cjs> [args...]\n"
+         "  sxn <file.sx|file.ts|file.js|file.mjs|file.cjs> [args...]\n"
          "  sxn run [script] -- [args...]\n"
          "  sxn <script> [-- args...]\n"
          "  sxn install [--trust package]\n"
          "  sxn add [--dev] package[@range]\n"
          "  sxn remove package\n"
          "  sxn init\n"
-         "  sxn [--memory-report] [--leak-check] <file.sx|file.js|file.mjs|file.cjs> [args...]\n"
+         "  sxn [--memory-report] [--leak-check] <file.sx|file.ts|file.js|file.mjs|file.cjs> [args...]\n"
          "  sxn lsp --stdio\n"
          "  sxn --help | --version");
 }
@@ -611,7 +611,7 @@ int main(int argc, char **argv) {
         ++file_index;
     }
     if (file_index >= argc) { usage(); return 2; }
-    if (!suffix(argv[file_index], ".sx") && !suffix(argv[file_index], ".js") && !suffix(argv[file_index], ".mjs") && !suffix(argv[file_index], ".cjs")) {
+    if (!suffix(argv[file_index], ".sx") && !suffix(argv[file_index], ".js") && !suffix(argv[file_index], ".mjs") && !suffix(argv[file_index], ".cjs") && !suffix(argv[file_index], ".ts") && !suffix(argv[file_index], ".mts")) {
         char **run_argv = calloc((size_t)argc + 1, sizeof(*run_argv));
         if (!run_argv) return 2;
         run_argv[0] = argv[0]; run_argv[1] = "run";

@@ -136,6 +136,9 @@ static void dynbuf_puts(DynBuf *buf, const char *s) { dynbuf_append(buf, s, strl
    chunks rather than inventing a second one. */
 typedef struct SxnChunkViewState SxnChunkViewState;
 static JSClassID sxn_chunkview_class_id;
+/* The object returned by Sxn.serve; its opaque is the uv_tcp_t listener. */
+static JSClassID sxn_serverhandle_class_id;
+static JSClassDef sxn_serverhandle_class = { "ServerHandle", NULL, NULL, NULL, NULL };
 static JSValue sxn_chunkview_acquire(JSContext *ctx, SxnChunkViewState *st, int exclusive, JSValue *out_buffer);
 static void sxn_chunkview_release_shared(SxnChunkViewState *st);
 
@@ -443,6 +446,30 @@ static void on_connection_cb(uv_stream_t *server_handle, int status) {
         uv_close((uv_handle_t *)&conn->handle, conn_close_cb);
 }
 
+/* Stops the listener a serve() call created. The handle is closed
+   asynchronously, so the ServeState is released from the close callback
+   rather than here. Idempotent: a second stop() is a no-op. */
+static void serve_close_cb(uv_handle_t *h) {
+    ServeState *serve = (ServeState *)h->data;
+    if (serve) {
+        JS_FreeValue(serve->ctx, serve->handler);
+        free(serve);
+    }
+    free(h);
+}
+
+static JSValue js_serve_stop(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv,
+                             int magic, JSValueConst *func_data) {
+    (void)this_val; (void)argc; (void)argv; (void)magic;
+    void *ptr = JS_GetOpaque(func_data[0], sxn_serverhandle_class_id);
+    if (ptr) {
+        JS_SetOpaque(func_data[0], NULL);
+        uv_close((uv_handle_t *)ptr, serve_close_cb);
+    }
+    return JS_UNDEFINED;
+}
+
 static JSValue js_serve(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     int32_t port = 3000;
     if (argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_ThrowTypeError(ctx, "serve(options, handler) requires a handler");
@@ -458,7 +485,23 @@ static JSValue js_serve(JSContext *ctx, JSValueConst this_val, int argc, JSValue
         free(server); JS_FreeValue(ctx, serve->handler); free(serve);
         return JS_ThrowInternalError(ctx, "listen on %d: %s", port, uv_strerror(rc));
     }
-    return JS_UNDEFINED;
+    /* Hand back a handle: without one a server can never be stopped, which
+       makes it impossible to run a server and anything else in one process. */
+    JSValue handle = JS_NewObjectClass(ctx, sxn_serverhandle_class_id);
+    if (JS_IsException(handle)) return handle;
+    JS_SetOpaque(handle, server);
+    JSValueConst data[1] = { handle };
+    JS_SetPropertyStr(ctx, handle, "stop",
+                      JS_NewCFunctionData(ctx, js_serve_stop, 0, 0, 1, data));
+    JS_SetPropertyStr(ctx, handle, "port", JS_NewInt32(ctx, port));
+    JS_SetPropertyStr(ctx, handle, "url",
+                      JS_NewString(ctx, ""));
+    {
+        char u[64];
+        snprintf(u, sizeof(u), "http://127.0.0.1:%d", port);
+        JS_SetPropertyStr(ctx, handle, "url", JS_NewString(ctx, u));
+    }
+    return handle;
 }
 
 /* --- Streaming fetch() -----------------------------------------------
@@ -1688,6 +1731,8 @@ int sxn_install_network(JSContext *ctx) {
 
     JS_NewClassID(rt, &sxn_chunkview_class_id);
     JS_NewClass(rt, sxn_chunkview_class_id, &sxn_chunkview_class_def);
+    JS_NewClassID(rt, &sxn_serverhandle_class_id);
+    JS_NewClass(rt, sxn_serverhandle_class_id, &sxn_serverhandle_class);
     JSValue chunkview_proto = JS_NewObject(ctx);
     JS_SetPropertyFunctionList(ctx, chunkview_proto, sxn_chunkview_proto_funcs, countof(sxn_chunkview_proto_funcs));
     JS_SetClassProto(ctx, sxn_chunkview_class_id, chunkview_proto);

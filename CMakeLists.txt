@@ -235,6 +235,11 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # TypeScript erasure: type-only declarations, optional parameters, generics,
   # as/satisfies, and that ordinary `<` comparisons still parse.
   add_test(NAME sxn-typescript COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/ts/main.mjs)
+  # A .ts file as the entry point, not only as an import.
+  add_test(NAME sxn-typescript-entry COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/ts/entry.ts)
+  # Sxn.serve returns a handle that reports its port and url and can stop.
+  add_test(NAME sxn-serve-handle COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_handle.mjs)
+  set_tests_properties(sxn-serve-handle PROPERTIES TIMEOUT 30 FAIL_REGULAR_EXPRESSION "FAIL")
   add_test(NAME sxn-serve-headers COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_headers.mjs)
   set_tests_properties(sxn-serve-headers PROPERTIES TIMEOUT 30 FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-performance-now PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
