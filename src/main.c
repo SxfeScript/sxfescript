@@ -13,6 +13,11 @@
 #define strcasecmp _stricmp
 #endif
 
+/* Defined in network.c; declared here rather than in sxfe.h because that
+   header deliberately avoids including quickjs.h and JSValue is a value
+   type, not something that can be forward-declared. */
+JSValue sxn_await_with_loop(JSContext *ctx, JSValue obj);
+
 static bool suffix(const char *value, const char *ending) {
     size_t a = strlen(value), b = strlen(ending);
     return a >= b && !strcasecmp(value + a - b, ending);
@@ -121,7 +126,10 @@ static int execute_file(int argc, char **argv, const char *filename,
             JS_FreeValue(context, value); value = JS_EXCEPTION;
         } else value = JS_EvalFunction(context, value);
     }
-    if (!JS_IsException(value)) value = js_std_await(context, value);
+    /* A module with top-level await evaluates to a pending promise. Awaiting
+       it has to drive the uv loop too, or any await on a timer, a fetch or a
+       server never resumes. */
+    if (!JS_IsException(value)) value = sxn_await_with_loop(context, value);
     if (JS_IsException(value)) { js_std_dump_error(context); JS_FreeValue(context, value); goto failure; }
     JS_FreeValue(context, value);
     if (js_std_loop(context)) { js_std_dump_error(context); goto failure; }

@@ -215,6 +215,14 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # generated at a pinned BC_VERSION; this catches the blobs going stale
   # against the interpreter, which throws SyntaxError on first access.
   add_test(NAME sxn-lazy-builtins COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/lazy_builtins.mjs)
+  # Top-level await has to drive the uv loop, not just the job queue, or an
+  # await on a timer, a fetch or the process's own server never resumes.
+  add_test(NAME sxn-toplevel-await COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/toplevel_await.mjs)
+  set_tests_properties(sxn-toplevel-await PROPERTIES TIMEOUT 30 FAIL_REGULAR_EXPRESSION "FAIL")
+  # Sxn.serve response headers, including that a handler cannot corrupt the
+  # framing headers that describe the response.
+  add_test(NAME sxn-serve-headers COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_headers.mjs)
+  set_tests_properties(sxn-serve-headers PROPERTIES TIMEOUT 30 FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-performance-now PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
 endif()

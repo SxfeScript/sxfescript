@@ -105,6 +105,18 @@ static void sxn_curl_multi_init(void) {
    handing it to a single uv_write, mirroring the byte stream the old
    blocking send_all() calls produced. */
 typedef struct DynBuf { char *data; size_t length, cap; } DynBuf;
+/* Header names are case-insensitive; strcasecmp is not in C17's standard
+   library, so compare explicitly rather than depend on a POSIX extension. */
+static int sxn_strcasecmp(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) {
+        int ca = *a, cb = *b;
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return ca - cb;
+    }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
 static void dynbuf_append(DynBuf *buf, const void *data, size_t n) {
     if (buf->length + n > buf->cap) {
         size_t cap = buf->cap ? buf->cap * 2 : 256;
@@ -335,8 +347,66 @@ static void conn_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf
 
             if (!is_binary) { body_text = JS_ToCString(ctx, body_value); body_len = body_text ? strlen(body_text) : 0; }
 
-            char head[512]; int n = snprintf(head, sizeof(head), "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\nConnection: close\r\nContent-Type: %s\r\n\r\n", status, reason(status), body_len, content_type);
+            /* A response may carry a `headers` object. Content-Type from it
+               wins over the default and the Blob-derived one; Content-Length
+               and Connection stay ours because they describe this framing,
+               not the payload. Values are emitted in insertion order, so
+               repeated names (Set-Cookie) can be passed as an array. */
+            JSValue hdrs = JS_GetPropertyStr(ctx, result, "headers");
+            char *extra = NULL; size_t extra_len = 0;
+            const char *ct_override = NULL;
+            JSValue ct_value = JS_UNDEFINED;
+            if (JS_IsObject(hdrs)) {
+                JSPropertyEnum *tab = NULL; uint32_t count = 0;
+                if (!JS_GetOwnPropertyNames(ctx, &tab, &count, hdrs,
+                                            JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
+                    DynBuf hb = {0};
+                    for (uint32_t hi = 0; hi < count; hi++) {
+                        const char *key = JS_AtomToCString(ctx, tab[hi].atom);
+                        JSValue v = JS_GetProperty(ctx, hdrs, tab[hi].atom);
+                        if (key && !JS_IsUndefined(v) && !JS_IsNull(v)) {
+                            if (!sxn_strcasecmp(key, "content-type")) {
+                                JS_FreeValue(ctx, ct_value);
+                                ct_value = JS_DupValue(ctx, v);
+                                ct_override = JS_ToCString(ctx, ct_value);
+                            } else if (sxn_strcasecmp(key, "content-length") &&
+                                       sxn_strcasecmp(key, "connection")) {
+                                /* An array value repeats the header. */
+                                int64_t alen = -1;
+                                if (JS_IsArray(v)) JS_GetLength(ctx, v, &alen);
+                                for (int64_t ai = 0; ai < (alen < 0 ? 1 : alen); ai++) {
+                                    JSValue one = alen < 0 ? JS_DupValue(ctx, v)
+                                                           : JS_GetPropertyInt64(ctx, v, ai);
+                                    const char *val = JS_ToCString(ctx, one);
+                                    if (val) {
+                                        dynbuf_append(&hb, key, strlen(key));
+                                        dynbuf_append(&hb, ": ", 2);
+                                        dynbuf_append(&hb, val, strlen(val));
+                                        dynbuf_append(&hb, "\r\n", 2);
+                                        JS_FreeCString(ctx, val);
+                                    }
+                                    JS_FreeValue(ctx, one);
+                                }
+                            }
+                        }
+                        JS_FreeValue(ctx, v);
+                        if (key) JS_FreeCString(ctx, key);
+                        JS_FreeAtom(ctx, tab[hi].atom);
+                    }
+                    js_free(ctx, tab);
+                    extra = hb.data; extra_len = hb.length;
+                }
+            }
+            JS_FreeValue(ctx, hdrs);
+            if (ct_override) content_type = ct_override;
+
+            char head[512]; int n = snprintf(head, sizeof(head), "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\nConnection: close\r\nContent-Type: %s\r\n", status, reason(status), body_len, content_type);
             dynbuf_append(&out, head, (size_t)n);
+            if (extra && extra_len) dynbuf_append(&out, extra, extra_len);
+            dynbuf_append(&out, "\r\n", 2);
+            free(extra);
+            if (ct_override) JS_FreeCString(ctx, ct_override);
+            JS_FreeValue(ctx, ct_value);
             if (is_binary) { if (body_bytes) dynbuf_append(&out, body_bytes, body_len); }
             else if (body_text) dynbuf_append(&out, body_text, body_len);
 
@@ -1679,6 +1749,47 @@ int sxn_install_network(JSContext *ctx) {
     JS_SetPropertyStr(ctx, runtime, "fetch", fetch_fn);
     JS_FreeValue(ctx, global);
     return 0;
+}
+
+/* Await a top-level-await module's evaluation promise while driving BOTH job
+   queues. js_std_await only drains QuickJS jobs and polls quickjs-libc's own
+   os handles; it knows nothing about the uv loop that timers, Sxn.serve and
+   fetch run on, so `const r = await fetch(...)` at module top level blocked
+   forever -- the promise could only be settled by work that never got a
+   chance to run. Mirrors js_std_await's contract: consumes obj, returns the
+   fulfilled value or throws the rejection, and passes non-promises through. */
+JSValue sxn_await_with_loop(JSContext *ctx, JSValue obj) {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    uv_loop_t *loop = sxn_loop();
+    for (;;) {
+        int state = JS_PromiseState(ctx, obj);
+        if (state == JS_PROMISE_FULFILLED) {
+            JSValue ret = JS_PromiseResult(ctx, obj);
+            JS_FreeValue(ctx, obj);
+            return ret;
+        }
+        if (state == JS_PROMISE_REJECTED) {
+            JSValue ret = JS_Throw(ctx, JS_PromiseResult(ctx, obj));
+            JS_FreeValue(ctx, obj);
+            return ret;
+        }
+        if (state != JS_PROMISE_PENDING)
+            return obj;                       /* not a promise at all */
+
+        JSContext *ctx1;
+        int err = JS_ExecutePendingJob(rt, &ctx1);
+        if (err < 0)
+            js_std_dump_error(ctx1);
+        if (err != 0)
+            continue;                         /* a job ran; re-check the state */
+
+        /* No jobs left, so only the loop can move this forward. UV_RUN_ONCE
+           blocks until something is ready rather than spinning. If nothing is
+           pending either, the promise can never settle -- return it and let
+           the caller see a still-pending module rather than hang. */
+        if (!uv_run(loop, UV_RUN_ONCE) && !JS_IsJobPending(rt))
+            return obj;
+    }
 }
 
 int sxn_run_event_loop(JSContext *ctx) {
