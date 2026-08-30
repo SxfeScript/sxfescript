@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <sys/stat.h>
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
@@ -35,6 +37,181 @@ static uint8_t *sxn_load_file(JSContext *ctx, size_t *length, const char *filena
 
 static bool has_prefix(const char *value, const char *prefix) {
     return !strncmp(value, prefix, strlen(prefix));
+}
+
+/* QuickJS's default normalizer is internal, and installing our own replaces
+   it, so the relative case has to be reproduced here: resolve "./" and "../"
+   against the importing module's directory, and pass anything else through. */
+static char *sxn_normalize_relative(JSContext *ctx, const char *base_name,
+                                    const char *name) {
+    if (name[0] != '.') return js_strdup(ctx, name);
+
+    const char *r = strrchr(base_name, '/');
+    size_t dlen = r ? (size_t)(r - base_name) : 0;
+    size_t cap = dlen + strlen(name) + 2;
+    char *out = js_malloc(ctx, cap);
+    if (!out) return NULL;
+    memcpy(out, base_name, dlen);
+    out[dlen] = 0;
+
+    r = name;
+    for (;;) {
+        if (r[0] == '.' && r[1] == '/') {
+            r += 2;
+        } else if (r[0] == '.' && r[1] == '.' && r[2] == '/') {
+            char *p = strrchr(out, '/');
+            if (!p) {
+                if (out[0] == 0) break;   /* cannot climb above the root */
+                p = out;
+            }
+            *p = 0;
+            r += 3;
+        } else {
+            break;
+        }
+    }
+    if (out[0] != 0) strncat(out, "/", cap - strlen(out) - 1);
+    strncat(out, r, cap - strlen(out) - 1);
+    return out;
+}
+
+/* ---- bare specifier resolution -------------------------------------------
+   `import x from "pkg"` previously failed even with node_modules/pkg present,
+   which meant nothing installed by `sxn install` could be imported. This walks
+   up from the importing module the way Node does, and reads the package's own
+   entry point rather than assuming index.js. */
+
+static bool sxn_is_file(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG;
+}
+
+/* A file, or the same name with an extension appended, in this runtime's
+   documented resolution order. Returns a fresh string or NULL. */
+static char *sxn_resolve_file(JSContext *ctx, const char *base) {
+    static const char *ext[] = { "", ".sx", ".mjs", ".js", ".cjs", ".json", ".ts" };
+    char buf[PATH_MAX];
+    for (size_t i = 0; i < sizeof(ext)/sizeof(ext[0]); i++) {
+        if (snprintf(buf, sizeof(buf), "%s%s", base, ext[i]) >= (int)sizeof(buf)) continue;
+        if (sxn_is_file(buf)) return js_strdup(ctx, buf);
+    }
+    /* a directory: index.<ext> */
+    for (size_t i = 1; i < sizeof(ext)/sizeof(ext[0]); i++) {
+        if (snprintf(buf, sizeof(buf), "%s/index%s", base, ext[i]) >= (int)sizeof(buf)) continue;
+        if (sxn_is_file(buf)) return js_strdup(ctx, buf);
+    }
+    return NULL;
+}
+
+/* Walk an "exports" value down to a path string. Conditions nest -- tinybench
+   ships {"import": {"types": ..., "import": "./dist/index.js"}} -- so this
+   recurses, preferring the ESM conditions and ignoring "types", which is a
+   declaration file rather than something to execute. */
+static JSValue sxn_pick_condition(JSContext *ctx, JSValueConst node, int depth) {
+    static const char *cond[] = { "import", "module", "default", "require", "node" };
+    if (JS_IsString(node)) return JS_DupValue(ctx, node);
+    if (!JS_IsObject(node) || depth > 4) return JS_UNDEFINED;
+    for (size_t i = 0; i < sizeof(cond)/sizeof(cond[0]); i++) {
+        JSValue v = JS_GetPropertyStr(ctx, node, cond[i]);
+        JSValue got = sxn_pick_condition(ctx, v, depth + 1);
+        JS_FreeValue(ctx, v);
+        if (!JS_IsUndefined(got)) return got;
+    }
+    return JS_UNDEFINED;
+}
+
+/* Pull a usable entry path out of a package.json. Prefers "exports" for the
+   "." subpath (string form, or an object keyed by condition, checking import
+   then default then require), then "module", then "main". */
+static char *sxn_pkg_entry(JSContext *ctx, const char *pkg_dir) {
+    char manifest[PATH_MAX], cand[PATH_MAX];
+    if (snprintf(manifest, sizeof(manifest), "%s/package.json", pkg_dir) >= (int)sizeof(manifest))
+        return NULL;
+    size_t len = 0;
+    uint8_t *buf = js_load_file(ctx, &len, manifest);
+    if (!buf) return NULL;
+    JSValue json = JS_ParseJSON(ctx, (const char *)buf, len, manifest);
+    js_free(ctx, buf);
+    if (JS_IsException(json)) { JS_FreeValue(ctx, json); return NULL; }
+
+    const char *rel = NULL;
+    JSValue hold = JS_UNDEFINED;
+    JSValue exports = JS_GetPropertyStr(ctx, json, "exports");
+    if (JS_IsString(exports) || JS_IsObject(exports)) {
+        JSValue dot = JS_GetPropertyStr(ctx, exports, ".");
+        JSValue pick = JS_IsUndefined(dot) ? JS_DupValue(ctx, exports) : JS_DupValue(ctx, dot);
+        JS_FreeValue(ctx, dot);
+        hold = sxn_pick_condition(ctx, pick, 0);
+        JS_FreeValue(ctx, pick);
+    }
+    JS_FreeValue(ctx, exports);
+    if (JS_IsUndefined(hold)) {
+        JSValue mod = JS_GetPropertyStr(ctx, json, "module");
+        if (JS_IsString(mod)) hold = JS_DupValue(ctx, mod);
+        JS_FreeValue(ctx, mod);
+    }
+    if (JS_IsUndefined(hold)) {
+        JSValue main = JS_GetPropertyStr(ctx, json, "main");
+        if (JS_IsString(main)) hold = JS_DupValue(ctx, main);
+        JS_FreeValue(ctx, main);
+    }
+    char *out = NULL;
+    if (JS_IsString(hold)) {
+        rel = JS_ToCString(ctx, hold);
+        if (rel) {
+            const char *r = rel;
+            while (r[0] == '.' && r[1] == '/') r += 2;
+            if (snprintf(cand, sizeof(cand), "%s/%s", pkg_dir, r) < (int)sizeof(cand))
+                out = sxn_resolve_file(ctx, cand);
+            JS_FreeCString(ctx, rel);
+        }
+    }
+    JS_FreeValue(ctx, hold);
+    JS_FreeValue(ctx, json);
+    if (!out) out = sxn_resolve_file(ctx, pkg_dir);   /* fall back to index.* */
+    return out;
+}
+
+static char *sxn_module_normalize(JSContext *ctx, const char *base_name,
+                                  const char *name, void *opaque) {
+    (void)opaque;
+    /* Builtins and relative/absolute paths keep the stock behaviour. */
+    if (has_prefix(name, "node:") || has_prefix(name, "qjs:") ||
+        name[0] == '.' || name[0] == '/')
+        return sxn_normalize_relative(ctx, base_name, name);
+
+    /* A bare specifier: "pkg", "@scope/pkg", or either with a subpath. Walk up
+       from the importing module's directory looking for node_modules. */
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", base_name);
+    char *slash = strrchr(dir, '/');
+    if (slash) *slash = 0; else snprintf(dir, sizeof(dir), ".");
+
+    for (;;) {
+        char pkg[PATH_MAX];
+        if (snprintf(pkg, sizeof(pkg), "%s/node_modules/%s", dir, name) < (int)sizeof(pkg)) {
+            /* A subpath ("pkg/lib/x") resolves as a file inside the package;
+               a bare package name resolves through its manifest. */
+            /* The package name is one segment, or two when scoped, so a
+               subpath is whatever follows that. "@scope/pkg" is a bare name;
+               "@scope/pkg/x" and "pkg/x" carry subpaths. */
+            const char *after = name;
+            if (name[0] == '@') {
+                const char *sep = strchr(name + 1, '/');
+                after = sep ? sep + 1 : name + strlen(name);
+            }
+            bool has_subpath = strchr(after, '/') != NULL;
+            char *hit = has_subpath ? sxn_resolve_file(ctx, pkg) : sxn_pkg_entry(ctx, pkg);
+            if (!hit && !has_subpath) hit = sxn_resolve_file(ctx, pkg);
+            if (hit) return hit;
+        }
+        char *up = strrchr(dir, '/');
+        if (!up) break;
+        *up = 0;
+        if (dir[0] == 0) break;
+    }
+    /* Unresolved: hand back the name so the loader reports it the usual way. */
+    return sxn_normalize_relative(ctx, base_name, name);
 }
 
 static JSModuleDef *sxn_module_loader(JSContext *ctx, const char *name, void *opaque,
@@ -111,7 +288,7 @@ static int execute_file(int argc, char **argv, const char *filename,
         fputs("sxn: unable to initialize node compatibility layer\n", stderr);
         goto failure;
     }
-    JS_SetModuleLoaderFunc2(runtime, NULL, sxn_module_loader, js_module_check_attributes, NULL);
+    JS_SetModuleLoaderFunc2(runtime, sxn_module_normalize, sxn_module_loader, js_module_check_attributes, NULL);
     JS_SetHostPromiseRejectionTracker(runtime, js_std_promise_rejection_tracker, NULL);
 
     source = sxn_load_file(context, &length, filename);

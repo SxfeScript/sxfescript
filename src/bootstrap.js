@@ -366,6 +366,97 @@
   Headers.prototype[Symbol.iterator] = Headers.prototype.entries;
   globalThis.Headers = Headers;
 
+  // ---------------- Event / EventTarget / CustomEvent ----------------
+  // The DOM event pattern, which plenty of runtime-agnostic packages expect
+  // even outside a browser: tinybench extends EventTarget to report progress.
+  // There is no node to bubble through here, so capture and bubbling are
+  // accepted and ignored; everything observable on a single target behaves.
+  function Event(type, init) {
+    init = init || {};
+    this.type = String(type);
+    this.bubbles = !!init.bubbles;
+    this.cancelable = !!init.cancelable;
+    this.composed = !!init.composed;
+    this.defaultPrevented = false;
+    this.target = null;
+    this.currentTarget = null;
+    this.eventPhase = 0;
+    this.isTrusted = false;
+    this.timeStamp = performance.now();
+    this._stop = false;
+    this._stopNow = false;
+  }
+  Event.prototype.preventDefault = function () { if (this.cancelable) this.defaultPrevented = true; };
+  Event.prototype.stopPropagation = function () { this._stop = true; };
+  Event.prototype.stopImmediatePropagation = function () { this._stop = true; this._stopNow = true; };
+  Event.NONE = 0; Event.CAPTURING_PHASE = 1; Event.AT_TARGET = 2; Event.BUBBLING_PHASE = 3;
+  globalThis.Event = Event;
+
+  function CustomEvent(type, init) {
+    Event.call(this, type, init);
+    this.detail = init && "detail" in init ? init.detail : null;
+  }
+  CustomEvent.prototype = Object.create(Event.prototype);
+  CustomEvent.prototype.constructor = CustomEvent;
+  globalThis.CustomEvent = CustomEvent;
+
+  function EventTarget() { Object.defineProperty(this, "_listeners", { value: new Map(), writable: true, configurable: true }); }
+  function listenersOf(self, type) {
+    if (!self._listeners) Object.defineProperty(self, "_listeners", { value: new Map(), writable: true, configurable: true });
+    let l = self._listeners.get(type);
+    if (!l) { l = []; self._listeners.set(type, l); }
+    return l;
+  }
+  EventTarget.prototype.addEventListener = function (type, callback, options) {
+    if (callback === null || callback === undefined) return;
+    type = String(type);
+    const opts = typeof options === "boolean" ? { capture: options } : (options || {});
+    const list = listenersOf(this, type);
+    // A duplicate (callback, capture) pair is ignored, per the spec.
+    for (const e of list) if (e.callback === callback && e.capture === !!opts.capture) return;
+    const entry = { callback: callback, once: !!opts.once, capture: !!opts.capture, signal: opts.signal };
+    list.push(entry);
+    if (opts.signal) {
+      if (opts.signal.aborted) { const i = list.indexOf(entry); if (i >= 0) list.splice(i, 1); return; }
+      if (typeof opts.signal.addEventListener === "function")
+        opts.signal.addEventListener("abort", () => { const i = list.indexOf(entry); if (i >= 0) list.splice(i, 1); });
+    }
+  };
+  EventTarget.prototype.removeEventListener = function (type, callback, options) {
+    type = String(type);
+    const capture = typeof options === "boolean" ? options : !!(options && options.capture);
+    const list = this._listeners && this._listeners.get(type);
+    if (!list) return;
+    for (let i = 0; i < list.length; i++)
+      if (list[i].callback === callback && list[i].capture === capture) { list.splice(i, 1); return; }
+  };
+  EventTarget.prototype.dispatchEvent = function (event) {
+    if (!event || typeof event.type !== "string")
+      throw new TypeError("dispatchEvent requires an Event");
+    event.target = this;
+    event.currentTarget = this;
+    event.eventPhase = 2;
+    const list = this._listeners && this._listeners.get(event.type);
+    // Walked live rather than over a copy: a listener registered during
+    // dispatch runs in that same dispatch, and one removed during it does
+    // not. That is what Node does, and what packages are written against.
+    if (list) {
+      for (let i = 0; i < list.length; ) {
+        if (event._stopNow) break;
+        const entry = list[i];
+        if (entry.once) list.splice(i, 1); else i++;
+        const fn = typeof entry.callback === "function" ? entry.callback
+                 : (entry.callback && typeof entry.callback.handleEvent === "function"
+                    ? entry.callback.handleEvent.bind(entry.callback) : null);
+        if (fn) fn.call(this, event);
+      }
+    }
+    event.currentTarget = null;
+    event.eventPhase = 0;
+    return !event.defaultPrevented;
+  };
+  globalThis.EventTarget = EventTarget;
+
   // ---------------- AbortController / AbortSignal ----------------
   function AbortSignal() {
     this._aborted = false;
