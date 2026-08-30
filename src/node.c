@@ -871,6 +871,34 @@ static JSValue js_path_posix_relative(JSContext *ctx, JSValueConst this_val, int
    JS: they already bottom out in native primitives per call (__sxnUtf8*,
    Uint8Array#toHex/fromHex/toBase64/fromBase64), so there's no comparable
    win left to extract without the same ArrayBuffer-internals risk. */
+static JSValue js_sxn_platform(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+#if defined(__APPLE__)
+    return JS_NewString(ctx, "darwin");
+#elif defined(_WIN32)
+    return JS_NewString(ctx, "win32");
+#elif defined(__linux__)
+    return JS_NewString(ctx, "linux");
+#elif defined(__FreeBSD__)
+    return JS_NewString(ctx, "freebsd");
+#else
+    return JS_NewString(ctx, "unknown");
+#endif
+}
+
+static JSValue js_sxn_arch(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return JS_NewString(ctx, "arm64");
+#elif defined(__x86_64__) || defined(_M_X64)
+    return JS_NewString(ctx, "x64");
+#elif defined(__i386__) || defined(_M_IX86)
+    return JS_NewString(ctx, "ia32");
+#else
+    return JS_NewString(ctx, "unknown");
+#endif
+}
+
 static JSValue js_buffer_is_buffer(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
                                     int magic, JSValueConst *func_data) {
     (void)this_val; (void)magic;
@@ -1317,6 +1345,59 @@ static JSModuleDef *sxn_init_module_node_path(JSContext *ctx, const char *name) 
     return m;
 }
 
+/* arcsx: the remaining builtins packages reach for. Each is a plain object
+   built in node_compat.js and exposed on a global; the module wrapper just
+   re-exports its own keys, so adding a function there needs no C change. */
+static const char *node_util_names[] = {
+    "inspect", "format", "promisify", "callbackify", "inherits", "deprecate",
+    "isDeepStrictEqual", "types", "TextEncoder", "TextDecoder",
+};
+static const char *node_os_names[] = {
+    "EOL", "platform", "arch", "type", "release", "hostname", "tmpdir",
+    "homedir", "endianness", "cpus", "totalmem", "freemem", "uptime", "devNull",
+};
+static const char *node_querystring_names[] = { "parse", "stringify", "escape", "unescape" };
+static const char *node_url_names[] = {
+    "URL", "URLSearchParams", "fileURLToPath", "pathToFileURL", "format", "parse",
+};
+static const char *node_assert_names[] = {
+    "ok", "equal", "notEqual", "strictEqual", "notStrictEqual", "deepEqual",
+    "deepStrictEqual", "notDeepStrictEqual", "fail", "throws", "doesNotThrow",
+    "match", "strict", "AssertionError",
+};
+
+/* One shared init: pull the object off its global and re-export its keys. */
+typedef struct { const char *global; const char **names; size_t count; } NodeSimpleModule;
+
+static int node_simple_init(JSContext *ctx, JSModuleDef *m,
+                            const char *global, const char **names, size_t count) {
+    JSValue obj = node_global_lookup(ctx, global);
+    JS_SetModuleExport(ctx, m, "default", JS_DupValue(ctx, obj));
+    for (size_t i = 0; i < count; i++)
+        JS_SetModuleExport(ctx, m, names[i], JS_GetPropertyStr(ctx, obj, names[i]));
+    JS_FreeValue(ctx, obj);
+    return 0;
+}
+
+#define NODE_SIMPLE_MODULE(tag, globalname, namearr)                          \
+    static int node_##tag##_init(JSContext *ctx, JSModuleDef *m) {            \
+        return node_simple_init(ctx, m, globalname, namearr, countof(namearr)); \
+    }                                                                         \
+    static JSModuleDef *sxn_init_module_node_##tag(JSContext *ctx, const char *name) { \
+        JSModuleDef *m = JS_NewCModule(ctx, name, node_##tag##_init);         \
+        if (!m) return NULL;                                                  \
+        JS_AddModuleExport(ctx, m, "default");                                \
+        for (size_t i = 0; i < countof(namearr); i++)                         \
+            JS_AddModuleExport(ctx, m, namearr[i]);                           \
+        return m;                                                             \
+    }
+
+NODE_SIMPLE_MODULE(util, "__sxnUtil", node_util_names)
+NODE_SIMPLE_MODULE(os, "__sxnOs", node_os_names)
+NODE_SIMPLE_MODULE(querystring, "__sxnQuerystring", node_querystring_names)
+NODE_SIMPLE_MODULE(url, "__sxnUrl", node_url_names)
+NODE_SIMPLE_MODULE(assert, "__sxnAssert", node_assert_names)
+
 static const char *node_fs_export_names[] = { "readFileSync", "writeFileSync", "existsSync" };
 
 static int node_fs_init(JSContext *ctx, JSModuleDef *m) {
@@ -1414,6 +1495,10 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
 #endif
     JS_SetPropertyStr(ctx, global, "__sxnExecPath", JS_NewString(ctx, exec_path ? exec_path : "sxn"));
     JS_SetPropertyStr(ctx, global, "__sxnCwd", JS_NewCFunction(ctx, js_sxn_cwd, "__sxnCwd", 0));
+    /* Node names the OS and CPU; packages branch on them. Derived from the
+       compiler's own target macros rather than a runtime uname call. */
+    JS_SetPropertyStr(ctx, global, "__sxnPlatform", JS_NewCFunction(ctx, js_sxn_platform, "__sxnPlatform", 0));
+    JS_SetPropertyStr(ctx, global, "__sxnArch", JS_NewCFunction(ctx, js_sxn_arch, "__sxnArch", 0));
     JS_SetPropertyStr(ctx, global, "__sxnEnvObject", sxn_new_env_object(ctx));
     JS_SetPropertyStr(ctx, global, "__sxnEeOn", JS_NewCFunction(ctx, js_ee_on, "on", 2));
     JS_SetPropertyStr(ctx, global, "__sxnEeOff", JS_NewCFunction(ctx, js_ee_off, "off", 2));
@@ -1459,5 +1544,11 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
     if (!sxn_init_module_node_process(ctx, "node:process")) return -1;
     if (!sxn_init_module_node_fs(ctx, "node:fs")) return -1;
     if (!sxn_init_module_node_fs_promises(ctx, "node:fs/promises")) return -1;
+    if (!sxn_init_module_node_util(ctx, "node:util")) return -1;
+    if (!sxn_init_module_node_os(ctx, "node:os")) return -1;
+    if (!sxn_init_module_node_querystring(ctx, "node:querystring")) return -1;
+    if (!sxn_init_module_node_url(ctx, "node:url")) return -1;
+    if (!sxn_init_module_node_assert(ctx, "node:assert")) return -1;
+    if (!sxn_init_module_node_assert(ctx, "node:assert/strict")) return -1;
     return 0;
 }

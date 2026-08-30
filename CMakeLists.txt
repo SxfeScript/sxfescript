@@ -238,6 +238,8 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # A .ts file as the entry point, not only as an import.
   add_test(NAME sxn-typescript-entry COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/ts/entry.ts)
   # Sxn.serve returns a handle that reports its port and url and can stop.
+  # node:util, os, querystring, url and assert, plus process.platform/arch.
+  add_test(NAME sxn-node-builtins COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_builtins.mjs)
   add_test(NAME sxn-serve-handle COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_handle.mjs)
   set_tests_properties(sxn-serve-handle PROPERTIES TIMEOUT 30 FAIL_REGULAR_EXPRESSION "FAIL")
   add_test(NAME sxn-serve-headers COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_headers.mjs)

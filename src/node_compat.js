@@ -342,6 +342,12 @@
   // round-trip through JS for every read/write.
   process.env = globalThis.__sxnEnvObject;
   delete globalThis.__sxnEnvObject;
+  // Node names these, and packages branch on them for path separators, line
+  // endings and native-binary selection.
+  process.platform = __sxnPlatform();
+  process.arch = __sxnArch();
+  process.version = "v" + (Sxn && Sxn.version ? Sxn.version : "0.0.0");
+  process.versions = { sxn: (Sxn && Sxn.version) || "0.0.0" };
   process.cwd = function () { return __sxnCwd(); };
   process.exit = function (code) { __sxnExit(code === undefined ? 0 : code); };
   // A genuine job-queue microtask (queueMicrotask is itself a thin JS_EnqueueJob
@@ -407,4 +413,256 @@
     writeFile: __sxnWriteFileAsync,
   };
   globalThis.__sxnFsPromises = fsPromises;
+
+  // ---------------- node:util ----------------
+  // The parts packages actually import: promisify, callbackify, inherits,
+  // format, deprecate, and the types guards. inspect is a readable
+  // approximation, not Node's exact formatter.
+  function inspect(v, opts, depth) {
+    opts = opts || {};
+    const max = opts.depth === undefined ? 2 : opts.depth;
+    const seen = opts._seen || new Set();
+    depth = depth || 0;
+    const t = typeof v;
+    if (v === null) return "null";
+    if (t === "string") return depth === 0 && !opts.quoteStrings ? v : JSON.stringify(v);
+    if (t === "number" || t === "boolean" || t === "undefined") return String(v);
+    if (t === "bigint") return String(v) + "n";
+    if (t === "symbol") return v.toString();
+    if (t === "function") return "[Function: " + (v.name || "anonymous") + "]";
+    if (v instanceof Error) return v.stack || (v.name + ": " + v.message);
+    if (v instanceof Date) return v.toISOString();
+    if (v instanceof RegExp) return String(v);
+    if (seen.has(v)) return "[Circular *1]";
+    if (depth > max) return Array.isArray(v) ? "[Array]" : "[Object]";
+    seen.add(v);
+    const sub = Object.assign({}, opts, { _seen: seen, quoteStrings: true });
+    let out;
+    if (Array.isArray(v)) {
+      out = "[ " + v.map((e) => inspect(e, sub, depth + 1)).join(", ") + " ]";
+      if (v.length === 0) out = "[]";
+    } else if (v instanceof Map) {
+      out = "Map(" + v.size + ") {" + (v.size ? " " + [...v].map(([k, val]) =>
+        inspect(k, sub, depth + 1) + " => " + inspect(val, sub, depth + 1)).join(", ") + " " : "") + "}";
+    } else if (v instanceof Set) {
+      out = "Set(" + v.size + ") {" + (v.size ? " " + [...v].map((e) =>
+        inspect(e, sub, depth + 1)).join(", ") + " " : "") + "}";
+    } else if (ArrayBuffer.isView(v)) {
+      out = v.constructor.name + "(" + v.length + ") [ " + Array.from(v).join(", ") + " ]";
+    } else {
+      const keys = Object.keys(v);
+      out = keys.length === 0 ? "{}" : "{ " + keys.map((k) =>
+        (/^[A-Za-z_$][\w$]*$/.test(k) ? k : JSON.stringify(k)) + ": " +
+        inspect(v[k], sub, depth + 1)).join(", ") + " }";
+    }
+    seen.delete(v);
+    return out;
+  }
+
+  function format(...args) {
+    if (typeof args[0] !== "string") return args.map((a) => inspect(a)).join(" ");
+    // With nothing to substitute, Node returns the string untouched -- even
+    // "%%" stays as written.
+    if (args.length === 1) return args[0];
+    let i = 1;
+    let out = args[0].replace(/%[sdifjoOc%]/g, (m) => {
+      if (m === "%%") return "%";
+      if (i >= args.length) return m;
+      const a = args[i++];
+      switch (m) {
+        case "%s": return typeof a === "string" ? a : inspect(a);
+        case "%d": case "%f": return typeof a === "bigint" ? a + "n" : Number(a).toString();
+        case "%i": return typeof a === "bigint" ? a + "n" : parseInt(a, 10).toString();
+        case "%j": try { return JSON.stringify(a); } catch { return "[Circular]"; }
+        case "%o": case "%O": return inspect(a, { depth: 4 });
+        case "%c": return "";
+        default: return m;
+      }
+    });
+    for (; i < args.length; i++) out += " " + (typeof args[i] === "string" ? args[i] : inspect(args[i]));
+    return out;
+  }
+
+  const util = {
+    inspect,
+    format,
+    // Node keeps the custom-inspect symbol here.
+    promisify(fn) {
+      if (typeof fn !== "function") throw new TypeError("promisify expects a function");
+      const wrapped = function (...args) {
+        return new Promise((resolve, reject) => {
+          fn.call(this, ...args, (err, ...values) =>
+            err ? reject(err) : resolve(values.length > 1 ? values : values[0]));
+        });
+      };
+      Object.defineProperty(wrapped, "name", { value: fn.name, configurable: true });
+      return wrapped;
+    },
+    callbackify(fn) {
+      return function (...args) {
+        const cb = args.pop();
+        Promise.resolve(fn.apply(this, args)).then((v) => cb(null, v), (e) => cb(e || new Error("rejected")));
+      };
+    },
+    inherits(ctor, superCtor) {
+      Object.defineProperty(ctor, "super_", { value: superCtor, writable: true, configurable: true });
+      Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
+    },
+    deprecate(fn, msg) {
+      let warned = false;
+      return function (...args) {
+        if (!warned) { warned = true; console.error("DeprecationWarning: " + msg); }
+        return fn.apply(this, args);
+      };
+    },
+    isDeepStrictEqual(a, b) { return deepEqual(a, b, true); },
+    types: {
+      isDate: (v) => v instanceof Date,
+      isRegExp: (v) => v instanceof RegExp,
+      isMap: (v) => v instanceof Map,
+      isSet: (v) => v instanceof Set,
+      isPromise: (v) => v instanceof Promise,
+      isTypedArray: (v) => ArrayBuffer.isView(v) && !(v instanceof DataView),
+      isArrayBuffer: (v) => v instanceof ArrayBuffer,
+      isDataView: (v) => v instanceof DataView,
+      isNativeError: (v) => v instanceof Error,
+      isAsyncFunction: (v) => typeof v === "function" && v.constructor && v.constructor.name === "AsyncFunction",
+      isGeneratorFunction: (v) => typeof v === "function" && v.constructor && v.constructor.name === "GeneratorFunction",
+    },
+    TextEncoder: globalThis.TextEncoder,
+    TextDecoder: globalThis.TextDecoder,
+  };
+  globalThis.__sxnUtil = util;
+
+  // Structural equality, shared by util.isDeepStrictEqual and node:assert.
+  function deepEqual(a, b, strict) {
+    if (strict ? Object.is(a, b) : a == b) return true;
+    if (a === null || b === null || typeof a !== "object" || typeof b !== "object") {
+      return strict ? Object.is(a, b) : a == b;
+    }
+    if (Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
+    if (a instanceof Date) return a.getTime() === b.getTime();
+    if (a instanceof RegExp) return String(a) === String(b);
+    if (Array.isArray(a) !== Array.isArray(b)) return false;
+    if (ArrayBuffer.isView(a)) {
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+      return true;
+    }
+    if (a instanceof Map) {
+      if (a.size !== b.size) return false;
+      for (const [k, v] of a) { if (!b.has(k) || !deepEqual(v, b.get(k), strict)) return false; }
+      return true;
+    }
+    if (a instanceof Set) {
+      if (a.size !== b.size) return false;
+      for (const v of a) if (!b.has(v)) return false;
+      return true;
+    }
+    const ka = Object.keys(a), kb = Object.keys(b);
+    if (ka.length !== kb.length) return false;
+    for (const k of ka) {
+      if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
+      if (!deepEqual(a[k], b[k], strict)) return false;
+    }
+    return true;
+  }
+
+  // ---------------- node:assert ----------------
+  function AssertionError(opts) {
+    const e = new Error(opts.message ||
+      (inspect(opts.actual) + " " + opts.operator + " " + inspect(opts.expected)));
+    e.name = "AssertionError";
+    e.code = "ERR_ASSERTION";
+    e.actual = opts.actual; e.expected = opts.expected; e.operator = opts.operator;
+    return e;
+  }
+  function assert(value, message) {
+    if (!value) throw AssertionError({ message, actual: value, expected: true, operator: "==" });
+  }
+  assert.ok = assert;
+  assert.AssertionError = AssertionError;
+  assert.equal = (a, b, m) => { if (!(a == b)) throw AssertionError({ message: m, actual: a, expected: b, operator: "==" }); };
+  assert.notEqual = (a, b, m) => { if (a == b) throw AssertionError({ message: m, actual: a, expected: b, operator: "!=" }); };
+  assert.strictEqual = (a, b, m) => { if (!Object.is(a, b)) throw AssertionError({ message: m, actual: a, expected: b, operator: "strictEqual" }); };
+  assert.notStrictEqual = (a, b, m) => { if (Object.is(a, b)) throw AssertionError({ message: m, actual: a, expected: b, operator: "notStrictEqual" }); };
+  assert.deepEqual = (a, b, m) => { if (!deepEqual(a, b, false)) throw AssertionError({ message: m, actual: a, expected: b, operator: "deepEqual" }); };
+  assert.deepStrictEqual = (a, b, m) => { if (!deepEqual(a, b, true)) throw AssertionError({ message: m, actual: a, expected: b, operator: "deepStrictEqual" }); };
+  assert.notDeepStrictEqual = (a, b, m) => { if (deepEqual(a, b, true)) throw AssertionError({ message: m, actual: a, expected: b, operator: "notDeepStrictEqual" }); };
+  assert.fail = (m) => { throw AssertionError({ message: m || "Failed", operator: "fail" }); };
+  assert.throws = (fn, _expected, m) => {
+    try { fn(); } catch { return; }
+    throw AssertionError({ message: m || "Missing expected exception.", operator: "throws" });
+  };
+  assert.doesNotThrow = (fn, m) => { fn(); void m; };
+  assert.match = (str, re, m) => { if (!re.test(str)) throw AssertionError({ message: m, actual: str, expected: re, operator: "match" }); };
+  assert.strict = assert;
+  globalThis.__sxnAssert = assert;
+
+  // ---------------- node:os ----------------
+  const os = {
+    EOL: "\n",
+    platform: () => process.platform,
+    arch: () => process.arch,
+    type: () => (process.platform === "darwin" ? "Darwin" : process.platform === "win32" ? "Windows_NT" : "Linux"),
+    release: () => "",
+    hostname: () => "localhost",
+    tmpdir: () => (process.env && (process.env.TMPDIR || process.env.TMP)) || "/tmp",
+    homedir: () => (process.env && process.env.HOME) || "/",
+    endianness: () => "LE",
+    cpus: () => [],
+    totalmem: () => 0,
+    freemem: () => 0,
+    uptime: () => Math.floor(performance.now() / 1000),
+    devNull: "/dev/null",
+  };
+  globalThis.__sxnOs = os;
+
+  // ---------------- node:querystring ----------------
+  const querystring = {
+    parse(str, sep, eq) {
+      const out = Object.create(null);
+      if (typeof str !== "string" || str.length === 0) return out;
+      for (const part of str.split(sep || "&")) {
+        if (!part) continue;
+        const i = part.indexOf(eq || "=");
+        const k = decodeURIComponent((i < 0 ? part : part.slice(0, i)).replace(/\+/g, " "));
+        const v = i < 0 ? "" : decodeURIComponent(part.slice(i + 1).replace(/\+/g, " "));
+        if (k in out) { if (Array.isArray(out[k])) out[k].push(v); else out[k] = [out[k], v]; }
+        else out[k] = v;
+      }
+      return out;
+    },
+    stringify(obj, sep, eq) {
+      if (!obj || typeof obj !== "object") return "";
+      const parts = [];
+      for (const k of Object.keys(obj)) {
+        const v = obj[k];
+        const ek = encodeURIComponent(k);
+        if (Array.isArray(v)) for (const one of v) parts.push(ek + (eq || "=") + encodeURIComponent(one));
+        else parts.push(ek + (eq || "=") + encodeURIComponent(v === undefined || v === null ? "" : v));
+      }
+      return parts.join(sep || "&");
+    },
+    escape: encodeURIComponent,
+    unescape: decodeURIComponent,
+  };
+  globalThis.__sxnQuerystring = querystring;
+
+  // ---------------- node:url ----------------
+  const url = {
+    URL: globalThis.URL,
+    URLSearchParams: globalThis.URLSearchParams,
+    fileURLToPath(u) {
+      const s = typeof u === "string" ? u : String(u);
+      if (!s.startsWith("file://")) throw new TypeError("must be a file: URL");
+      return decodeURIComponent(s.slice(7).replace(/^localhost/, "")) || "/";
+    },
+    pathToFileURL(p) {
+      return new URL("file://" + encodeURI(String(p)).replace(/[?#]/g, encodeURIComponent));
+    },
+    format: (u) => String(u),
+    parse: (s) => { try { return new URL(s); } catch { return null; } },
+  };
+  globalThis.__sxnUrl = url;
 })();
