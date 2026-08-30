@@ -302,6 +302,13 @@
     return this._protocol + slashes + authority + this._pathname + this._search + this._hash;
   };
   URL.prototype.toJSON = function () { return this.toString(); };
+  // Parses-or-not without the cost and noise of a thrown exception.
+  URL.canParse = function (url, base) {
+    try { new URL(url, base); return true; } catch { return false; }
+  };
+  URL.parse = function (url, base) {
+    try { return new URL(url, base); } catch { return null; }
+  };
   globalThis.URL = URL;
 
   // ---------------- Headers ----------------
@@ -326,8 +333,13 @@
   };
   Headers.prototype.append = function (name, value) {
     name = this._norm(name); value = String(value);
-    for (var i = 0; i < this._list.length; i++) {
-      if (this._list[i][0] === name) { this._list[i][1] += ", " + value; return; }
+    // Set-Cookie is the one header that never combines: two cookies joined by
+    // a comma are a single malformed cookie, not two. Every other repeated
+    // name folds into one comma-separated value, per the fetch standard.
+    if (name !== "set-cookie") {
+      for (var i = 0; i < this._list.length; i++) {
+        if (this._list[i][0] === name) { this._list[i][1] += ", " + value; return; }
+      }
     }
     this._list.push([name, value]);
   };
@@ -364,6 +376,13 @@
   Headers.prototype.values = function () { return sortedHeaderList(this).map(function (p) { return p[1]; })[Symbol.iterator](); };
   Headers.prototype.entries = function () { return sortedHeaderList(this).map(function (p) { return p.slice(); })[Symbol.iterator](); };
   Headers.prototype[Symbol.iterator] = Headers.prototype.entries;
+  // Set-Cookie is the one header that must not be joined into a single
+  // comma-separated value, so the standard exposes it separately.
+  Headers.prototype.getSetCookie = function () {
+    const out = [];
+    for (const pair of this._list) if (pair[0].toLowerCase() === "set-cookie") out.push(pair[1]);
+    return out;
+  };
   globalThis.Headers = Headers;
 
   // ---------------- Event / EventTarget / CustomEvent ----------------
@@ -590,6 +609,7 @@
     if (init.signal !== undefined) this.signal = init.signal;
   }
   Object.defineProperty(Request.prototype, "body", { get: function () { return null; } });
+  Request.prototype.clone = function () { return new Request(this); };
   globalThis.Request = Request;
 
   function Response(body, init) {
@@ -670,6 +690,32 @@
     return new Blob([buf], { type: this.headers.get("content-type") || "" });
   };
   Response.prototype.clone = function () { throw new Error("Response.clone() is not supported"); };
+  // Static constructors and clone, which the fetch standard requires and
+  // handlers reach for constantly.
+  Response.json = function (data, init) {
+    init = init || {};
+    const h = new Headers(init.headers);
+    if (!h.has("content-type")) h.set("content-type", "application/json");
+    return new Response(JSON.stringify(data), { status: init.status, statusText: init.statusText, headers: h });
+  };
+  Response.error = function () {
+    const r = new Response(null, { status: 0 });
+    r.type = "error";
+    return r;
+  };
+  Response.redirect = function (url, status) {
+    status = status === undefined ? 302 : status;
+    if ([301, 302, 303, 307, 308].indexOf(status) < 0)
+      throw new RangeError("invalid redirect status " + status);
+    return new Response(null, { status: status, headers: { location: String(new URL(url, "http://localhost/")) } });
+  };
+  Response.prototype.clone = function () {
+    if (this._bodyUsed) throw new TypeError("Response body is already used");
+    const r = new Response(this._staticBytes !== undefined ? this._staticBytes : this._staticBody,
+                           { status: this.status, statusText: this.statusText, headers: this.headers });
+    r.url = this.url; r.type = this.type; r.redirected = this.redirected;
+    return r;
+  };
   globalThis.Response = Response;
 
   // ---------------- fetch() ----------------
@@ -725,8 +771,90 @@
   // frame on every call, ~9.8ns of a ~35ns performance.now().
   globalThis.performance = { now: __sxnNow };
 
+  // ---------------- structuredClone ----------------
+  // A deep clone over the structured-clone graph: cycles preserved, the
+  // built-in containers handled, functions and symbols rejected the way the
+  // standard requires.
+  globalThis.structuredClone = function structuredClone(value, options) {
+    const seen = new Map();
+    const walk = (v) => {
+      if (v === null || typeof v !== "object") {
+        if (typeof v === "function" || typeof v === "symbol")
+          throw new DOMExceptionLike(String(v) + " could not be cloned.", "DataCloneError");
+        return v;
+      }
+      if (seen.has(v)) return seen.get(v);
+      let out;
+      if (Array.isArray(v)) {
+        out = []; seen.set(v, out);
+        for (let i = 0; i < v.length; i++) out[i] = walk(v[i]);
+        return out;
+      }
+      if (v instanceof Date) { out = new Date(v.getTime()); seen.set(v, out); return out; }
+      if (v instanceof RegExp) { out = new RegExp(v.source, v.flags); seen.set(v, out); return out; }
+      if (v instanceof Map) {
+        out = new Map(); seen.set(v, out);
+        for (const [k, val] of v) out.set(walk(k), walk(val));
+        return out;
+      }
+      if (v instanceof Set) {
+        out = new Set(); seen.set(v, out);
+        for (const val of v) out.add(walk(val));
+        return out;
+      }
+      if (v instanceof ArrayBuffer) { out = v.slice(0); seen.set(v, out); return out; }
+      if (ArrayBuffer.isView(v)) {
+        out = new v.constructor(walk(v.buffer), v.byteOffset, v.length !== undefined ? v.length : undefined);
+        seen.set(v, out); return out;
+      }
+      if (v instanceof Error) {
+        out = new v.constructor(v.message); seen.set(v, out);
+        if (v.stack !== undefined) out.stack = v.stack;
+        if (v.cause !== undefined) out.cause = walk(v.cause);
+        return out;
+      }
+      if (typeof v === "function")
+        throw new DOMExceptionLike("function could not be cloned.", "DataCloneError");
+      out = {}; seen.set(v, out);
+      for (const k of Object.keys(v)) out[k] = walk(v[k]);
+      return out;
+    };
+    void options;
+    return walk(value);
+  };
+
+  // A minimal DOMException stand-in: the name is what callers branch on.
+  function DOMExceptionLike(message, name) {
+    const e = new Error(message);
+    e.name = name || "Error";
+    return e;
+  }
+  if (typeof globalThis.DOMException === "undefined") {
+    globalThis.DOMException = function DOMException(message, name) { return DOMExceptionLike(message, name); };
+  }
+
+  // ---------------- navigator ----------------
+  if (typeof globalThis.navigator === "undefined") {
+    globalThis.navigator = Object.freeze({
+      userAgent: "sxn/" + (Sxn && Sxn.version ? Sxn.version : "0"),
+      // WinterCG names this for runtime detection.
+      platform: "",
+    });
+  }
+
   // ---------------- crypto ----------------
   globalThis.crypto = {
+    // RFC 4122 v4 from the same CSPRNG getRandomValues uses.
+    randomUUID: function () {
+      const b = new Uint8Array(16);
+      globalThis.crypto.getRandomValues(b);
+      b[6] = (b[6] & 0x0f) | 0x40;   // version 4
+      b[8] = (b[8] & 0x3f) | 0x80;   // variant 10xx
+      const h = [];
+      for (let i = 0; i < 16; i++) h.push(b[i].toString(16).padStart(2, "0"));
+      return h.slice(0,4).join("") + "-" + h.slice(4,6).join("") + "-" +
+             h.slice(6,8).join("") + "-" + h.slice(8,10).join("") + "-" + h.slice(10,16).join("");
+    },
     getRandomValues: function (typedArray) {
       if (!ArrayBuffer.isView(typedArray)) throw new TypeError("crypto.getRandomValues expects an integer typed array");
       var bytes = __sxnRandomBytes(typedArray.byteLength);

@@ -226,6 +226,9 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   add_test(NAME sxn-module-resolution COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/pkgs/resolve.mjs)
   # Event/EventTarget/CustomEvent, which runtime-agnostic packages expect.
   add_test(NAME sxn-event-target COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/event_target.mjs)
+  # structuredClone, URL.canParse, crypto.randomUUID, Response statics and
+  # clone, Request.clone, Headers.getSetCookie.
+  add_test(NAME sxn-web-apis COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/web_apis.mjs)
   add_test(NAME sxn-serve-headers COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_headers.mjs)
   set_tests_properties(sxn-serve-headers PROPERTIES TIMEOUT 30 FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-performance-now PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
