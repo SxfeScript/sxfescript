@@ -7,6 +7,7 @@
 #include <string.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
@@ -81,6 +82,41 @@ static char *sxn_normalize_relative(JSContext *ctx, const char *base_name,
    up from the importing module the way Node does, and reads the package's own
    entry point rather than assuming index.js. */
 
+/* Collapse "." and ".." segments in place. Without this a chain of relative
+   requires accumulates "./" per hop, so the same file gets a different cache
+   key each time and a cycle recurses until the stack gives out. */
+static void sxn_norm_path(char *p) {
+    char *out = p, *seg = p;
+    int lead_slash = (p[0] == '/');
+    if (lead_slash) { out++; seg++; }
+    char *w = out;
+    while (*seg) {
+        char *end = strchr(seg, '/');
+        size_t n = end ? (size_t)(end - seg) : strlen(seg);
+        if (n == 1 && seg[0] == '.') {
+            /* drop */
+        } else if (n == 2 && seg[0] == '.' && seg[1] == '.') {
+            if (w > out) {                       /* pop one written segment */
+                char *back = w - 1;
+                if (back > out && *back == '/') back--;
+                while (back > out && *back != '/') back--;
+                w = (back == out && *back != '/') ? out : back + (*back == '/' ? 1 : 0);
+                if (w > out) w--;                /* drop the separator too */
+            } else {
+                if (w != out) *w++ = '/';
+                memcpy(w, "..", 2); w += 2;
+            }
+        } else if (n > 0) {
+            if (w != out) *w++ = '/';
+            memmove(w, seg, n); w += n;
+        }
+        if (!end) break;
+        seg = end + 1;
+    }
+    *w = 0;
+    if (lead_slash && p[1] == 0 && w == out) { p[1] = 0; }
+}
+
 static bool sxn_is_file(const char *path) {
     struct stat st;
     return stat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG;
@@ -93,11 +129,13 @@ static char *sxn_resolve_file(JSContext *ctx, const char *base) {
     char buf[PATH_MAX];
     for (size_t i = 0; i < sizeof(ext)/sizeof(ext[0]); i++) {
         if (snprintf(buf, sizeof(buf), "%s%s", base, ext[i]) >= (int)sizeof(buf)) continue;
+        sxn_norm_path(buf);
         if (sxn_is_file(buf)) return js_strdup(ctx, buf);
     }
     /* a directory: index.<ext> */
     for (size_t i = 1; i < sizeof(ext)/sizeof(ext[0]); i++) {
         if (snprintf(buf, sizeof(buf), "%s/index%s", base, ext[i]) >= (int)sizeof(buf)) continue;
+        sxn_norm_path(buf);
         if (sxn_is_file(buf)) return js_strdup(ctx, buf);
     }
     return NULL;
@@ -170,6 +208,182 @@ static char *sxn_pkg_entry(JSContext *ctx, const char *pkg_dir) {
     JS_FreeValue(ctx, json);
     if (!out) out = sxn_resolve_file(ctx, pkg_dir);   /* fall back to index.* */
     return out;
+}
+
+static char *sxn_module_normalize(JSContext *ctx, const char *base_name,
+                                  const char *name, void *opaque);
+
+/* ---- CommonJS ------------------------------------------------------------
+   Most of npm is still CJS, and `require` was simply undefined. Each module
+   gets its own require bound to its own directory, so relative specifiers
+   resolve against the file doing the requiring rather than the process cwd,
+   and results are cached by resolved path so a diamond dependency is
+   evaluated once and shares one exports object. */
+
+static JSValue sxn_cjs_cache(JSContext *ctx) {
+    JSValue g = JS_GetGlobalObject(ctx);
+    JSValue cache = JS_GetPropertyStr(ctx, g, "__sxnCjsCache");
+    if (!JS_IsObject(cache)) {
+        JS_FreeValue(ctx, cache);
+        cache = JS_NewObject(ctx);
+        JS_DefinePropertyValueStr(ctx, g, "__sxnCjsCache", JS_DupValue(ctx, cache), 0);
+    }
+    JS_FreeValue(ctx, g);
+    return cache;
+}
+
+static JSValue sxn_make_require(JSContext *ctx, const char *dir);
+
+/* Resolve a specifier the way require() does: relative and absolute paths by
+   extension, bare names through node_modules. Returns a fresh string. */
+static char *sxn_require_resolve(JSContext *ctx, const char *dir, const char *name) {
+    char buf[PATH_MAX];
+    if (name[0] == '.' || name[0] == '/') {
+        if (snprintf(buf, sizeof(buf), name[0] == '/' ? "%s%s" : "%s/%s",
+                     name[0] == '/' ? "" : dir, name) >= (int)sizeof(buf))
+            return NULL;
+        return sxn_resolve_file(ctx, buf);
+    }
+    /* Bare: reuse the same walk the ESM normalizer does. */
+    char base[PATH_MAX];
+    if (snprintf(base, sizeof(base), "%s/x", dir) >= (int)sizeof(base)) return NULL;
+    char *hit = sxn_module_normalize(ctx, base, name, NULL);
+    if (hit && sxn_is_file(hit)) return hit;
+    js_free(ctx, hit);
+    return NULL;
+}
+
+static JSValue sxn_require_fn(JSContext *ctx, JSValueConst this_val,
+                              int argc, JSValueConst *argv,
+                              int magic, JSValueConst *func_data) {
+    (void)this_val; (void)magic;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "require needs a specifier");
+    const char *name = JS_ToCString(ctx, argv[0]);
+    if (!name) return JS_EXCEPTION;
+
+    /* node: builtins are ES modules here; hand back their namespace so
+       `const path = require("node:path")` behaves like the import. */
+    if (has_prefix(name, "node:") || has_prefix(name, "qjs:")) {
+        JSValue g = JS_GetGlobalObject(ctx);
+        JSValue reg = JS_GetPropertyStr(ctx, g, "__sxnBuiltinRequire");
+        JS_FreeValue(ctx, g);
+        if (JS_IsFunction(ctx, reg)) {
+            JSValueConst a[1] = { argv[0] };
+            JSValue r = JS_Call(ctx, reg, JS_UNDEFINED, 1, a);
+            JS_FreeValue(ctx, reg);
+            JS_FreeCString(ctx, name);
+            return r;
+        }
+        JS_FreeValue(ctx, reg);
+        JSValue e = JS_ThrowReferenceError(ctx, "require('%s') is not available; use import", name);
+        JS_FreeCString(ctx, name);
+        return e;
+    }
+
+    const char *dir = JS_ToCString(ctx, func_data[0]);
+    char *path = dir ? sxn_require_resolve(ctx, dir, name) : NULL;
+    if (dir) JS_FreeCString(ctx, dir);
+    if (!path) {
+        /* Node throws a plain Error with code MODULE_NOT_FOUND here, and
+           code is what callers branch on. */
+        JSValue err = JS_NewError(ctx);
+        char msg[PATH_MAX + 32];
+        snprintf(msg, sizeof(msg), "Cannot find module '%s'", name);
+        JS_SetPropertyStr(ctx, err, "message", JS_NewString(ctx, msg));
+        JS_SetPropertyStr(ctx, err, "code", JS_NewString(ctx, "MODULE_NOT_FOUND"));
+        JS_FreeCString(ctx, name);
+        return JS_Throw(ctx, err);
+    }
+    JS_FreeCString(ctx, name);
+
+    JSValue cache = sxn_cjs_cache(ctx);
+    JSValue hit = JS_GetPropertyStr(ctx, cache, path);
+    if (JS_IsObject(hit)) {          /* already loaded: same exports object */
+        JSValue ex = JS_GetPropertyStr(ctx, hit, "exports");
+        JS_FreeValue(ctx, hit); JS_FreeValue(ctx, cache); js_free(ctx, path);
+        return ex;
+    }
+    JS_FreeValue(ctx, hit);
+
+    size_t len = 0;
+    uint8_t *src = js_load_file(ctx, &len, path);
+    if (!src) {
+        JS_FreeValue(ctx, cache);
+        JSValue e = JS_ThrowReferenceError(ctx, "cannot read module '%s'", path);
+        js_free(ctx, path);
+        return e;
+    }
+
+    /* JSON is a module too, and needs no wrapper. */
+    if (suffix(path, ".json")) {
+        JSValue v = JS_ParseJSON(ctx, (const char *)src, len, path);
+        js_free(ctx, src);
+        if (!JS_IsException(v)) {
+            JSValue rec = JS_NewObject(ctx);
+            JS_SetPropertyStr(ctx, rec, "exports", JS_DupValue(ctx, v));
+            JS_SetPropertyStr(ctx, cache, path, rec);
+        }
+        JS_FreeValue(ctx, cache); js_free(ctx, path);
+        return v;
+    }
+
+    /* module and exports go in the cache before evaluating, so a cycle sees
+       the partially-filled exports rather than recursing forever. */
+    JSValue module_obj = JS_NewObject(ctx);
+    JSValue exports = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, module_obj, "exports", JS_DupValue(ctx, exports));
+    JS_SetPropertyStr(ctx, module_obj, "id", JS_NewString(ctx, path));
+    JS_SetPropertyStr(ctx, cache, path, JS_DupValue(ctx, module_obj));
+
+    char mdir[PATH_MAX];
+    snprintf(mdir, sizeof(mdir), "%s", path);
+    char *sl = strrchr(mdir, '/'); if (sl) *sl = 0; else snprintf(mdir, sizeof(mdir), ".");
+
+    /* Wrap exactly the way Node does, so the file's own `this` is exports. */
+    static const char *pre = "(function (exports, require, module, __filename, __dirname) {";
+    static const char *post = "\n});";
+    size_t total = strlen(pre) + len + strlen(post) + 1;
+    char *code = js_malloc(ctx, total);
+    if (!code) { js_free(ctx, src); JS_FreeValue(ctx, cache); js_free(ctx, path);
+                 JS_FreeValue(ctx, module_obj); JS_FreeValue(ctx, exports); return JS_EXCEPTION; }
+    snprintf(code, total, "%s%.*s%s", pre, (int)len, (const char *)src, post);
+    js_free(ctx, src);
+
+    JSValue fn = JS_Eval(ctx, code, strlen(code), path, JS_EVAL_TYPE_GLOBAL);
+    js_free(ctx, code);
+    if (JS_IsException(fn)) {
+        JS_FreeValue(ctx, cache); js_free(ctx, path);
+        JS_FreeValue(ctx, module_obj); JS_FreeValue(ctx, exports);
+        return fn;
+    }
+    JSValue req = sxn_make_require(ctx, mdir);
+    JSValueConst args[5] = { exports, req, module_obj,
+                             JS_NewString(ctx, path), JS_NewString(ctx, mdir) };
+    JSValue res = JS_Call(ctx, fn, exports, 5, args);
+    JS_FreeValue(ctx, (JSValue)args[3]);
+    JS_FreeValue(ctx, (JSValue)args[4]);
+    JS_FreeValue(ctx, req);
+    JS_FreeValue(ctx, fn);
+    if (JS_IsException(res)) {
+        JS_DeleteProperty(ctx, cache, JS_NewAtom(ctx, path), 0);
+        JS_FreeValue(ctx, cache); js_free(ctx, path);
+        JS_FreeValue(ctx, module_obj); JS_FreeValue(ctx, exports);
+        return res;
+    }
+    JS_FreeValue(ctx, res);
+    /* module.exports may have been replaced wholesale. */
+    JSValue final = JS_GetPropertyStr(ctx, module_obj, "exports");
+    JS_FreeValue(ctx, module_obj); JS_FreeValue(ctx, exports);
+    JS_FreeValue(ctx, cache); js_free(ctx, path);
+    return final;
+}
+
+static JSValue sxn_make_require(JSContext *ctx, const char *dir) {
+    JSValue d = JS_NewString(ctx, dir);
+    JSValueConst data[1] = { d };
+    JSValue fn = JS_NewCFunctionData(ctx, sxn_require_fn, 1, 0, 1, data);
+    JS_FreeValue(ctx, d);
+    return fn;
 }
 
 static char *sxn_module_normalize(JSContext *ctx, const char *base_name,
@@ -293,11 +507,46 @@ static int execute_file(int argc, char **argv, const char *filename,
 
     source = sxn_load_file(context, &length, filename);
     if (!source) { js_std_dump_error(context); goto failure; }
+    /* A CommonJS entry point needs require/module/exports/__dirname in scope,
+       and every module needs a require bound to its own directory. Install a
+       global one anchored at the entry file's directory so ESM can use it too,
+       the way Node's createRequire is used. */
+    {
+        char entry_dir[PATH_MAX];
+        snprintf(entry_dir, sizeof(entry_dir), "%s", filename);
+        char *sl = strrchr(entry_dir, '/');
+        if (sl) *sl = 0; else snprintf(entry_dir, sizeof(entry_dir), ".");
+        JSValue g = JS_GetGlobalObject(context);
+        JS_SetPropertyStr(context, g, "require", sxn_make_require(context, entry_dir));
+        JS_FreeValue(context, g);
+    }
     int flags = suffix(filename, ".cjs") ? JS_EVAL_TYPE_GLOBAL : JS_EVAL_TYPE_MODULE;
-    JSValue value = JS_Eval(context, (const char *)source, length, filename,
-                            flags | (flags == JS_EVAL_TYPE_MODULE ? JS_EVAL_FLAG_COMPILE_ONLY : 0));
-    js_free(context, source);
-    source = NULL;
+    JSValue value;
+    if (flags == JS_EVAL_TYPE_GLOBAL) {
+        /* Run the entry through require() rather than as bare global code, so
+           it gets the same wrapper every other CommonJS module gets and has
+           module, exports, __filename and __dirname in scope. */
+        js_free(context, source);
+        source = NULL;
+        char abs[PATH_MAX];
+        if (filename[0] == '/') snprintf(abs, sizeof(abs), "%s", filename);
+        else {
+            char cwd[PATH_MAX];
+            if (!getcwd(cwd, sizeof(cwd))) cwd[0] = 0;
+            snprintf(abs, sizeof(abs), "%s/%s", cwd, filename);
+        }
+        JSValue g = JS_GetGlobalObject(context);
+        JSValue req = JS_GetPropertyStr(context, g, "require");
+        JSValue spec = JS_NewString(context, abs);
+        JSValueConst a[1] = { spec };
+        value = JS_Call(context, req, JS_UNDEFINED, 1, a);
+        JS_FreeValue(context, spec);
+        JS_FreeValue(context, req);
+        JS_FreeValue(context, g);
+    } else
+    value = JS_Eval(context, (const char *)source, length, filename,
+                            flags | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (source) { js_free(context, source); source = NULL; }
     if (!JS_IsException(value) && flags == JS_EVAL_TYPE_MODULE) {
         if (js_module_set_import_meta(context, value, true, true) < 0) {
             JS_FreeValue(context, value); value = JS_EXCEPTION;
