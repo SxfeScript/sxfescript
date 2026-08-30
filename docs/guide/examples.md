@@ -7,11 +7,16 @@ inlined from those files when this page is built, so it cannot drift out of
 step with them. Clone the repo and run them, or paste one into a file and run
 that.
 
+They are all `.sx`, because that is the language this project is for.
+Everything a `.sx` file can do here, a plain `.js`, `.mjs` or `.ts` file can
+do too — the annotations and the ownership syntax are the only difference, and
+[the quick start](../quickstart/) shows the same program in each.
+
 ## Types and borrows
 
 [`examples/hello.sx`](https://github.com/SxfeScript/sxfescript/blob/main/examples/hello.sx)
 
-<!-- include: examples/hello.sx as ts -->
+<!-- include: examples/hello.sx as sx -->
 
 ```sh
 sxn examples/hello.sx
@@ -31,7 +36,7 @@ describes a struct with declared field order and natural alignment — the same
 layout on every supported target, which is what code crossing into native
 memory needs.
 
-<!-- include: examples/velocity.sx as ts -->
+<!-- include: examples/velocity.sx as sx -->
 
 ```sh
 sxn examples/velocity.sx
@@ -43,16 +48,16 @@ sxn examples/velocity.sx
 
 ## An HTTP server
 
-[`examples/server.mjs`](https://github.com/SxfeScript/sxfescript/blob/main/examples/server.mjs)
+[`examples/server.sx`](https://github.com/SxfeScript/sxfescript/blob/main/examples/server.sx)
 
 The handler receives a `Request` and returns a `Response`. `req.url` is
 absolute, so `new URL(req.url)` gives you the path and query, and
 `await req.json()` reads the body.
 
-<!-- include: examples/server.mjs as js -->
+<!-- include: examples/server.sx as sx -->
 
 ```sh
-sxn examples/server.mjs
+sxn examples/server.sx
 ```
 
 ```
@@ -66,15 +71,15 @@ pick a free one. Pass a real port number to choose it yourself.
 
 ## fetch and streams
 
-[`examples/fetch.mjs`](https://github.com/SxfeScript/sxfescript/blob/main/examples/fetch.mjs)
+[`examples/fetch.sx`](https://github.com/SxfeScript/sxfescript/blob/main/examples/fetch.sx)
 
 A response body is a real `ReadableStream`, so it can be piped and consumed a
 chunk at a time rather than only read whole.
 
-<!-- include: examples/fetch.mjs as js -->
+<!-- include: examples/fetch.sx as sx -->
 
 ```sh
-sxn examples/fetch.mjs
+sxn examples/fetch.sx
 ```
 
 ```
@@ -85,15 +90,16 @@ sxn examples/fetch.mjs
 
 ## Files
 
-[`examples/files.mjs`](https://github.com/SxfeScript/sxfescript/blob/main/examples/files.mjs)
+[`examples/files.sx`](https://github.com/SxfeScript/sxfescript/blob/main/examples/files.sx)
 
-`Sxn.file` and `Sxn.write` are the runtime's own file I/O. `node:fs` works
-too, over the same files, for code that already expects it.
+`Sxn.file` and `Sxn.write` are the runtime's own file I/O. The `node:fs`
+import is the compatibility layer reading the same file back, for code that
+already expects Node.
 
-<!-- include: examples/files.mjs as js -->
+<!-- include: examples/files.sx as sx -->
 
 ```sh
-sxn examples/files.mjs
+sxn examples/files.sx
 ```
 
 ```
@@ -104,15 +110,15 @@ sxn version: 0.0.1
 
 ## Calling a C function
 
-[`examples/ffi.mjs`](https://github.com/SxfeScript/sxfescript/blob/main/examples/ffi.mjs)
+[`examples/ffi.sx`](https://github.com/SxfeScript/sxfescript/blob/main/examples/ffi.sx)
 
 `Sxn.ffi(library, symbol, argumentTypes, returnType)` returns a callable
-JavaScript function, through libffi and `dlopen`.
+function, through libffi and `dlopen`.
 
-<!-- include: examples/ffi.mjs as js -->
+<!-- include: examples/ffi.sx as sx -->
 
 ```sh
-sxn examples/ffi.mjs
+sxn examples/ffi.sx
 ```
 
 ```

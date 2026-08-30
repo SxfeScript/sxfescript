@@ -60,7 +60,7 @@ complete Node-API becomes. A library bundled into the app is not.
 Returns a callable. The libffi call interface is prepared once, here, so the
 returned function is the only thing on the hot path.
 
-```js
+```sx
 const pow = Sxn.ffi("libSystem.B.dylib", "pow", ["f64", "f64"], "f64");
 pow(2, 10);                     // 1024
 ```

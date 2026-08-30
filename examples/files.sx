@@ -1,13 +1,14 @@
-// Reading and writing files. Run it: sxn examples/files.mjs
+// Reading and writing files. Run it: sxn examples/files.sx
 //
 // Sxn.file(path) and Sxn.write(path, data) are the runtime's own file I/O.
-// node:fs works too, for code that already expects it.
+// The node:fs import below is the compatibility layer reading the same file,
+// for code that already expects Node.
 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFile } from "node:fs/promises";
 
-const path = join(tmpdir(), "sxn-example.txt");
+const path: string = join(tmpdir(), "sxn-example.txt");
 
 await Sxn.write(path, "written by the example\n");
 

@@ -84,8 +84,25 @@ def expand_includes(text):
     return INCLUDE_RE.sub(one, text)
 
 
+# GitHub has no highlighter for .sx, and an ```sx fence comes back as flat
+# unhighlighted text. TypeScript's covers the language almost exactly -- it is
+# JavaScript plus the same annotation syntax -- so the fence is relabelled on
+# the way in and the three keywords TypeScript does not know are re-tagged as
+# keywords on the way out. The markdown files stay honest and say `sx`.
+SX_FENCE_RE = re.compile(r"^```sx$", re.M)
+SX_KEYWORDS = ("mut", "safe", "unsafe")
+
+
+def retag_sx_keywords(body):
+    for word in SX_KEYWORDS:
+        body = body.replace(f'<span class="pl-s1">{word}</span>',
+                            f'<span class="pl-k">{word}</span>')
+    return body
+
+
 def render_markdown(text):
     """GitHub's own renderer, through gh so the call is authenticated."""
+    text = SX_FENCE_RE.sub("```ts", text)
     try:
         out = subprocess.run(
             ["gh", "api", "-X", "POST", "/markdown", "-f", "mode=markdown", "-f", "text=" + text],
@@ -154,6 +171,40 @@ def rewrite_links(body, root, repo_url):
     return re.sub(r'href="([^"]*)"', one, body)
 
 
+SOURCE_RE = re.compile(r"<!-- source: (\S+) -->")
+# An inline snippet that is an illustration rather than a runnable file -- the
+# hero's TypeScript-versus-SxfeScript pair. Same renderer, so the hero and the
+# example panels below it are highlighted by one thing rather than two.
+INLINE_RE = re.compile(r"<!-- highlight: (\S+) -->(.*?)<!-- /highlight -->", re.S)
+
+
+def render_index(repo_url):
+    """The landing page's example panels name a file rather than carrying a
+    copy of it, for the same reason the examples page does: a pasted copy goes
+    stale the moment the program is edited, silently. Each marker becomes that
+    file, highlighted by the same renderer the doc pages use."""
+    page = (ROOT / "docs" / "index.html").read_text()
+
+    def one(m):
+        source = (ROOT / m.group(1)).read_text().rstrip()
+        # Drop the file's own header comment. It says how to run the program,
+        # which the panel already shows on the line above and the line below.
+        lines = source.splitlines()
+        while lines and (lines[0].startswith("//") or not lines[0].strip()):
+            lines.pop(0)
+        source = "\n".join(lines)
+        return retag_sx_keywords(render_markdown(f"```sx\n{source}\n```")).strip()
+
+    def inline(m):
+        snippet = html.unescape(m.group(2)).strip("\n")
+        rendered = render_markdown(f"```{m.group(1)}\n{snippet}\n```")
+        return retag_sx_keywords(rendered).strip()
+
+    page = SOURCE_RE.sub(one, page)
+    page = INLINE_RE.sub(inline, page)
+    return page.replace("{{REPO_URL}}", repo_url)
+
+
 def sidebar_html(current_slug, root):
     out = []
     section = None
@@ -192,7 +243,7 @@ def build(out_dir, repo_url):
         text = expand_includes((ROOT / source).read_text())
         # Depth from /docs/<slug>/ back to the site root.
         root = "../../"
-        body = render_markdown(text)
+        body = retag_sx_keywords(render_markdown(text))
         body = add_heading_anchors(body)
         body = wrap_tables(body)
         body = rewrite_links(body, root, repo_url)
@@ -210,6 +261,9 @@ def build(out_dir, repo_url):
         (target / "index.html").write_text(page)
         rendered.append((source, slug, title, description, text))
         print(f"  docs/{slug}/", file=sys.stderr)
+
+    (out_dir / "index.html").write_text(render_index(repo_url))
+    print("  index.html", file=sys.stderr)
 
     # /docs/ itself is the quick start, so the nav link lands somewhere real.
     first = (out_dir / "docs" / PAGES[0][1] / "index.html").read_text()

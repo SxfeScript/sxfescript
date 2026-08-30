@@ -31,11 +31,11 @@ git clone -q "https://github.com/$DOCS_REPO.git" "$tmp"
 
 cp docs/logo.png "$tmp/logo.png"
 cp docs/site.css "$tmp/site.css"
-sed "s#{{REPO_URL}}#$REPO_URL#g" docs/index.html > "$tmp/index.html"
 
-# Every page under /docs/, plus llms.txt and llms-full.txt, generated from the
-# repo's own markdown. Regenerated from scratch each time, so a page whose
-# source file was renamed or dropped does not linger.
+# The landing page, every page under /docs/, and llms.txt/llms-full.txt, all
+# generated from the repo's own markdown and examples. Regenerated from
+# scratch each time, so a page whose source file was renamed or dropped does
+# not linger.
 rm -rf "$tmp/docs"
 scripts/build-docs.py "$tmp" "$REPO_URL"
 

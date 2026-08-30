@@ -34,16 +34,17 @@ surfaces, native calling, bytecode, and the full performance write-up behind
 the two tables below -- lives in [`spec/`](spec/); see that directory's own
 files for each topic.
 
-Complete programs that run as-is are in [`examples/`](examples/):
+Complete programs that run as-is are in [`examples/`](examples/), all of them
+`.sx`:
 
 | File | What it shows |
 |---|---|
 | [`hello.sx`](examples/hello.sx) | Erasable types, `let mut`, and an `&mut` borrow |
 | [`velocity.sx`](examples/velocity.sx) | A primitive-only interface as a fixed-layout struct |
-| [`server.mjs`](examples/server.mjs) | `Sxn.serve` with `Request`/`Response` routing and a JSON body |
-| [`fetch.mjs`](examples/fetch.mjs) | `fetch`, then the same response read as a stream |
-| [`files.mjs`](examples/files.mjs) | `Sxn.file`/`Sxn.write`, and `node:fs` over the same file |
-| [`ffi.mjs`](examples/ffi.mjs) | Calling a C function through `Sxn.ffi` |
+| [`server.sx`](examples/server.sx) | `Sxn.serve` with `Request`/`Response` routing and a JSON body |
+| [`fetch.sx`](examples/fetch.sx) | `fetch`, then the same response read as a stream |
+| [`files.sx`](examples/files.sx) | `Sxn.file`/`Sxn.write`, and `node:fs` over the same file |
+| [`ffi.sx`](examples/ffi.sx) | Calling a C function through `Sxn.ffi` |
 
 ## Install
 
@@ -121,8 +122,8 @@ already loads native code in its engine core on every platform including
 mobile, and has no Node layer to put an addon loader in.)
 
 A third document, **`spec/BYTECODE.md`**, covers `.sxbc`: `sxn compile
-app.js` produces bytecode for distribution (`--strip` drops the compiling
-machine's own paths from it), `sxn --compile-cache app.js` compiles once and
+app.sx` produces bytecode for distribution (`--strip` drops the compiling
+machine's own paths from it), `sxn --compile-cache app.sx` compiles once and
 reuses the result on later launches, and `sxn app.sxbc` runs either one
 directly. Real, measured gains -- see that document for the numbers -- and
 proportional to how much there is to parse: noticeable on a large file,

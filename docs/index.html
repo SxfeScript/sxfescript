@@ -49,6 +49,7 @@
   @media (max-width: 860px) { .hero-grid { grid-template-columns: 1fr; } }
   .compare-hero { display: grid; grid-template-columns: 1fr; gap: 14px; }
   .compare-hero pre { margin: 0; font-size: 12.6px; }
+  .compare-hero .highlight { margin: 0; }
   .compare-label {
     font-family: "JetBrains Mono", monospace; font-size: 11px; letter-spacing: .08em;
     text-transform: uppercase; color: var(--ink-mid); margin: 0 0 8px;
@@ -69,6 +70,9 @@
     color: var(--ink-soft); margin: 0 0 8px;
   }
   .ex-panel pre { position: relative; margin: 0; font-size: 13px; }
+  /* The code block is inlined from the example file at build time and
+     arrives wrapped in .highlight, the way the doc pages get it. */
+  .ex-panel .highlight { margin: 0; }
   .ex-run {
     font-family: "JetBrains Mono", monospace; font-size: 11px; letter-spacing: .1em;
     text-transform: uppercase; color: var(--ink-soft); margin: 18px 0 8px;
@@ -187,20 +191,24 @@
       <div class="compare-hero">
         <div>
           <p class="compare-label">TypeScript: erased at build time</p>
-          <pre><code>function withdraw(acct: Account, n: number) {
+          <!-- highlight: ts -->
+function withdraw(acct: Account, n: number) {
   // nothing here is true at runtime.
   // acct could be null. n could be NaN.
   // tsc already stopped watching.
   acct.balance -= n;
-}</code></pre>
+}
+          <!-- /highlight -->
         </div>
         <div>
           <p class="compare-label">SxfeScript: checked, then run</p>
-          <pre><code>function withdraw(<span class="kw-unsafe">&mut</span> acct: Account, n: i32) {
+          <!-- highlight: sx -->
+function withdraw(&mut acct: Account, n: i32) {
   // acct is a live, exclusive borrow --
   // checked at parse time, not hoped for.
   acct.balance -= n;
-}</code></pre>
+}
+          <!-- /highlight -->
         </div>
       </div>
     </div>
@@ -209,7 +217,7 @@
   <section id="code">
     <h2 class="h">What it looks like</h2>
     <p class="lede-s">
-      Each of these is a real file in
+      Each of these is a real <code>.sx</code> file in
       <a href="{{REPO_URL}}/tree/main/examples"><code>examples/</code></a>, and the
       output under it is what that file actually prints. Nothing here needs a
       config file, a bundler, or a step before <code>sxn</code> runs it.
@@ -223,26 +231,9 @@
     </div>
 
     <div class="ex-panel" data-ex="server">
-      <p class="ex-file">examples/server.mjs</p>
-      <pre><code>const server = Sxn.serve({ port: 0 }, async (req) =&gt; {
-  const url = new URL(req.url);
-
-  if (url.pathname === "/notes" &amp;&amp; req.method === "GET") {
-    return Response.json([...notes].map(([id, text]) =&gt; ({ id, text })));
-  }
-
-  if (url.pathname === "/notes" &amp;&amp; req.method === "POST") {
-    const { text } = await req.json();
-    const id = nextId++;
-    notes.set(id, text);
-    return Response.json({ id, text }, { status: 201 });
-  }
-
-  return new Response("not found", { status: 404 });
-});
-
-console.log(`listening on ${server.url}`);</code></pre>
-      <p class="ex-run">sxn examples/server.mjs</p>
+      <p class="ex-file">examples/server.sx</p>
+      <!-- source: examples/server.sx -->
+      <p class="ex-run">sxn examples/server.sx</p>
       <pre class="ex-out"><code>listening on http://127.0.0.1:56690
 POST /notes -&gt; 201 {"id":2,"text":"written by the example"}
 GET  /notes -&gt; 200 [{"id":1,"text":"the first note"},{"id":2,"text":"written by the example"}]</code></pre>
@@ -250,58 +241,24 @@ GET  /notes -&gt; 200 [{"id":1,"text":"the first note"},{"id":2,"text":"written 
 
     <div class="ex-panel" data-ex="sx" hidden>
       <p class="ex-file">examples/hello.sx</p>
-      <pre><code>interface Counter {
-  hits: i32;
-}
-
-// &amp;mut borrows the counter exclusively: bump can change what it was
-// handed without taking ownership of it.
-function bump(c: <span class="kw-unsafe">&amp;mut</span> Counter): void {
-  c.hits += 1;
-}
-
-<span class="kw-safe">let mut</span> counter: Counter = { hits: 0 };
-bump(&amp;mut counter);
-bump(&amp;mut counter);
-console.log(`counter: ${counter.hits}`);</code></pre>
+      <!-- source: examples/hello.sx -->
       <p class="ex-run">sxn examples/hello.sx</p>
       <pre class="ex-out"><code>counter: 2</code></pre>
     </div>
 
     <div class="ex-panel" data-ex="fetch" hidden>
-      <p class="ex-file">examples/fetch.mjs</p>
-      <pre><code>const res = await fetch("https://example.com/");
-console.log(res.status, res.headers.get("content-type"));
-
-// A response body is a real ReadableStream, so it can be read a
-// chunk at a time instead of all at once.
-const streamed = await fetch("https://example.com/");
-let chunks = 0, characters = 0;
-for await (const chunk of streamed.body.pipeThrough(new TextDecoderStream())) {
-  chunks += 1;
-  characters += chunk.length;
-}
-console.log(`${chunks} chunk(s), ${characters} characters`);</code></pre>
-      <p class="ex-run">sxn examples/fetch.mjs</p>
+      <p class="ex-file">examples/fetch.sx</p>
+      <!-- source: examples/fetch.sx -->
+      <p class="ex-run">sxn examples/fetch.sx</p>
       <pre class="ex-out"><code>200 text/html
 559 bytes
 1 chunk(s), 559 characters</code></pre>
     </div>
 
     <div class="ex-panel" data-ex="ffi" hidden>
-      <p class="ex-file">examples/ffi.mjs</p>
-      <pre><code>const libm = {
-  darwin: "libSystem.B.dylib",
-  linux: "libm.so.6",
-  win32: "msvcrt.dll",
-}[process.platform];
-
-const pow = Sxn.ffi(libm, "pow", ["f64", "f64"], "f64");
-const sqrt = Sxn.ffi(libm, "sqrt", ["f64"], "f64");
-
-console.log("pow(2, 10) =", pow(2, 10));
-console.log("sqrt(144)  =", sqrt(144));</code></pre>
-      <p class="ex-run">sxn examples/ffi.mjs</p>
+      <p class="ex-file">examples/ffi.sx</p>
+      <!-- source: examples/ffi.sx -->
+      <p class="ex-run">sxn examples/ffi.sx</p>
       <pre class="ex-out"><code>pow(2, 10) = 1024
 sqrt(144)  = 12</code></pre>
     </div>

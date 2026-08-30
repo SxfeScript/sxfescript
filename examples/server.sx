@@ -1,13 +1,18 @@
-// An HTTP server. Run it: sxn examples/server.mjs
+// An HTTP server. Run it: sxn examples/server.sx
 //
 // The handler takes a Request and returns a Response, the same two objects a
 // handler on Cloudflare Workers, Deno or Bun receives. `port: 0` asks the OS
 // for a free port; pass a real one to pick it yourself.
 
-const notes = new Map([[1, "the first note"]]);
-let nextId = 2;
+interface Note {
+  id: number;
+  text: string;
+}
 
-const server = Sxn.serve({ port: 0 }, async (req) => {
+const notes: Map<number, string> = new Map([[1, "the first note"]]);
+let mut nextId: number = 2;
+
+const server = Sxn.serve({ port: 0 }, async (req: Request): Promise<Response> => {
   const url = new URL(req.url);
 
   if (url.pathname === "/") {
@@ -15,14 +20,15 @@ const server = Sxn.serve({ port: 0 }, async (req) => {
   }
 
   if (url.pathname === "/notes" && req.method === "GET") {
-    return Response.json([...notes].map(([id, text]) => ({ id, text })));
+    const all: Note[] = [...notes].map(([id, text]) => ({ id, text }));
+    return Response.json(all);
   }
 
   if (url.pathname === "/notes" && req.method === "POST") {
     const { text } = await req.json();
-    const id = nextId++;
-    notes.set(id, text);
-    return Response.json({ id, text }, { status: 201 });
+    const note: Note = { id: nextId++, text };
+    notes.set(note.id, note.text);
+    return Response.json(note, { status: 201 });
   }
 
   return new Response("not found", { status: 404 });

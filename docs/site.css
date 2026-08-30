@@ -154,6 +154,18 @@ nav.top a.navlink.current { color: var(--ink); border-color: var(--accent); }
   mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>');
 }
 
+/* GitHub's renderer emits its own token classes for highlighted code. Map the
+   handful that actually appear onto this site's palette rather than shipping
+   GitHub's stylesheet for them. Shared, because the landing page inlines the
+   same example sources the doc pages do. */
+.pl-c { color: var(--ink-soft); font-style: italic; }
+.pl-k { color: var(--unsafe); }
+.pl-s, .pl-pds, .pl-sr { color: var(--safe); }
+.pl-c1, .pl-cce { color: var(--accent); }
+.pl-en, .pl-e, .pl-ent { color: var(--ink); font-weight: 600; }
+.pl-s1, .pl-smi, .pl-v { color: var(--ink-mid); }
+.highlight pre { margin: 0; }
+
 footer {
   padding: 44px 0 60px; border-top: 1px solid var(--rule-soft); margin-top: 20px;
 }

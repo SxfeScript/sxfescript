@@ -1,7 +1,8 @@
 # Quick start
 
-`sxn` is a single binary. It runs `.sx`, `.ts`, `.js`, `.mjs` and `.cjs`
-files directly, with no build step and nothing to configure first.
+`sxn` is a single binary. It runs `.sx` — this project's own language — plus
+`.ts`, `.js`, `.mjs` and `.cjs`, all directly, with no build step and nothing
+to configure first.
 
 ## Install
 
@@ -34,68 +35,45 @@ rather unpack one yourself.
 
 ## Your first program
 
-Ordinary JavaScript runs as-is. Put this in `hello.js`:
+Put this in `hello.sx`:
 
-```js
-const runtime = typeof Sxn !== "undefined" ? "sxn " + Sxn.version : "something else";
-console.log(`hello from ${runtime}`);
-```
-
-```sh
-sxn hello.js
-```
-
-```
-hello from sxn 0.0.1
-```
-
-## TypeScript, with no build step
-
-Rename it to `hello.ts` and add annotations. `sxn` parses and strips them
-itself, so there is no `tsc` and no bundler in front of it:
-
-```ts
-interface Runtime {
+```sx
+interface Repo {
   name: string;
-  version: string;
+  stars: i32;
 }
 
-function describe(r: Runtime): string {
-  return `hello from ${r.name} ${r.version}`;
-}
+const describe = (repo: Repo): string =>
+  `${repo.name} has ${repo.stars} star${repo.stars === 1 ? "" : "s"}`;
 
-console.log(describe({ name: "sxn", version: Sxn.version }));
+console.log(describe({ name: "sxfescript", stars: 1 }));
 ```
 
 ```sh
-sxn hello.ts
+sxn hello.sx
 ```
 
 ```
-hello from sxn 0.0.1
+sxfescript has 1 star
 ```
 
-Types that can be erased are accepted: aliases, interfaces, `declare`,
-annotations, optional parameters, generics on functions, `as`/`satisfies`,
-and union types. `enum` and `namespace` are rejected on purpose rather than
-stripped, because both emit a real object at runtime in TypeScript, and
-quietly removing them would turn every use of their members into `undefined`:
+That is an ordinary interface and an ordinary annotation, and there is no
+`tsc` and no bundler in front of it. `sxn` parses the types itself and strips
+them as it goes.
 
-```
-SyntaxError: unsupported keyword: enum
-```
+## Ownership and borrows
 
-## `.sx`: ownership and borrows
+`.sx` is the same language with mutation and aliasing made explicit. `let mut`
+is a mutable owner, `let` an immutable one, `&` borrows a value shared, and
+`&mut` borrows it exclusively:
 
-A `.sx` file is the same language with mutation and aliasing made explicit.
-`let mut` is a mutable owner, `let` an immutable one, `&` borrows a value
-shared, and `&mut` borrows it exclusively:
-
-```ts
+```sx
 interface Counter {
   hits: i32;
 }
 
+// &mut borrows the counter exclusively, so bump can change what it was
+// handed without taking ownership of it.
 function bump(c: &mut Counter): void {
   c.hits += 1;
 }
@@ -114,20 +92,24 @@ sxn counter.sx
 counter: 2
 ```
 
-The syntax is parsed natively today. The full control-flow ownership pass
-that enforces every rule in
-[the language contract](../language/) is still being written —
-[the implementation ledger](../implementation/) tracks exactly what is
-checked and what is only parsed, and it is worth reading before you rely on a
-rule being enforced.
+An interface whose fields are all primitives — `i32`, `f32`, `f64`, `bool` —
+describes a fixed-layout struct: declared field order, natural alignment, the
+same layout on every supported target. That is what code crossing into native
+memory needs.
+
+The syntax is parsed natively today. The full control-flow ownership pass that
+enforces every rule in [the language contract](../language/) is still being
+written, and [the implementation ledger](../implementation/) tracks exactly
+what is checked and what is only parsed. It is worth reading before you rely
+on a rule being enforced.
 
 ## An HTTP server
 
 `Sxn.serve` hands your function a `Request` and expects a `Response` back —
 the same pair of objects a handler gets on Cloudflare Workers, Deno or Bun:
 
-```js
-const server = Sxn.serve({ port: 3000 }, async (req) => {
+```sx
+const server = Sxn.serve({ port: 3000 }, async (req: Request): Promise<Response> => {
   const url = new URL(req.url);
   if (url.pathname === "/echo") return Response.json(await req.json());
   return new Response("hello from " + url.pathname);
@@ -137,7 +119,7 @@ console.log(`listening on ${server.url}`);
 ```
 
 ```sh
-sxn server.js
+sxn server.sx
 ```
 
 ```
@@ -148,16 +130,46 @@ listening on http://127.0.0.1:3000
 `server.port` then tells you which one it picked. `server.stop()` shuts the
 listener down, so one process can serve and then go on to do something else.
 
+## JavaScript and TypeScript run too
+
+Nothing above is required. `sxn` runs a plain `.js`, `.mjs`, `.cjs` or `.ts`
+file directly, and a `.sx` module can `import` any of them and vice versa. A
+`.sx` file that uses none of the extra syntax is just JavaScript with a
+different extension.
+
+```js
+const runtime = typeof Sxn !== "undefined" ? "sxn " + Sxn.version : "something else";
+console.log(`hello from ${runtime}`);
+```
+
+```sh
+sxn hello.js
+```
+
+```
+hello from sxn 0.0.1
+```
+
+TypeScript's erasable forms are all accepted: aliases, interfaces, `declare`,
+annotations, optional parameters, generics on functions, `as`/`satisfies`, and
+union types. `enum` and `namespace` are rejected on purpose rather than
+stripped, because both emit a real object at runtime in TypeScript, and
+quietly removing them would turn every use of their members into `undefined`:
+
+```
+SyntaxError: unsupported keyword: enum
+```
+
 ## Precompiling
 
 `sxn compile` writes bytecode that skips parsing on later runs:
 
 ```sh
-sxn compile app.js -o app.sxbc
+sxn compile app.sx -o app.sxbc
 sxn app.sxbc
 ```
 
-`sxn --compile-cache app.js` does the same thing automatically, building the
+`sxn --compile-cache app.sx` does the same thing automatically, building the
 cache on the first launch and reusing it afterwards. The measured gains, and
 the reason bytecode is not a safe format for untrusted input, are in
 [the bytecode spec](../bytecode/).

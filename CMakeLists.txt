@@ -168,6 +168,14 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   add_test(NAME sxfe-frontend COMMAND sxfe-tests)
   add_test(NAME sxn-help COMMAND sxn --help)
   add_test(NAME sxn-example COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/examples/velocity.sx)
+  # The docs site inlines every one of these programs verbatim, so an example
+  # that stops running is a broken code block published to the web. fetch.sx
+  # is left out on purpose: it is the only one that needs the network.
+  foreach(sxn_example hello server files ffi)
+    add_test(NAME sxn-example-${sxn_example}
+             COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/examples/${sxn_example}.sx)
+    set_tests_properties(sxn-example-${sxn_example} PROPERTIES TIMEOUT 30)
+  endforeach()
   add_test(NAME sxn-memory-report COMMAND sxn --memory-report ${CMAKE_CURRENT_SOURCE_DIR}/examples/velocity.sx)
   add_test(NAME sxn-memory-usage COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/memory-usage.sx)
   add_test(NAME sxn-native-safe COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/benchmarks/compute-native-safe.sx)

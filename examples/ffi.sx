@@ -1,11 +1,13 @@
-// Calling a C function directly. Run it: sxn examples/ffi.mjs
+// Calling a C function directly. Run it: sxn examples/ffi.sx
 //
 // Sxn.ffi(library, symbol, argumentTypes, returnType) returns a callable
-// JavaScript function, through libffi and dlopen. This is an engine
+// SxfeScript function, through libffi and dlopen. This is an engine
 // capability, not a Node one -- see spec/NATIVE.md for the type list and for
 // what is deliberately unsupported (structs by value, callbacks, variadics).
 
-const libm = {
+type LibraryName = string;
+
+const libm: LibraryName | undefined = {
   darwin: "libSystem.B.dylib",
   linux: "libm.so.6",
   win32: "msvcrt.dll",

@@ -44,8 +44,8 @@ explicit about where it's calling.
 
 ## Sxn.serve — the HTTP server
 
-```js
-const server = Sxn.serve({ port: 0 }, async (req) => {
+```sx
+const server = Sxn.serve({ port: 0 }, async (req: Request): Promise<Response> => {
   const url = new URL(req.url);
   if (url.pathname === "/echo") return Response.json(await req.json());
   return new Response("hi");
@@ -98,7 +98,7 @@ WebSocket from a `Sxn.serve` handler — works), `ErrorEvent`,
 
 ## `Sxn.ffi` — calling a C function
 
-```js
+```sx
 const pow = Sxn.ffi("libSystem.B.dylib", "pow", ["f64", "f64"], "f64");
 pow(2, 10);   // 1024
 ```

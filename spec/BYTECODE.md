@@ -4,12 +4,12 @@
 instead. This exists for two different reasons that happen to share one
 mechanism:
 
-- **Distribution.** `sxn compile app.js` produces `app.sxbc`; ship that
+- **Distribution.** `sxn compile app.sx` produces `app.sxbc`; ship that
   instead of the source and there is nothing left to parse on the machine
   that finally runs it. `--strip` drops the compiling machine's own file
   paths from the output, for when the source shouldn't be reconstructible
   from a stack trace.
-- **Startup, on a large file.** `sxn --compile-cache app.js` compiles once,
+- **Startup, on a large file.** `sxn --compile-cache app.sx` compiles once,
   caches the result next to the source, and reuses it on every later launch
   until the source changes. This is the same idea already applied to this
   runtime's own bootstrap (see the README's benchmark section), turned into
@@ -40,9 +40,9 @@ anything you'd notice.
 ## `sxn compile <file> [-o out.sxbc] [--strip]`
 
 ```sh
-sxn compile app.js              # writes app.sxbc next to it
-sxn compile app.js -o dist/app.sxbc
-sxn compile app.js --strip -o dist/app.sxbc   # no local paths in the output
+sxn compile app.sx              # writes app.sxbc next to it
+sxn compile app.sx -o dist/app.sxbc
+sxn compile app.sx --strip -o dist/app.sxbc   # no local paths in the output
 ```
 
 Works on anything `sxn` can run as an entry point: `.sx`, `.ts`, `.js`,
