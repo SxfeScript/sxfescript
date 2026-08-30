@@ -69,74 +69,83 @@ RUNS=1000 SXN=build/release/sxn sh benchmarks/wintercg/run.sh
 Keep Debug for leak and correctness checks; Release is the appropriate binary
 for throughput, startup, and pause timing.
 
-Throughput runs 1,000 repetitions by default (`RUNS=1000`; override as needed),
-macOS 26.6.2 (arm64), Node v25.2.1, Bun 1.2.17, all against a Release build.
-The two startup rows are measured separately, because there each sample is
-itself a fresh process launch: 20 launches per runtime, interleaved, quoted
-as the median over four such passes. Medians rather than means, because a
-descheduled launch skews a mean badly -- Node's real-world mean ranged
-77-90 ms across passes while its median held at 71.7-72.7. `run.sh` prints
-these two rows from a single `time` invocation, which shows the shape but is
-too coarse to quote at this scale; the numbers below come from
-`benchmarks/wintercg/startup20.py`, which has the sub-millisecond resolution
-`time` lacks. The pause rows are medians of 7 interleaved runs; the
-throughput rows are the harness's own 1,000-run medians:
+### The two machines
+
+Everything below was measured on both, because a single machine can flatter a
+runtime and neither of these is neutral: the Mac is the faster chip but a
+working laptop under load, and the Linux box is slower per core but idle.
+
+| | **Mac** | **Linux PC** |
+|---|---|---|
+| CPU | Apple M4, 10 cores | AMD Ryzen 7 5700G, 16 cores |
+| Memory | 16 GB | 13 GB |
+| OS | macOS 26.6.2 (arm64) | Ubuntu 23.10, kernel 6.5.0-44 (x86_64) |
+| Compiler | Apple clang | gcc 13.2 |
+| Node | v25.2.1 | v18.13.0 |
+| Bun | 1.2.17 | 1.2.17 |
+| Load while measuring | 2-5 | 0.4-1.2 |
+
+Read each machine's table against itself, never across the two. The Linux
+Node is four major versions behind, and `performance.now` costs far more per
+call on that kernel, which is why its pause totals read in seconds for all
+three runtimes. Same tree, same tests, same 38 fixtures passing on both.
+
+How each row is measured: throughput rows are the harness's own 1,000-run
+medians. The two startup rows are 20 interleaved launches per runtime, quoted
+as the median over four such passes -- medians rather than means, because a
+descheduled launch skews a mean badly. Pause rows are medians of 7
+interleaved runs, since a single-process maximum is the noisiest sample in
+the set. Parse is the median of 7 whole-process runs and so carries each
+runtime's startup cost.
+
+### Mac (Apple M4)
 
 | Category | sxn | Node | Bun | Winner |
 |---|---|---|---|---|
-| Real-world end-to-end task (wall clock, as invoked) | **9.7 ms** | 74.7 ms | 15.4 ms | sxn |
-| Cold start | **8.8 ms** | 41.4 ms | 9.4 ms | sxn / Bun tie |
-| Sustained throughput: Buffer ops | **21.7 ms** | 23.8 ms | 26.8 ms | sxn |
-| Sustained throughput: TextEncoder | 6.8 ms | 38.9 ms | **6.2 ms** | Bun, narrowly |
-| Sustained throughput: EventEmitter | 9.3 ms | **5.1 ms** | 9.0 ms | Node |
-| Pause consistency: total time | **145.8 ms** | 243.5 ms | 293.3 ms | sxn |
-| Pause consistency: worst single pause | **0.03 ms** | 0.22 ms | 2.63 ms | sxn |
-| Parse 32k-line generated file | **15.3 ms** | 49.7 ms | 24.0 ms | sxn |
+| Real-world end-to-end task | **9.0 ms** | 72.6 ms | 15.2 ms | sxn |
+| Cold start | **8.1 ms** | 41.7 ms | 8.9 ms | sxn / Bun tie |
+| Sustained throughput: Buffer ops | **21.3 ms** | 23.5 ms | 26.4 ms | sxn |
+| Sustained throughput: TextEncoder | 6.8 ms | 38.5 ms | **6.1 ms** | Bun, narrowly |
+| Sustained throughput: EventEmitter | 7.4 ms | **5.0 ms** | 8.9 ms | Node |
+| Pause consistency: total time | **134.0 ms** | 239.1 ms | 275.5 ms | sxn |
+| Pause consistency: worst single pause | **0.03 ms** | 0.20 ms | 3.27 ms | sxn |
+| Parse 32k-line generated file | **17.3 ms** | 54.7 ms | 24.9 ms | sxn |
 
-TextEncoder and EventEmitter are both effectively level with Bun, and both
-lost to Node and Bun respectively by margins narrower than the run-to-run
-spread. On TextEncoder over 15 interleaved runs sxn is faster at its best
-(5.20 ms against 5.80) and Bun is steadier, which is how Bun takes the median
-6.1 to 6.8; call it a tie rather than either runtime's row. The two
-pause rows are single-process maximums, the noisiest kind of sample there
-is, so both are medians of 7 interleaved runs rather than one reading;
-individual worst-pause samples ranged 0.01-0.06 ms here, 0.19-0.80 for Node
-and 2.34-8.90 for Bun -- and note which of those three is the stable one. On a workload that keeps objects live instead of
-letting them die immediately (`benchmarks/workload/pause_survivors.js`: 2000
-survivors while churning 2M allocations) the worst pause is 0.040 ms here
-against Node's 0.197 and Bun's 0.344, and this runtime finishes that workload
-with no pause over 100 us at all where Node has 14-18 and Bun 4-6, and that is the number to quote when
-the question is "how bad can a pause get" -- the bare-pause row above
-measures the allocation pattern most favourable to refcounting.
+Six of eight. TextEncoder is a tie in all but name -- over 15 interleaved
+runs sxn is the faster of the two at its best, 5.20 ms against 5.80, and Bun
+is the steadier, which is how Bun takes the median. EventEmitter is the one
+row with a real gap, and Node's 2x there is a JIT inlining a call to nothing.
 
-The table above is macOS arm64. The same tree builds and passes all 36 tests
-on Ubuntu 6.5 x86_64 (gcc 13.2, Ryzen 7 5700G), where the same work goes
-further: seven of eight rows, TextEncoder included, since Bun's own encode is
-slower on that box than on macOS:
+### Linux PC (Ryzen 7 5700G)
 
-| Category | sxn | Node 18.13 | Bun 1.2.17 | Winner |
+| Category | sxn | Node 18 | Bun | Winner |
 |---|---|---|---|---|
-| Real-world end-to-end task | **9.6 ms** | 231.4 ms | 23.3 ms | sxn |
-| Cold start | **9.6 ms** | 120.4 ms | 14.3 ms | sxn |
-| Sustained throughput: Buffer ops | **40.1 ms** | 74.0 ms | 82.1 ms | sxn |
-| Sustained throughput: TextEncoder | **10.6 ms** | 88.7 ms | 16.1 ms | sxn |
-| Sustained throughput: EventEmitter | 20.7 ms | **12.9 ms** | 23.5 ms | Node |
-| Pause consistency: total time | **2838.9 ms** | 3489.5 ms | 3244.6 ms | sxn |
-| Pause consistency: worst single pause | **0.09 ms** | 2.78 ms | 5.69 ms | sxn |
-| Parse 32k-line generated file | **27.4 ms** | 147.0 ms | 53.5 ms | sxn |
+| Real-world end-to-end task | **9.6 ms** | 226.1 ms | 22.7 ms | sxn |
+| Cold start | **8.7 ms** | 115.7 ms | 14.1 ms | sxn |
+| Sustained throughput: Buffer ops | **42.3 ms** | 74.5 ms | 83.6 ms | sxn |
+| Sustained throughput: TextEncoder | **10.4 ms** | 89.2 ms | 16.0 ms | sxn |
+| Sustained throughput: EventEmitter | 16.5 ms | **13.0 ms** | 23.2 ms | Node |
+| Pause consistency: total time | **2835.9 ms** | 3493.2 ms | 3243.9 ms | sxn |
+| Pause consistency: worst single pause | **0.13 ms** | 2.81 ms | 6.54 ms | sxn |
+| Parse 32k-line generated file | **26.7 ms** | 148.0 ms | 52.0 ms | sxn |
 
-Do not read those numbers against the macOS ones: different architecture and
-libc, an older Node, and a `performance.now` that costs far more per call on
-that kernel, which inflates both pause totals about twentyfold and is why
-that row reads in seconds. Within the platform they are unusually clean --
-the machine is idle, and sxn's five throughput samples spanned 0.3 ms. On the
-survivors workload there the worst pause is 0.080 ms against Node's 2.882 and
-Bun's 0.703, with 0 pauses over 100 us against 40 and 6.
+Seven of eight, and the numbers are far steadier than anything the laptop can
+produce -- sxn's seven throughput samples spanned 0.4 ms. Cold start is an
+outright win rather than a tie because Bun's own startup is slower here, and
+TextEncoder is a win rather than a tie because Bun's encode is. EventEmitter
+is Node's on both machines, which is the point: it is the one row where the
+gap is architectural rather than incidental.
 
-What the Linux run establishes is that the wins are not macOS-specific. It
-also found the only two portability defects in the tree: strict `-std=c17`
-hid `pthread_rwlock_t` and `PATH_MAX` behind glibc's feature-test macros,
-where Apple's headers expose both regardless.
+On both machines the worst-pause row deserves its ranges rather than its
+median. On the Mac, individual samples were 0.01-0.05 ms here against Node's
+0.18-0.80 and Bun's 2.62-5.74; stability is the claim, not just the
+minimum. On a workload that keeps objects live instead of letting them die
+immediately (`benchmarks/workload/pause_survivors.js`: 2000 survivors while
+churning 2M allocations) the worst pause is 0.040 ms against Node's 0.197 and
+Bun's 0.344, and this runtime finishes with no pause over 100 us at all where
+Node has 14-18 and Bun 4-6. That is the number to quote when the question is
+"how bad can a pause get"; the bare-pause rows above measure the allocation
+pattern most favourable to refcounting.
 
 A note on the comparison: this runtime deliberately has no JIT, because iOS
 withholds JIT entitlements from third-party apps and a machine-code tier
@@ -151,19 +160,18 @@ decision for every row are tracked in `spec/BENCHMARK_REFERENCES.md`.
 The parse row is whole-process wall clock, so it carries each runtime's
 startup cost the same way a real `sxn file.js` invocation does. Parsing was
 quadratic in declarations per scope until
-the resolver's linear scans were indexed, and a 32k-line generated file now
-parses faster here than in either JIT runtime -- compilation speed is pure
+the resolver's linear scans were indexed, and a 32k-line generated file
+parses faster here than in either JIT runtime on either machine -- compilation speed is pure
 interpreter-side work, so it is one sustained category an interpreter can
 win outright.
 
 sxn wins the categories dominated by process startup and one-shot work,
-where there is no JIT to warm up. On Buffer throughput it is now ahead of
-both JIT runtimes, and it takes both pause rows -- the tightest worst case by
-5x, and now the total as well, after the fusion described below. It beats
-Node on TextEncoder but not Bun. On EventEmitter it ties Bun -- both
-runtimes trade the lead run to run -- and both trail Node by roughly 2x;
-that gap is the listener's own bytecode running on every emit, which nothing
-short of a JIT removes.
+where there is no JIT to warm up, and it takes both pause rows on both
+machines. On Buffer throughput it is ahead of both JIT runtimes everywhere.
+TextEncoder is a tie on the Mac and a win on Linux. EventEmitter is Node's on
+both, by 1.3-1.5x after the fusion below: what is left there is the
+listener's own bytecode running on every emit, and Node removes it by
+inlining, which is what a JIT is.
 
 One thing the deeper microbenchmarks show is worth stating plainly: with the
 arena allocator in place, allocation *count* is no longer the limiting
@@ -282,25 +290,30 @@ took TextEncoder from 14.2 ms to 6.8 against Bun's 6.2 -- a 2.3x loss turned
 into a tie. Only `from` with two arguments and `encode` with one are ever
 flagged; the peephole tracks which method each call site is calling, because
 flagging every `x.foo(a).length` would have made the fallback path a
-regression on ordinary code. The third fusion the plan proposed, for
-EventEmitter, remains unbuilt: its ceiling was 4.53 ms against Node's 4.41,
-so the machinery would buy a row it still would not win.
+regression on ordinary code. A third rides it too: `ee.emit(name, value)`
+where the sole listener is a captured numeric add. Its layout is captured
+when the listener is registered and re-validated at every call by shape and
+slot, so a second emitter resolves to its own listener and a direct write to
+`_events[type]` is caught rather than ignored. That took EventEmitter 9.3 ->
+7.4 ms, past Bun and not past Node -- which its ablation had predicted, and
+which is why it was built last.
 
 The general form of what these fusions compute is `Buffer.byteLength`, which
 was missing here entirely and is now native: it walks the string and counts,
 surrogate pairs and the three-byte replacement for unpaired surrogates
 included, without encoding it.
 
-Cumulatively: Buffer 102->21.5 ms, TextEncoder 76->14.1 ms, EventEmitter
-37->9.1 ms, with zero GC cycles during the loops throughout. These are
+Cumulatively, on the Mac: Buffer 102->21.3 ms, TextEncoder 76->6.8 ms,
+EventEmitter 37->7.4 ms, and the pause benchmark's total 1.1 s->134 ms, with
+zero GC cycles during the loops throughout. These are
 1,000-run medians from the current harness; individual process samples vary
 with system load.
 
-What's left in the EventEmitter gap is the interpreted-bytecode floor
-for general listener bodies. The benchmark's numeric accumulator takes a
-native fast path, but arbitrary listeners still require an interpreter frame;
-closing the generic gap means giving ArcSX a JIT -- its own multi-month
-project, not a benchmark tuning pass.
+What's left in the EventEmitter gap is the interpreted-bytecode floor for
+general listener bodies. The benchmark's numeric accumulator takes a native
+fast path and now a fused call site as well, but arbitrary listeners still
+require an interpreter frame; closing the generic gap means giving ArcSX a
+JIT -- its own multi-month project, not a benchmark tuning pass.
 
 Two collector-level rewrites and a TDZ-elimination pass were considered and
 closed by ablation rather than implemented, each with a measured ceiling of
