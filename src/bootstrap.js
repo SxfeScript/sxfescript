@@ -771,6 +771,68 @@
   // frame on every call, ~9.8ns of a ~35ns performance.now().
   globalThis.performance = { now: __sxnNow };
 
+  // ---------------- File / FormData ----------------
+  // File is a Blob with a name and a modified time; FormData is the multi-map
+  // fetch bodies and form parsing are built on.
+  function File(bits, name, options) {
+    options = options || {};
+    Blob.call(this, bits, options);
+    this.name = String(name);
+    this.lastModified = options.lastModified !== undefined ? options.lastModified : Date.now();
+  }
+  File.prototype = Object.create(Blob.prototype);
+  File.prototype.constructor = File;
+  globalThis.File = File;
+
+  function FormData() { this._entries = []; }
+  function fdNormalize(value, filename) {
+    if (value instanceof File) return filename !== undefined
+      ? new File([value], filename, { type: value.type }) : value;
+    if (value instanceof Blob) return new File([value], filename === undefined ? "blob" : filename, { type: value.type });
+    return String(value);
+  }
+  FormData.prototype.append = function (name, value, filename) {
+    this._entries.push([String(name), fdNormalize(value, filename)]);
+  };
+  FormData.prototype.set = function (name, value, filename) {
+    name = String(name);
+    const v = fdNormalize(value, filename);
+    let placed = false;
+    this._entries = this._entries.filter(([k]) => {
+      if (k !== name) return true;
+      if (placed) return false;
+      placed = true;
+      return true;
+    });
+    const i = this._entries.findIndex(([k]) => k === name);
+    if (i >= 0) this._entries[i] = [name, v]; else this._entries.push([name, v]);
+  };
+  FormData.prototype.get = function (name) {
+    name = String(name);
+    for (const [k, v] of this._entries) if (k === name) return v;
+    return null;
+  };
+  FormData.prototype.getAll = function (name) {
+    name = String(name);
+    return this._entries.filter(([k]) => k === name).map(([, v]) => v);
+  };
+  FormData.prototype.has = function (name) {
+    name = String(name);
+    return this._entries.some(([k]) => k === name);
+  };
+  FormData.prototype.delete = function (name) {
+    name = String(name);
+    this._entries = this._entries.filter(([k]) => k !== name);
+  };
+  FormData.prototype.forEach = function (cb, thisArg) {
+    for (const [k, v] of this._entries.slice()) cb.call(thisArg, v, k, this);
+  };
+  FormData.prototype.entries = function () { return this._entries.map((e) => e.slice())[Symbol.iterator](); };
+  FormData.prototype.keys = function () { return this._entries.map(([k]) => k)[Symbol.iterator](); };
+  FormData.prototype.values = function () { return this._entries.map(([, v]) => v)[Symbol.iterator](); };
+  FormData.prototype[Symbol.iterator] = FormData.prototype.entries;
+  globalThis.FormData = FormData;
+
   // ---------------- structuredClone ----------------
   // A deep clone over the structured-clone graph: cycles preserved, the
   // built-in containers handled, functions and symbols rejected the way the

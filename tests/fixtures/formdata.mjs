@@ -1,0 +1,25 @@
+const L=[];const p=(n,v)=>L.push(n+"="+JSON.stringify(v));
+const fd = new FormData();
+fd.append("a", "1"); fd.append("a", "2"); fd.append("b", "x");
+p("getAll", fd.getAll("a"));
+p("get first", fd.get("a"));
+p("has", [fd.has("a"), fd.has("zz")]);
+fd.set("a", "only");
+p("set collapses", fd.getAll("a"));
+p("set keeps order", [...fd.keys()]);
+fd.delete("b");
+p("after delete", [...fd.keys()]);
+const seen = []; fd.forEach((v, k) => seen.push(k + "=" + v));
+p("forEach", seen);
+p("entries", [...fd].map(([k, v]) => k + ":" + v));
+// File is a Blob with a name
+const f = new File(["hello"], "greet.txt", { type: "text/plain" });
+p("file", [f.name, f.size, f.type, f instanceof Blob]);
+p("file text", await f.text());
+const fd2 = new FormData();
+fd2.append("upload", f);
+p("file in formdata", [fd2.get("upload").name, fd2.get("upload") instanceof File]);
+fd2.append("blob", new Blob(["z"]), "renamed.bin");
+p("blob becomes file", [fd2.get("blob").name, fd2.get("blob") instanceof File]);
+p("number coerced", (() => { const d = new FormData(); d.append("n", 42); return typeof d.get("n"); })());
+console.log(L.join("\n"));
