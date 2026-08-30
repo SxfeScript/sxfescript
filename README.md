@@ -11,6 +11,11 @@ since diverged under its own name, **ArcSX** (see
 
 ## Build
 
+Needs OpenSSL, libcurl, libuv, zlib, and libffi on the system (`brew install
+openssl curl libuv zlib libffi` on macOS; `apt install libssl-dev libcurl4-openssl-dev
+libuv1-dev zlib1g-dev libffi-dev` on Debian/Ubuntu). CMake finds all five and
+fails clearly, naming the missing one, if any aren't there.
+
 ```sh
 cmake --preset debug
 cmake --build --preset debug
@@ -39,18 +44,35 @@ opcode lowering, full control-flow ownership pass, native npm registry backend,
 and semantic LSP features are tracked in `spec/IMPLEMENTATION.md` and are not
 yet represented as complete production implementations.
 
-The runtime also includes native HTTP serving with SSE/WebSocket response modes
-and a libcurl-backed global `fetch`; see `spec/NETWORK.md`. Applications use the
-Bun-style `Sxn` namespace (`Sxn.serve`, `Sxn.file`, `Sxn.write`, `Sxn.fetch`
-and `Sxn.ffi`). The `qjs:*` modules remain internal compatibility modules.
+## What the runtime does
 
-Two separate things call into machine code, and `spec/NATIVE.md` explains why
-they are separate. `Sxn.ffi` calls a C function in a shared library through
-libffi, and belongs to the runtime: it is an engine capability, and it is the
-half that travels when this engine is embedded elsewhere. `.node` addons load
-through a Node-API implementation on QuickJS, and belong to the node: layer:
-that exists only to run npm's compiled addons, and a build without the Node
-surface drops it entirely.
+Two documents cover what actually runs, and split the same way the codebase
+does:
+
+- **`spec/RUNTIME.md`** -- the WinterCG web APIs and the `Sxn` host namespace:
+  `fetch`, `Sxn.serve` (HTTP, SSE, WebSocket upgrade), Web Streams, Web
+  Crypto, `structuredClone`, and `Sxn.ffi` for calling a C function directly.
+  This is the half that travels when the engine is embedded elsewhere, and
+  the only half a mobile build needs.
+- **`spec/NODE.md`** -- what makes `sxn` usable as a Node alternative:
+  CommonJS, `node:` builtins (24 of ~37), and `.node` native-addon loading
+  through a from-scratch Node-API implementation. This half exists to
+  emulate Node and nothing else, so a build with no Node surface drops it
+  and loses nothing on the runtime side.
+
+`spec/NATIVE.md` is the design note behind that split, written against a
+concrete question: when this engine is folded into Rayact, which of `Sxn.ffi`
+and `.node`-addon loading goes with it. (Answer: `Sxn.ffi`, because Rayact
+already loads native code in its engine core on every platform including
+mobile, and has no Node layer to put an addon loader in.)
+
+A third document, **`spec/BYTECODE.md`**, covers `.sxbc`: `sxn compile
+app.js` produces bytecode for distribution (`--strip` drops the compiling
+machine's own paths from it), `sxn --compile-cache app.js` compiles once and
+reuses the result on later launches, and `sxn app.sxbc` runs either one
+directly. Real, measured gains -- see that document for the numbers -- and
+proportional to how much there is to parse: noticeable on a large file,
+negligible on a one-liner.
 
 ## Benchmarks: sxn vs Node vs Bun
 
@@ -110,38 +132,37 @@ runtime's startup cost.
 
 | Category | sxn | Node | Bun | Winner |
 |---|---|---|---|---|
-| Real-world end-to-end task | **8.4 ms** | 77.2 ms | 16.7 ms | sxn |
-| Cold start | **8.3 ms** | 42.6 ms | 9.5 ms | sxn |
-| Sustained throughput: Buffer ops | **19.2 ms** | 23.5 ms | 26.9 ms | sxn |
-| Sustained throughput: TextEncoder | **4.6 ms** | 38.5 ms | 6.2 ms | sxn |
-| Sustained throughput: EventEmitter | 6.6 ms | **5.0 ms** | 9.2 ms | Node |
-| Pause consistency: total time | **143.9 ms** | 263.7 ms | 308.9 ms | sxn |
-| Pause consistency: worst single pause | **0.04 ms** | 1.68 ms | 3.28 ms | sxn |
-| Parse 32k-line generated file | **15.0 ms** | 48.7 ms | 24.0 ms | sxn |
+| Real-world end-to-end task | **10.4 ms** | 76.3 ms | 15.5 ms | sxn |
+| Cold start | **8.4 ms** | 41.6 ms | 9.2 ms | sxn |
+| Sustained throughput: Buffer ops | **19.2 ms** | 23.8 ms | 27.6 ms | sxn |
+| Sustained throughput: TextEncoder | **4.7 ms** | 38.9 ms | 6.3 ms | sxn |
+| Sustained throughput: EventEmitter | 6.6 ms | **5.1 ms** | 9.3 ms | Node |
+| Pause consistency: total time | **147.8 ms** | 242.5 ms | 283.1 ms | sxn |
+| Pause consistency: worst single pause | **0.04 ms** | 0.36 ms | 2.59 ms | sxn |
+| Parse 32k-line generated file | **20.9 ms** | 51.0 ms | 24.3 ms | sxn |
 
-Seven of eight. TextEncoder and cold start both changed hands this pass:
-counting UTF-8 bytes eight units at a time turned a narrow loss into a 1.3x
-win, and compiling the bootstrap at build time rather than parsing it at
-launch took cold start past Bun. EventEmitter is the one row left, and Node's
-1.3x there is a JIT inlining a call to nothing -- an ablation that skips the
-fused call's guards entirely still only reaches 4.7 ms, because roughly a
-third of the row is this interpreter's own loop dispatch.
+Seven of eight, holding steady since the last pass -- these numbers include
+the class-constructor and thread-safe-function work, and neither moved a
+row. EventEmitter is the one Node keeps, and its 1.1x here is a JIT inlining
+a call to nothing: an ablation that skips the fused call's guards entirely
+still only reaches 4.7 ms, because roughly a third of the row is this
+interpreter's own loop dispatch.
 
 ### Linux PC (Ryzen 7 5700G)
 
 | Category | sxn | Node 18 | Bun | Winner |
 |---|---|---|---|---|
-| Real-world end-to-end task | **8.2 ms** | 225.0 ms | 23.4 ms | sxn |
-| Cold start | **8.1 ms** | 114.8 ms | 14.5 ms | sxn |
-| Sustained throughput: Buffer ops | **38.5 ms** | 75.6 ms | 82.8 ms | sxn |
-| Sustained throughput: TextEncoder | **8.5 ms** | 89.1 ms | 16.1 ms | sxn |
-| Sustained throughput: EventEmitter | 14.3 ms | **13.0 ms** | 23.1 ms | Node |
-| Pause consistency: total time | **2899.4 ms** | 3507.0 ms | 3215.8 ms | sxn |
-| Pause consistency: worst single pause | **0.22 ms** | 2.83 ms | 5.63 ms | sxn |
-| Parse 32k-line generated file | **26.1 ms** | 145.0 ms | 53.8 ms | sxn |
+| Real-world end-to-end task | **6.9 ms** | 224.0 ms | 23.2 ms | sxn |
+| Cold start | **7.6 ms** | 117.1 ms | 15.1 ms | sxn |
+| Sustained throughput: Buffer ops | **37.4 ms** | 75.6 ms | 83.0 ms | sxn |
+| Sustained throughput: TextEncoder | **8.6 ms** | 89.2 ms | 16.2 ms | sxn |
+| Sustained throughput: EventEmitter | 14.8 ms | **13.0 ms** | 23.2 ms | Node |
+| Pause consistency: total time | **2836.0 ms** | 3463.2 ms | 3219.4 ms | sxn |
+| Pause consistency: worst single pause | **0.30 ms** | 4.96 ms | 5.67 ms | sxn |
+| Parse 32k-line generated file | **34.8 ms** | 144.3 ms | 54.1 ms | sxn |
 
 Seven of eight, and the numbers are far steadier than anything the laptop can
-produce. Both machines now agree on which row is which: sxn takes everything
+produce. Both machines agree on which row is which: sxn takes everything
 except EventEmitter, and that one is Node's on both, which is the point --
 it is the one row where the gap is architectural rather than incidental. The
 Linux gap is the narrower of the two, 1.1x against the Mac's 1.3x.

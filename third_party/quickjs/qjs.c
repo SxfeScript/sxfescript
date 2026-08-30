@@ -374,7 +374,7 @@ static const JSMallocFunctions mi_mf = {
 
 void help(int exit_status)
 {
-    printf("QuickJS-ng version %s\n"
+    printf("ArcSX version %s (QuickJS-ng base)\n"
            "usage: " PROG_NAME " [options] [file [args]]\n"
            "-h  --help         list options\n"
            "-v  --version      print version string and then exit\n"

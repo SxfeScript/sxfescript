@@ -28,18 +28,23 @@
   transformer lowers it to the `Sxn.ffi` call that now works.
 - Native SX execution is unconditional; `SXN_NATIVE_SX` is no longer read
   and has no effect.
+- `.sxbc` precompiled bytecode: `sxn compile`, `sxn --compile-cache`, and
+  running a `.sxbc` file directly all work, for both module and CommonJS
+  entries. `spec/BYTECODE.md` has the format, the measured gains, and the
+  trust boundary (bytecode is not a safe format for untrusted input).
+- The vendored QuickJS-ng tooling (`qjs`, `qjsc`) reports itself as ArcSX in
+  every user-visible banner and in the comment `qjsc` writes atop a
+  generated header; `third_party/QUICKJS-PROVENANCE.md` has the lineage this
+  is built on.
 
 ## Performance shape (measured, benchmarks/wintercg/run.sh)
 
-- sxn wins: process cold start (~0.01s vs node ~0.04-0.07s), worst-case
-  pause consistency under sustained allocation (0.05ms vs 0.21ms worst
-  single pause over 2M allocations), and `safe`-kernel scalar loops
-  (native loop fusion beats node outright at any iteration count).
-- node/V8 wins: sustained throughput on allocation- and call-heavy loops
-  (2x-30x depending on workload) because V8 JIT-compiles hot code and
-  QuickJS interprets. The floor is intrinsic: a bare indirect function
-  call in a loop is ~18x slower interpreted than JIT-inlined. Closing it
-  in general requires a JIT tier, tracked as future work, not claimed.
+- sxn wins seven of the eight README benchmark categories on both measured
+  machines: startup, cold start, Buffer and TextEncoder throughput, both
+  pause-consistency rows, and whole-process parse time. EventEmitter is
+  Node's by 1.1-1.3x, and that gap is architectural rather than incidental
+  -- see the README for the measurement and `spec/NATIVE.md`'s note on why a
+  JIT tier isn't coming.
 
 ## Measured performance ceiling (why some gaps are not tunable)
 
@@ -289,33 +294,6 @@ written to measure. Sweeping for anomalous *shapes* found in one sitting
 several defects that mattered more to real programs than any benchmark row
 in the suite.
 
-## Known: object literals rebuild their intermediate shapes
-
-Building `{a: 1, b: 2}` transitions empty -> {a} -> {a,b}. The shape hash
-table holds no reference, so a shape dies with its last object -- and the
-intermediate {a} has no holder at all. It is created, hashed, used for one
-property store, then freed, on every literal.
-
-Measured with `benchmarks/engine/shape_churn_probe.js`, which keeps an
-`{a:0}` object alive from JS for no reason other than to pin that shape:
-`{a,b}` literal creation goes 103.1 -> 78.7 ns, about 24%, on one of the
-most common operations in any program. Node builds the same literal in
-~4 ns.
-
-An attempt to fix this with a bounded keep-alive ring of recently hashed
-shapes **segfaults**, and the reason is worth recording. In add_property's
-transition path the freshly cloned shape is used under
-`assert(JS_REF_COUNT(p->shape) == 1)`: add_shape_property mutates it in
-place precisely because it is known to be unshared. Taking a reference for a
-cache makes it shared, and the in-place mutation then corrupts a shape other
-objects can reach. Any fix has to take its reference *after* the shape is
-complete, or make the table an owner and let the cycle collector reclaim
-shape->proto->shape cycles -- not simply pin the shape mid-transition.
-
-The ad-hoc pinning of Buffer/Uint8Array/ArrayBuffer shapes in
-`sxn_pin_core_shapes` (src/node.c) is the same problem solved narrowly for
-three known types; a general fix would subsume it.
-
 ## Fixed: parsing was quadratic in declarations per scope
 
 A 32k-line file of top-level `let`s took 1.03 s against Node's 0.05 s,
@@ -368,43 +346,9 @@ The ad-hoc pinning of Buffer/Uint8Array/ArrayBuffer shapes in
 `sxn_pin_core_shapes` (src/node.c) is the same problem solved narrowly for
 three known types; a general fix would subsume it.
 
-## Known: parsing is still quadratic in declarations per scope
-
-Parsing a file with many declarations in one scope is O(N^2). A 32k-line
-file of top-level `let`s takes ~0.73 s against Node's 0.06 s, and the cost
-grows quadratically -- large bundles and generated code pay it, and it
-undercuts the cold-start advantage that is this runtime's main strength.
-
-The cause is a set of linear scans, each run once per declaration or
-reference. Two on the *parse* path are fixed (`find_var_in_child_scope` and
-`find_global_var`, the latter given the same open-addressed index that
-`find_var` already had), worth ~29%: 1.03 -> 0.73 s at 32k lines.
-
-The remaining one is in the *resolution* pass, and is located precisely:
-`resolve_scope_var` walks `s->scopes[scope_level].first` down `vd->scope_next`
-to match a name. The chain is ordered most-recent-first, so at parse time a
-declaration finds itself immediately -- but `resolve_variables` runs later,
-over the whole function, when the chain holds every variable in scope. A
-reference to an early variable then walks the entire chain, giving O(N/2)
-per reference and O(N^2) overall. A 60k-declaration file profiles as
-`resolve_scope_var` 1086 samples and `resolve_variables` 721, with
-`define_var` no longer significant.
-
-Fixing it needs a real index rather than the negative-filter trick used on
-the parse path, because the lookup must return *which* variable matches, not
-merely whether one exists: an index keyed by (scope chain, name), or a
-per-name chain of variable indices that resolution can search in scope
-order. Redeclaration in a single scope is already an error, so a name maps
-to at most one variable per scope level -- the difficulty is only that the
-chain spans enclosing scopes.
-
-Reproducer: `benchmarks/engine/parse_scale.js` (32k declarations); generate
-other sizes to confirm the curve. Any fix must keep
-`tests/fixtures/declaration_scoping.mjs` passing -- redeclaration errors,
-block shadowing, TDZ and per-iteration closure capture all depend on these
-lookups being exact.
-
 ## Required production completion
+
+Architectural work with no shortcut, still outstanding:
 
 - Replace the conservative source transformer with QuickJS parser-mode changes
   and shared parser tables for the LSP.
@@ -414,5 +358,11 @@ lookups being exact.
 - Replace the npm bootstrap delegation with the pinned native registry,
   integrity, extraction, resolver, lockfile, and trusted-hook implementation.
 - Implement semantic LSP requests and parser-conformance sharing.
-- Add libuv-backed Node-compatible timers/files/fetch modules and the complete
-  platform CI matrix.
+- The complete platform CI matrix.
+
+What used to be listed here and now isn't: libuv-backed Node-compatible
+timers, file, and fetch modules shipped (`spec/RUNTIME.md`, `spec/NODE.md`).
+Remaining gaps in that surface -- `child_process`, `worker_threads`, generic
+classes, decorators -- are tracked as feature gaps in those two documents
+rather than as foundational work; they don't block anything else on this
+list.

@@ -1,4 +1,4 @@
-/* File generated automatically by the QuickJS-ng compiler. */
+/* File generated automatically by the ArcSX compiler. */
 
 #include <inttypes.h>
 

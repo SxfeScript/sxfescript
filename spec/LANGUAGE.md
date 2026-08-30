@@ -2,8 +2,14 @@
 
 SxfeScript uses `.sx`. JavaScript is the host language; ordinary JS values keep
 ordinary JS semantics. Types that can be erased without generating runtime code
-are accepted. JSX, enums, namespaces, decorators, and parameter properties are
-rejected.
+are accepted: type aliases, interfaces, `declare`, type-only exports,
+annotations, optional parameters, generics on functions, `as`/`satisfies`, and
+union types. `enum` and `namespace` are rejected deliberately rather than
+erased -- both emit a runtime object in real TypeScript, so silently stripping
+them would turn every use of their members into `undefined`. JSX, decorators,
+parameter properties, generic classes, and non-null assertions are rejected
+because they are simply not implemented yet, not because they've been ruled
+out.
 
 `safe` is an optional contextual qualifier for `let` and `const`. It marks a
 binding as type-stable for runtime validation and optimization; ordinary

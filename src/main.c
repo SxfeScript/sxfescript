@@ -205,6 +205,241 @@ static bool sxn_entry_is_commonjs(JSContext *ctx, const char *filename) {
     }
 }
 
+/* -------------------------------------------------------------------------
+ * .sxbc: precompiled bytecode for a single entry file.
+ *
+ * A file this runtime is handed is normally source text, parsed fresh on
+ * every launch. .sxbc skips that: `sxn compile` writes the parsed form once,
+ * `sxn app.sxbc` (or `sxn --compile-cache app.js`, which writes and then
+ * reads its own cache) loads it directly. The format is 5 bytes of this
+ * runtime's own header -- so a version mismatch or a foreign file gets a
+ * clear error instead of a QuickJS-internal one -- followed by whatever
+ * JS_WriteObject produced.
+ *
+ * The one thing this format cannot skip is module resolution: a module
+ * compiled ahead of time still has to have its `import`s resolved against
+ * the loader when it's read back, because that resolution didn't happen at
+ * parse time the way it does for JS_Eval'd source. JS_ResolveModule is that
+ * step; the module case below is JS_ReadObject, JS_ResolveModule,
+ * js_module_set_import_meta, JS_EvalFunction, in that order -- the same
+ * sequence quickjs-libc's own js_std_eval_binary uses for a compiled module,
+ * just with our own dispatch on top of it. */
+#define SXN_SXBC_MAGIC "SXB1"
+#define SXN_SXBC_KIND_MODULE 0
+#define SXN_SXBC_KIND_CJS 1
+
+/* The CommonJS wrapper text, exactly what sxn_require_fn wraps a source file
+   in below -- kept here too so a compiled .cjs function can be called with
+   the same five arguments require() gives it. */
+static const char *sxn_cjs_wrap_pre =
+    "(function (exports, require, module, __filename, __dirname) {";
+static const char *sxn_cjs_wrap_post = "\n});";
+
+/* Defined below (needs the require() machinery); used by sxn_run_sxbc for a compiled CommonJS entry. */
+static JSValue sxn_make_require(JSContext *ctx, const char *dir);
+
+static int sxn_write_sxbc(const char *path, uint8_t kind, const uint8_t *buf, size_t len) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    int ok = fwrite(SXN_SXBC_MAGIC, 1, 4, f) == 4 &&
+             fwrite(&kind, 1, 1, f) == 1 &&
+             (len == 0 || fwrite(buf, 1, len, f) == len);
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) unlink(path);
+    return ok ? 0 : -1;
+}
+
+/* Derives `out.sxbc` from a source filename: replaces a recognized source
+   extension, or appends `.sxbc` to anything else (an extensionless CLI, or
+   a name that's already unfamiliar) rather than guessing wrong. */
+static void sxn_sxbc_default_path(char *out, size_t out_size, const char *src) {
+    static const char *known[] = { ".sx", ".ts", ".mjs", ".mts", ".cjs", ".js" };
+    size_t len = strlen(src);
+    for (size_t i = 0; i < sizeof(known)/sizeof(known[0]); i++) {
+        size_t k = strlen(known[i]);
+        if (len >= k && !strcasecmp(src + len - k, known[i])) {
+            snprintf(out, out_size, "%.*s.sxbc", (int)(len - k), src);
+            return;
+        }
+    }
+    snprintf(out, out_size, "%s.sxbc", src);
+}
+
+/* Compiles `filename` (module or CommonJS, exactly as execute_file would run
+   it) to bytecode and writes it to `out_path`. Returns 0 on success; on
+   failure, prints the parse error and returns -1. `context` must not yet
+   have run anything the compiled code depends on -- compiling is a pure
+   parse, so this is safe to call before or after normal setup. */
+static int sxn_compile_file(JSContext *ctx, const char *filename, const char *out_path,
+                            bool strip) {
+    size_t len = 0;
+    uint8_t *src = js_load_file(ctx, &len, filename);
+    if (!src) {
+        fprintf(stderr, "sxn: cannot open '%s': %s\n", filename, strerror(errno));
+        return -1;
+    }
+    /* JS_WRITE_OBJ_STRIP_SOURCE/STRIP_DEBUG drop the line-number and local-
+       variable tables, but not the compiled function's own script name --
+       that's load-bearing (import.meta.url, module identity) and stays
+       embedded regardless. So --strip's actual privacy job is done here: the
+       name QuickJS embeds is whatever this call passes as `filename`, and
+       for a stripped build that's the bare basename, not the path the
+       compiling machine happens to keep the source at. */
+    const char *eval_name = filename;
+    if (strip) {
+        const char *b = strrchr(filename, '/');
+        eval_name = b ? b + 1 : filename;
+    }
+    bool cjs = sxn_entry_is_commonjs(ctx, filename);
+    JSValue compiled;
+    if (cjs) {
+        if (len >= 2 && src[0] == '#' && src[1] == '!') {
+            size_t i = 0;
+            while (i < len && src[i] != '\n') src[i++] = ' ';
+        }
+        size_t total = strlen(sxn_cjs_wrap_pre) + len + strlen(sxn_cjs_wrap_post) + 1;
+        char *code = js_malloc(ctx, total);
+        if (!code) { js_free(ctx, src); return -1; }
+        snprintf(code, total, "%s%.*s%s", sxn_cjs_wrap_pre, (int)len, (const char *)src,
+                 sxn_cjs_wrap_post);
+        js_free(ctx, src);
+        compiled = JS_Eval(ctx, code, strlen(code), eval_name,
+                           JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+        js_free(ctx, code);
+    } else {
+        compiled = JS_Eval(ctx, (const char *)src, len, eval_name,
+                           JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+        js_free(ctx, src);
+    }
+    if (JS_IsException(compiled)) {
+        js_std_dump_error(ctx);
+        JS_FreeValue(ctx, compiled);
+        return -1;
+    }
+    size_t bc_len = 0;
+    /* Line/variable tables gone too, on top of the bare filename above: a
+       stripped error reports a bytecode offset, not a source line. */
+    int write_flags = JS_WRITE_OBJ_BYTECODE |
+        (strip ? (JS_WRITE_OBJ_STRIP_SOURCE | JS_WRITE_OBJ_STRIP_DEBUG) : 0);
+    uint8_t *bc = JS_WriteObject(ctx, &bc_len, compiled, write_flags);
+    JS_FreeValue(ctx, compiled);
+    if (!bc) {
+        fprintf(stderr, "sxn: cannot serialize '%s' to bytecode\n", filename);
+        return -1;
+    }
+    int rc = sxn_write_sxbc(out_path, cjs ? SXN_SXBC_KIND_CJS : SXN_SXBC_KIND_MODULE, bc, bc_len);
+    js_free(ctx, bc);
+    if (rc != 0) {
+        fprintf(stderr, "sxn: cannot write '%s': %s\n", out_path, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/* Loads and evaluates a .sxbc file as the entry point. Returns the value
+   execute_file's normal post-processing (top-level await, error dump) should
+   receive -- a promise for a module, or the require()-equivalent
+   module.exports for a compiled CommonJS function -- or JS_EXCEPTION with
+   the error already reported. */
+static JSValue sxn_run_sxbc(JSContext *ctx, const char *filename) {
+    size_t len = 0;
+    uint8_t *buf = js_load_file(ctx, &len, filename);
+    if (!buf) {
+        fprintf(stderr, "sxn: cannot open '%s': %s\n", filename, strerror(errno));
+        return JS_EXCEPTION;
+    }
+    if (len < 5 || memcmp(buf, SXN_SXBC_MAGIC, 4) != 0) {
+        js_free(ctx, buf);
+        fprintf(stderr, "sxn: '%s' is not a recognized .sxbc file "
+                        "(wrong format, or compiled by a different version -- recompile it)\n",
+                filename);
+        return JS_EXCEPTION;
+    }
+    uint8_t kind = buf[4];
+    JSValue obj = JS_ReadObject(ctx, buf + 5, len - 5, JS_READ_OBJ_BYTECODE);
+    js_free(ctx, buf);
+    if (JS_IsException(obj)) { js_std_dump_error(ctx); return JS_EXCEPTION; }
+
+    if (kind == SXN_SXBC_KIND_MODULE) {
+        /* use_realpath=false, matching quickjs-libc's own js_std_eval_binary
+           for a compiled module: the embedded name may not exist on disk at
+           this exact path any more -- --strip made sure of that on purpose,
+           and even an unstripped .sxbc is meant to run somewhere other than
+           the machine that compiled it. realpath() would either fail loudly
+           (this crashed with "realpath failure" before the fix) or silently
+           resolve to the wrong file if something else now sits at that path. */
+        if (JS_ResolveModule(ctx, obj) < 0 ||
+            js_module_set_import_meta(ctx, obj, false, false) < 0) {
+            js_std_dump_error(ctx);
+            JS_FreeValue(ctx, obj);
+            return JS_EXCEPTION;
+        }
+        return JS_EvalFunction(ctx, obj);
+    }
+
+    if (kind != SXN_SXBC_KIND_CJS) {
+        JS_FreeValue(ctx, obj);
+        fprintf(stderr, "sxn: '%s' has an unrecognized .sxbc kind byte -- recompile it\n", filename);
+        return JS_EXCEPTION;
+    }
+
+    /* `obj` right now is the *compiled top-level script* "(function(...) {
+       ... });", not the function itself -- getting the function out means
+       running that script, the same way JS_Eval without COMPILE_ONLY would
+       have. Its completion value (an expression statement's value) is the
+       function object, which is what compiling the .cjs source, rather than
+       calling JS_Eval on it directly, deferred to here. */
+    obj = JS_EvalFunction(ctx, obj);
+    if (JS_IsException(obj)) { js_std_dump_error(ctx); return JS_EXCEPTION; }
+
+    char abs[PATH_MAX], dir[PATH_MAX];
+    if (filename[0] == '/') snprintf(abs, sizeof(abs), "%s", filename);
+    else {
+        char cwd[PATH_MAX];
+        if (!getcwd(cwd, sizeof(cwd))) cwd[0] = 0;
+        snprintf(abs, sizeof(abs), "%s/%s", cwd, filename);
+    }
+    snprintf(dir, sizeof(dir), "%s", abs);
+    char *sl = strrchr(dir, '/'); if (sl) *sl = 0; else snprintf(dir, sizeof(dir), ".");
+
+    JSValue module_obj = JS_NewObject(ctx);
+    JSValue exports = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, module_obj, "exports", JS_DupValue(ctx, exports));
+    JSValue req = sxn_make_require(ctx, dir);
+    JSValueConst args[5] = { exports, req, module_obj, JS_NewString(ctx, abs), JS_NewString(ctx, dir) };
+    JSValue res = JS_Call(ctx, obj, exports, 5, args);
+    JS_FreeValue(ctx, (JSValue)args[3]);
+    JS_FreeValue(ctx, (JSValue)args[4]);
+    JS_FreeValue(ctx, req);
+    JS_FreeValue(ctx, obj);
+    if (JS_IsException(res)) {
+        js_std_dump_error(ctx);
+        JS_FreeValue(ctx, module_obj); JS_FreeValue(ctx, exports);
+        return res;
+    }
+    JS_FreeValue(ctx, res);
+    JSValue final = JS_GetPropertyStr(ctx, module_obj, "exports");
+    JS_FreeValue(ctx, module_obj); JS_FreeValue(ctx, exports);
+    return final;
+}
+
+/* Checks whether `cache_path` is a valid, up-to-date .sxbc for `source_path`
+   -- exists, has this runtime's magic header, and is not older than the
+   source. A source rewritten after its cache was written must not be served
+   stale bytecode; mtime is the same freshness test `make` uses and is cheap
+   enough to pay on every launch. */
+static bool sxn_sxbc_cache_is_fresh(const char *cache_path, const char *source_path) {
+    struct stat cache_st, src_st;
+    if (stat(cache_path, &cache_st) != 0 || stat(source_path, &src_st) != 0) return false;
+    if (cache_st.st_mtime < src_st.st_mtime) return false;
+    FILE *f = fopen(cache_path, "rb");
+    if (!f) return false;
+    char magic[4];
+    bool ok = fread(magic, 1, 4, f) == 4 && memcmp(magic, SXN_SXBC_MAGIC, 4) == 0;
+    fclose(f);
+    return ok;
+}
+
 static char *sxn_pkg_entry(JSContext *ctx, const char *pkg_dir) {
     char manifest[PATH_MAX], cand[PATH_MAX];
     if (snprintf(manifest, sizeof(manifest), "%s/package.json", pkg_dir) >= (int)sizeof(manifest))
@@ -626,7 +861,7 @@ static size_t sxn_js_stack_budget(void) {
 void sxn_shutdown_napi(JSContext *ctx);
 
 static int execute_file(int argc, char **argv, const char *filename,
-                        bool memory_report, bool leak_check) {
+                        int arg_offset, bool memory_report, bool leak_check) {
     size_t length = 0;
     uint8_t *source = NULL;
     JSRuntime *runtime = JS_NewRuntime();
@@ -657,7 +892,12 @@ static int execute_file(int argc, char **argv, const char *filename,
     js_init_module_std(context, "qjs:std");
     js_init_module_os(context, "qjs:os");
     js_init_module_bjson(context, "qjs:bjson");
-    js_std_add_helpers(context, argc - 1, argv + 1);
+    /* process.argv is [execPath, scriptPath, ...userArgs]; arg_offset is
+       how many leading argv entries (argv[0] plus any --flag this runtime
+       consumed for itself, e.g. --compile-cache) aren't part of that, so a
+       flag before the script name doesn't leak into the script's own argv
+       the way it did when this was hardcoded to skip exactly one. */
+    js_std_add_helpers(context, argc - arg_offset, argv + arg_offset);
     if (sxn_install_network(context) != 0) {
         fputs("sxn: unable to initialize network runtime\n", stderr);
         goto failure;
@@ -669,17 +909,21 @@ static int execute_file(int argc, char **argv, const char *filename,
     JS_SetModuleLoaderFunc2(runtime, sxn_module_normalize, sxn_module_loader, js_module_check_attributes, NULL);
     JS_SetHostPromiseRejectionTracker(runtime, js_std_promise_rejection_tracker, NULL);
 
-    source = sxn_load_file(context, &length, filename);
-    if (!source) {
-        /* js_load_file reports failure without setting an exception, so
-           dumping one printed "[uninitialized]" instead of naming the file. */
-        fprintf(stderr, "sxn: cannot open '%s': %s\n", filename, strerror(errno));
-        goto failure;
+    bool is_sxbc = suffix(filename, ".sxbc");
+    if (!is_sxbc) {
+        source = sxn_load_file(context, &length, filename);
+        if (!source) {
+            /* js_load_file reports failure without setting an exception, so
+               dumping one printed "[uninitialized]" instead of naming the file. */
+            fprintf(stderr, "sxn: cannot open '%s': %s\n", filename, strerror(errno));
+            goto failure;
+        }
     }
     /* A CommonJS entry point needs require/module/exports/__dirname in scope,
        and every module needs a require bound to its own directory. Install a
        global one anchored at the entry file's directory so ESM can use it too,
-       the way Node's createRequire is used. */
+       the way Node's createRequire is used. A .sxbc entry needs the same
+       global, since bytecode compiled from a module can call require() too. */
     {
         char entry_dir[PATH_MAX];
         snprintf(entry_dir, sizeof(entry_dir), "%s", filename);
@@ -691,38 +935,48 @@ static int execute_file(int argc, char **argv, const char *filename,
                           JS_NewCFunction(context, sxn_make_require_fn, "createRequire", 1));
         JS_FreeValue(context, g);
     }
-    int flags = sxn_entry_is_commonjs(context, filename) ? JS_EVAL_TYPE_GLOBAL
-                                                        : JS_EVAL_TYPE_MODULE;
     JSValue value;
-    if (flags == JS_EVAL_TYPE_GLOBAL) {
-        /* Run the entry through require() rather than as bare global code, so
-           it gets the same wrapper every other CommonJS module gets and has
-           module, exports, __filename and __dirname in scope. */
-        js_free(context, source);
-        source = NULL;
-        char abs[PATH_MAX];
-        if (filename[0] == '/') snprintf(abs, sizeof(abs), "%s", filename);
-        else {
-            char cwd[PATH_MAX];
-            if (!getcwd(cwd, sizeof(cwd))) cwd[0] = 0;
-            snprintf(abs, sizeof(abs), "%s/%s", cwd, filename);
+    if (is_sxbc) {
+        /* Precompiled bytecode: no parse at all, just load and run it.
+           sxn_run_sxbc reports its own errors (a bad file, or a real
+           exception from loading/resolving/evaluating it) on the way out,
+           so a failure here skips the shared dump-error below rather than
+           printing it twice. */
+        value = sxn_run_sxbc(context, filename);
+        if (JS_IsException(value)) { JS_FreeValue(context, value); goto failure; }
+    } else {
+        int flags = sxn_entry_is_commonjs(context, filename) ? JS_EVAL_TYPE_GLOBAL
+                                                             : JS_EVAL_TYPE_MODULE;
+        if (flags == JS_EVAL_TYPE_GLOBAL) {
+            /* Run the entry through require() rather than as bare global code, so
+               it gets the same wrapper every other CommonJS module gets and has
+               module, exports, __filename and __dirname in scope. */
+            js_free(context, source);
+            source = NULL;
+            char abs[PATH_MAX];
+            if (filename[0] == '/') snprintf(abs, sizeof(abs), "%s", filename);
+            else {
+                char cwd[PATH_MAX];
+                if (!getcwd(cwd, sizeof(cwd))) cwd[0] = 0;
+                snprintf(abs, sizeof(abs), "%s/%s", cwd, filename);
+            }
+            JSValue g = JS_GetGlobalObject(context);
+            JSValue req = JS_GetPropertyStr(context, g, "require");
+            JSValue spec = JS_NewString(context, abs);
+            JSValueConst a[1] = { spec };
+            value = JS_Call(context, req, JS_UNDEFINED, 1, a);
+            JS_FreeValue(context, spec);
+            JS_FreeValue(context, req);
+            JS_FreeValue(context, g);
+        } else
+        value = JS_Eval(context, (const char *)source, length, filename,
+                                flags | JS_EVAL_FLAG_COMPILE_ONLY);
+        if (source) { js_free(context, source); source = NULL; }
+        if (!JS_IsException(value) && flags == JS_EVAL_TYPE_MODULE) {
+            if (js_module_set_import_meta(context, value, true, true) < 0) {
+                JS_FreeValue(context, value); value = JS_EXCEPTION;
+            } else value = JS_EvalFunction(context, value);
         }
-        JSValue g = JS_GetGlobalObject(context);
-        JSValue req = JS_GetPropertyStr(context, g, "require");
-        JSValue spec = JS_NewString(context, abs);
-        JSValueConst a[1] = { spec };
-        value = JS_Call(context, req, JS_UNDEFINED, 1, a);
-        JS_FreeValue(context, spec);
-        JS_FreeValue(context, req);
-        JS_FreeValue(context, g);
-    } else
-    value = JS_Eval(context, (const char *)source, length, filename,
-                            flags | JS_EVAL_FLAG_COMPILE_ONLY);
-    if (source) { js_free(context, source); source = NULL; }
-    if (!JS_IsException(value) && flags == JS_EVAL_TYPE_MODULE) {
-        if (js_module_set_import_meta(context, value, true, true) < 0) {
-            JS_FreeValue(context, value); value = JS_EXCEPTION;
-        } else value = JS_EvalFunction(context, value);
     }
     /* A module with top-level await evaluates to a pending promise. Awaiting
        it has to drive the uv loop too, or any await on a timer, a fetch or a
@@ -750,6 +1004,45 @@ failure:
     js_std_free_handlers(runtime); JS_FreeContext(context); JS_FreeRuntime(runtime); return 1;
 }
 
+/* `sxn compile <file> [-o out.sxbc]`: ahead-of-time compile for
+   distribution -- ship the bytecode, not the source. Needs only a bare
+   context: compiling is a pure parse, with no network or node: layer to
+   install and nothing yet to execute. */
+static int sxn_compile_command(int argc, char **argv) {
+    const char *in = NULL, *out = NULL;
+    bool strip = false;
+    for (int i = 2; i < argc; i++) {
+        if ((!strcmp(argv[i], "-o") || !strcmp(argv[i], "--output")) && i + 1 < argc) {
+            out = argv[++i];
+        } else if (!strcmp(argv[i], "--strip")) {
+            strip = true;
+        } else if (!in) {
+            in = argv[i];
+        } else {
+            fprintf(stderr, "sxn: compile takes one input file (got '%s' after '%s')\n", argv[i], in);
+            return 2;
+        }
+    }
+    if (!in) {
+        fputs("sxn: usage: sxn compile <file> [-o out.sxbc]\n", stderr);
+        return 2;
+    }
+    char default_out[PATH_MAX];
+    if (!out) { sxn_sxbc_default_path(default_out, sizeof(default_out), in); out = default_out; }
+
+    JSRuntime *runtime = JS_NewRuntime();
+    if (!runtime) { fputs("sxn: unable to create QuickJS runtime\n", stderr); return 2; }
+    js_std_init_handlers(runtime);
+    JSContext *context = JS_NewContext(runtime);
+    if (!context) { JS_FreeRuntime(runtime); return 2; }
+    int rc = sxn_compile_file(context, in, out, strip);
+    js_std_free_handlers(runtime);
+    JS_FreeContext(context);
+    JS_FreeRuntime(runtime);
+    if (rc == 0) fprintf(stderr, "sxn: compiled '%s' -> '%s'\n", in, out);
+    return rc == 0 ? 0 : 1;
+}
+
 static void usage(void) {
     puts("SXN 0.0.1\n"
          "Usage:\n"
@@ -760,7 +1053,9 @@ static void usage(void) {
          "  sxn add [--dev] package[@range]\n"
          "  sxn remove package\n"
          "  sxn init\n"
-         "  sxn [--memory-report] [--leak-check] <file.sx|file.ts|file.js|file.mjs|file.cjs> [args...]\n"
+         "  sxn [--memory-report] [--leak-check] [--compile-cache] <file.sx|file.ts|file.js|file.mjs|file.cjs> [args...]\n"
+         "  sxn compile <file> [-o out.sxbc] [--strip]   -- compile to bytecode for distribution\n"
+         "  sxn <file.sxbc> [args...]          -- run precompiled bytecode directly\n"
          "  sxn lsp --stdio\n"
          "  sxn --help | --version");
 }
@@ -769,13 +1064,17 @@ int main(int argc, char **argv) {
     if (argc < 2 || !strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) { usage(); return 0; }
     if (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v")) { puts("sxn 0.0.1"); return 0; }
     if (!strcmp(argv[1], "lsp")) return sxn_lsp_main();
+    if (!strcmp(argv[1], "compile")) return sxn_compile_command(argc, argv);
     if (!strcmp(argv[1], "run") || !strcmp(argv[1], "install") || !strcmp(argv[1], "add") ||
         !strcmp(argv[1], "remove") || !strcmp(argv[1], "init")) return sxn_package_command(argc, argv);
-    bool memory_report = false, leak_check = false;
+    bool memory_report = false, leak_check = false, compile_cache = false;
     int file_index = 1;
-    while (file_index < argc && (!strcmp(argv[file_index], "--memory-report") || !strcmp(argv[file_index], "--leak-check"))) {
+    while (file_index < argc && (!strcmp(argv[file_index], "--memory-report") ||
+                                 !strcmp(argv[file_index], "--leak-check") ||
+                                 !strcmp(argv[file_index], "--compile-cache"))) {
         if (!strcmp(argv[file_index], "--memory-report")) memory_report = true;
-        else leak_check = true;
+        else if (!strcmp(argv[file_index], "--leak-check")) leak_check = true;
+        else compile_cache = true;
         ++file_index;
     }
     if (file_index >= argc) { usage(); return 2; }
@@ -785,7 +1084,7 @@ int main(int argc, char **argv) {
        suffix here sent them all to `npm run` and reported a missing script.
        A name that is not a file is still a package script. */
     if (!sxn_is_file(argv[file_index]) &&
-        !suffix(argv[file_index], ".sx") && !suffix(argv[file_index], ".js") && !suffix(argv[file_index], ".mjs") && !suffix(argv[file_index], ".cjs") && !suffix(argv[file_index], ".ts") && !suffix(argv[file_index], ".mts")) {
+        !suffix(argv[file_index], ".sx") && !suffix(argv[file_index], ".js") && !suffix(argv[file_index], ".mjs") && !suffix(argv[file_index], ".cjs") && !suffix(argv[file_index], ".ts") && !suffix(argv[file_index], ".mts") && !suffix(argv[file_index], ".sxbc")) {
         char **run_argv = calloc((size_t)argc + 1, sizeof(*run_argv));
         if (!run_argv) return 2;
         run_argv[0] = argv[0]; run_argv[1] = "run";
@@ -793,5 +1092,29 @@ int main(int argc, char **argv) {
         int status = sxn_package_command(argc + 1, run_argv);
         free(run_argv); return status;
     }
-    return execute_file(argc, argv, argv[file_index], memory_report, leak_check);
+    const char *entry = argv[file_index];
+    char cache_path[PATH_MAX];
+    if (compile_cache && !suffix(entry, ".sxbc")) {
+        /* "Convert to bytecode, then run that" -- but only actually compile
+           when the cache is missing or older than the source; a script run
+           twice in a row should parse once, not on every launch. */
+        sxn_sxbc_default_path(cache_path, sizeof(cache_path), entry);
+        if (!sxn_sxbc_cache_is_fresh(cache_path, entry)) {
+            JSRuntime *rt = JS_NewRuntime();
+            if (!rt) { fputs("sxn: unable to create QuickJS runtime\n", stderr); return 2; }
+            js_std_init_handlers(rt);
+            JSContext *ctx = JS_NewContext(rt);
+            if (!ctx) { JS_FreeRuntime(rt); return 2; }
+            /* A cache built for this runtime's own next launch keeps
+               source info: it's read back on the same machine, so there's
+               nothing to strip for and stack traces should stay useful. */
+            int rc = sxn_compile_file(ctx, entry, cache_path, false);
+            js_std_free_handlers(rt);
+            JS_FreeContext(ctx);
+            JS_FreeRuntime(rt);
+            if (rc != 0) return 1;
+        }
+        entry = cache_path;
+    }
+    return execute_file(argc, argv, entry, file_index, memory_report, leak_check);
 }

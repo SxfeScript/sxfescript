@@ -1,15 +1,17 @@
 # SXN network runtime
 
-SXN installs browser-style `fetch` and a Bun-style `Sxn` host namespace in every
-runtime context. `fetch(url, options)` and `Sxn.fetch(url, options)` use libcurl and support HTTP methods,
-request bodies, redirects, status/ok fields, and `text()`/`json()` response
-readers.
+The server, fetch, and Web Streams surface described here is documented in
+full, with examples, in `spec/RUNTIME.md`. This page stays as the pointer to
+it and the one implementation detail worth knowing separately: the transport.
 
-`__sxnServe(options, handler)` is the low-level server ABI used by ExpressX. It
-`Sxn.serve(options, handler)` parses HTTP requests, invokes the handler, writes regular responses, emits SSE
-event streams, and performs WebSocket upgrades and text frames.
+`fetch`/`Sxn.fetch` are backed by libcurl. `Sxn.serve` is a native HTTP
+server with its own event loop integration (`sxn_loop()` in `src/network.c`,
+a thin wrapper over `uv_default_loop()`) rather than a JS-level framework
+sitting on top of sockets -- request parsing, response writing, SSE framing,
+and the WebSocket upgrade handshake all happen in C.
 
-Rayact's production desktop networking uses libwebsockets. SXN should use the
-same library when its WebSocket client/event-loop API is added; the initial
-server path deliberately keeps the ExpressX-facing ABI independent of the
-underlying transport so that migration does not change application code.
+Rayact's own production networking uses libwebsockets. If SXN grows an
+outbound WebSocket client, that's the library to match, so a future migration
+of the underlying transport doesn't change application code -- the server-side
+upgrade path already keeps its ABI independent of the transport for the same
+reason.

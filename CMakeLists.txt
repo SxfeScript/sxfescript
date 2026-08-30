@@ -306,6 +306,12 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # Sxn.ffi against the platform's own C library, so there is nothing to build
   # and the functions behave the same on every target.
   add_test(NAME sxn-ffi COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/ffi.mjs)
+  # sxn compile / sxn --compile-cache / running a .sxbc directly: module and
+  # CommonJS bytecode, cache reuse and invalidation, --strip, and the error
+  # path for a corrupt file. A shell fixture because it drives sxn itself as
+  # a subprocess (compile, then run what it produced) rather than being run
+  # by it.
+  add_test(NAME sxn-sxbc COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/sxbc_roundtrip.sh $<TARGET_FILE:sxn>)
   # A real Node-API addon, compiled here against Node's own headers so the
   # thing under test is the same binary shape npm ships.
   add_library(sxn_test_addon MODULE ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/napi/hello.c)

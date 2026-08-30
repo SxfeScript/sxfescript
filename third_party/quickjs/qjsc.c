@@ -333,7 +333,7 @@ static const char main_c_template2[] =
 
 void help(void)
 {
-    printf("QuickJS-ng Compiler version %s\n"
+    printf("ArcSX Compiler version %s (QuickJS-ng base)\n"
            "usage: " PROG_NAME " [options] [files]\n"
            "\n"
            "options are:\n"
@@ -577,7 +577,7 @@ int main(int argc, char **argv)
     JS_SetModuleLoaderFunc(rt, NULL, jsc_module_loader, NULL);
 
     if (output_type != OUTPUT_RAW) {
-        fprintf(fo, "/* File generated automatically by the QuickJS-ng compiler. */\n"
+        fprintf(fo, "/* File generated automatically by the ArcSX compiler. */\n"
                 "\n"
                 );
     }
