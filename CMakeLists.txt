@@ -243,6 +243,13 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # File and FormData, the multi-map fetch bodies are built on.
   add_test(NAME sxn-formdata COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/formdata.mjs)
   # fetch with a request body: POST/PUT/PATCH, empty, JSON and large bodies.
+  # Web Streams: reading, locking, backpressure, tee, cancel, pipeTo/Through,
+  # async iteration, the text transforms, and streams as response bodies.
+  add_test(NAME sxn-web-streams COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/web_streams.mjs)
+  # Crypto/SubtleCrypto brands, and MessageChannel's two ports.
+  add_test(NAME sxn-message-channel COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/message_channel.mjs)
+  set_tests_properties(sxn-message-channel PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  set_tests_properties(sxn-web-streams PROPERTIES TIMEOUT 40)
   add_test(NAME sxn-fetch-body COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/fetch_body.mjs)
   set_tests_properties(sxn-fetch-body PROPERTIES TIMEOUT 40 FAIL_REGULAR_EXPRESSION "FAIL")
   add_test(NAME sxn-serve-handle COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_handle.mjs)
