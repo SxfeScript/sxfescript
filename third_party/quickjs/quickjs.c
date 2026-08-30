@@ -644,6 +644,25 @@ struct JSContext {
     JSDebuggerCallback *debugger_handler;
     void *debugger_opaque;
     int debugger_enabled;
+
+    /* arcsx: guarded fusion of `Buffer.from(s, "utf-8").length`. The compiler
+       flags the call site and elides the trailing `.length`; these are what the
+       flagged site checks before answering from the string alone. Captured by
+       JS_EnableBufferLengthFusion once Buffer is installed. buf_len_fusion_on
+       stays false until then, so the flagged path is inert in a plain runtime.
+       Every entry is compared by identity: a shape pointer catches a property
+       added to or removed from a prototype, and the getter value catches
+       `length` being redefined in place, which leaves the shape alone. */
+    bool buf_len_fusion_on;
+    JSValue buf_len_from_fn;        /* the exact native Buffer.from */
+    JSValue buf_len_proto;          /* Buffer.prototype */
+    JSValue buf_len_u8_proto;       /* Uint8Array.prototype */
+    JSValue buf_len_ta_proto;       /* %TypedArray%.prototype */
+    JSShape *buf_len_proto_shape;   /* their shapes when the fusion was enabled */
+    JSShape *buf_len_u8_shape;
+    JSShape *buf_len_ta_shape;
+    int buf_len_getter_idx;         /* slot of `length` on %TypedArray%.prototype */
+    JSObject *buf_len_getter;       /* and the getter that was in it */
 };
 
 typedef union JSFloat64Union {
@@ -3029,6 +3048,11 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
     ctx->error_ctor = JS_NULL;
     ctx->error_back_trace = JS_UNDEFINED;
     ctx->error_prepare_stack = JS_UNDEFINED;
+    /* arcsx: Buffer.byteLength fusion; off until JS_EnableBufferLengthFusion. */
+    ctx->buf_len_from_fn = JS_UNDEFINED;
+    ctx->buf_len_proto = JS_UNDEFINED;
+    ctx->buf_len_u8_proto = JS_UNDEFINED;
+    ctx->buf_len_ta_proto = JS_UNDEFINED;
     ctx->error_stack_trace_limit = js_int32(10);
     init_list_head(&ctx->loaded_modules);
     // TODO(bnoordhuis) use getrandom() etc.
@@ -3159,6 +3183,11 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
     JS_MarkValue(rt, ctx->error_ctor, mark_func);
     JS_MarkValue(rt, ctx->error_back_trace, mark_func);
     JS_MarkValue(rt, ctx->error_prepare_stack, mark_func);
+    /* arcsx: the Buffer length fusion holds these alive. */
+    JS_MarkValue(rt, ctx->buf_len_from_fn, mark_func);
+    JS_MarkValue(rt, ctx->buf_len_proto, mark_func);
+    JS_MarkValue(rt, ctx->buf_len_u8_proto, mark_func);
+    JS_MarkValue(rt, ctx->buf_len_ta_proto, mark_func);
     JS_MarkValue(rt, ctx->error_stack_trace_limit, mark_func);
     for(i = 0; i < rt->class_count; i++) {
         JS_MarkValue(rt, ctx->class_proto[i], mark_func);
@@ -3187,6 +3216,8 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
     if (ctx->regexp_result_shape)
         mark_func(rt, &ctx->regexp_result_shape->header);
 }
+
+void JS_DisableBufferLengthFusion(JSContext *ctx);
 
 void JS_FreeContext(JSContext *ctx)
 {
@@ -3240,6 +3271,7 @@ void JS_FreeContext(JSContext *ctx)
     }
     JS_FreeValue(ctx, ctx->error_ctor);
     JS_FreeValue(ctx, ctx->error_back_trace);
+    JS_DisableBufferLengthFusion(ctx);
     JS_FreeValue(ctx, ctx->error_prepare_stack);
     JS_FreeValue(ctx, ctx->error_stack_trace_limit);
     for(i = 0; i < rt->class_count; i++) {
@@ -4967,6 +4999,61 @@ static JSValue js_concat_values(JSContext *ctx, int n, JSValueConst *vals)
 }
 
 static size_t js_string_utf8_exact(JSString *str);
+
+static JSShapeProperty *find_own_property(JSProperty **ppr, JSObject *p, JSAtom atom);
+
+/* arcsx: enable the `Buffer.from(s, "utf-8").length` fusion. Captures the
+   exact `from` the guard requires and the prototype chain the elided `.length`
+   would have walked, so any later tampering with either is detected by pointer
+   comparison at the call site. Safe to call more than once; a failed lookup
+   simply leaves the fusion off and every flagged site takes the ordinary path. */
+void JS_EnableBufferLengthFusion(JSContext *ctx, JSValueConst from_fn,
+                                 JSValueConst buffer_proto)
+{
+    JSObject *bp, *up, *tp;
+    JSShapeProperty *prs;
+    JSProperty *pr;
+
+    JS_DisableBufferLengthFusion(ctx);
+    if (!JS_IsFunction(ctx, from_fn) ||
+        JS_VALUE_GET_TAG(buffer_proto) != JS_TAG_OBJECT)
+        return;
+    bp = JS_VALUE_GET_OBJ(buffer_proto);
+    if (!bp->shape->proto) return;
+    up = bp->shape->proto;                 /* Uint8Array.prototype */
+    if (!up->shape->proto) return;
+    tp = up->shape->proto;                 /* %TypedArray%.prototype */
+
+    prs = find_own_property(&pr, tp, JS_ATOM_length);
+    if (!prs || !(prs->flags & JS_PROP_GETSET) || !pr->u.getset.getter)
+        return;
+
+    ctx->buf_len_from_fn = js_dup(from_fn);
+    ctx->buf_len_proto = js_dup(buffer_proto);
+    ctx->buf_len_u8_proto = js_dup(JS_MKPTR(JS_TAG_OBJECT, up));
+    ctx->buf_len_ta_proto = js_dup(JS_MKPTR(JS_TAG_OBJECT, tp));
+    ctx->buf_len_proto_shape = bp->shape;
+    ctx->buf_len_u8_shape = up->shape;
+    ctx->buf_len_ta_shape = tp->shape;
+    ctx->buf_len_getter_idx = (int)(pr - tp->prop);
+    ctx->buf_len_getter = pr->u.getset.getter;
+    ctx->buf_len_fusion_on = true;
+}
+
+void JS_DisableBufferLengthFusion(JSContext *ctx)
+{
+    if (!ctx->buf_len_fusion_on) return;
+    ctx->buf_len_fusion_on = false;
+    JS_FreeValue(ctx, ctx->buf_len_from_fn);
+    JS_FreeValue(ctx, ctx->buf_len_proto);
+    JS_FreeValue(ctx, ctx->buf_len_u8_proto);
+    JS_FreeValue(ctx, ctx->buf_len_ta_proto);
+    ctx->buf_len_from_fn = JS_UNDEFINED;
+    ctx->buf_len_proto = JS_UNDEFINED;
+    ctx->buf_len_u8_proto = JS_UNDEFINED;
+    ctx->buf_len_ta_proto = JS_UNDEFINED;
+    ctx->buf_len_getter = NULL;
+}
 
 /* arcsx: exact UTF-8 byte length of a string value, without encoding it.
    Returns -1 if the value is not a string. Backs Buffer.byteLength. */
@@ -18780,6 +18867,43 @@ static void close_lexical_var(JSContext *ctx, JSFunctionBytecode *b,
 }
 
 #define JS_CALL_FLAG_COPY_ARGV   (1 << 1)
+/* arcsx: set on OP_call_method's argument count to mark a call site whose
+   result feeds only a `.length` read that the compiler has elided. Masked off
+   everywhere the count is consumed. */
+#define JS_CALL_METHOD_FUSED_LEN 0x8000
+
+/* arcsx: "utf8" / "utf-8", the only encodings the length fusion answers for.
+   Compared on the string itself so a computed encoding still works. */
+static bool js_buf_len_encoding_is_utf8(JSString *p)
+{
+    const uint8_t *c;
+    if (p->is_wide_char)
+        return false;
+    c = str8(p);
+    if (p->len == 4)
+        return c[0]=='u' && c[1]=='t' && c[2]=='f' && c[3]=='8';
+    if (p->len == 5)
+        return c[0]=='u' && c[1]=='t' && c[2]=='f' && c[3]=='-' && c[4]=='8';
+    return false;
+}
+
+/* arcsx: has anything on the way to `Buffer.prototype.length` moved since the
+   fusion was enabled? A shape pointer catches a property added to or removed
+   from a prototype -- and carries the prototype link, so a re-pointed chain is
+   caught too. The getter identity catches `length` being redefined in place,
+   which leaves the shape alone. */
+static bool js_buf_len_guard_ok(JSContext *ctx)
+{
+    JSObject *tp = JS_VALUE_GET_OBJ(ctx->buf_len_ta_proto);
+    if (JS_VALUE_GET_OBJ(ctx->buf_len_proto)->shape != ctx->buf_len_proto_shape)
+        return false;
+    if (JS_VALUE_GET_OBJ(ctx->buf_len_u8_proto)->shape != ctx->buf_len_u8_shape)
+        return false;
+    if (tp->shape != ctx->buf_len_ta_shape)
+        return false;
+    return tp->prop[ctx->buf_len_getter_idx].u.getset.getter == ctx->buf_len_getter;
+}
+
 #define JS_CALL_FLAG_GENERATOR   (1 << 2)
 
 static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
@@ -19563,10 +19687,32 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_call_method):
         CASE(OP_tail_call_method):
             {
+                bool fused_len;
                 call_argc = get_u16(pc);
                 pc += 2;
+                fused_len = (call_argc & JS_CALL_METHOD_FUSED_LEN) != 0;
+                call_argc &= ~JS_CALL_METHOD_FUSED_LEN;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
+                /* arcsx: `Buffer.from(s, "utf-8").length`. The trailing
+                   `.length` was elided at compile time, so this site must
+                   leave the number on the stack either way. When the guards
+                   hold, the answer comes from the string without building the
+                   bytes, the ArrayBuffer or the Buffer. */
+                if (unlikely(fused_len) && ctx->buf_len_fusion_on &&
+                    call_argc == 2 &&
+                    js_same_value(ctx, call_argv[-1], ctx->buf_len_from_fn) &&
+                    JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_STRING &&
+                    JS_VALUE_GET_TAG(call_argv[1]) == JS_TAG_STRING &&
+                    js_buf_len_encoding_is_utf8(JS_VALUE_GET_STRING(call_argv[1])) &&
+                    js_buf_len_guard_ok(ctx)) {
+                    int64_t n = JS_Utf8ByteLength(ctx, call_argv[0]);
+                    for (i = -2; i < call_argc; i++)
+                        JS_FreeValue(ctx, call_argv[i]);
+                    sp -= call_argc + 2;
+                    *sp++ = JS_NewInt64(ctx, n);
+                    BREAK;
+                }
                 /* arcsx: same direct C-function dispatch as OP_call above. */
                 if (likely(JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT &&
                            JS_VALUE_GET_OBJ(call_argv[-1])->class_id == JS_CLASS_C_FUNCTION))
@@ -19583,6 +19729,16 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 for(i = -2; i < call_argc; i++)
                     JS_FreeValue(ctx, call_argv[i]);
                 sp -= call_argc + 2;
+                /* arcsx: the guards did not hold, so perform the `.length`
+                   read the compiler elided. Identical to the original
+                   `call_method` followed by `get_field length`. */
+                if (unlikely(fused_len)) {
+                    JSValue len_val = JS_GetProperty(ctx, ret_val, JS_ATOM_length);
+                    JS_FreeValue(ctx, ret_val);
+                    if (unlikely(JS_IsException(len_val)))
+                        goto exception;
+                    ret_val = len_val;
+                }
                 *sp++ = ret_val;
             }
             BREAK;
@@ -34775,8 +34931,14 @@ static void dump_byte_code(JSContext *ctx, int pass,
             printf(" %d", get_i8(tab + pos));
             break;
         case OP_FMT_u16:
-        case OP_FMT_npop:
             printf(" %u", get_u16(tab + pos));
+            break;
+        case OP_FMT_npop:
+            {   /* arcsx: strip the fused-length flag, and say so */
+                int n = get_u16(tab + pos);
+                printf(" %u%s", n & ~JS_CALL_METHOD_FUSED_LEN,
+                       (n & JS_CALL_METHOD_FUSED_LEN) ? "  ; +fused .length" : "");
+            }
             break;
         case OP_FMT_npop_u16:
             printf(" %u,%u", get_u16(tab + pos), get_u16(tab + pos + 2));
@@ -37902,6 +38064,25 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                 /* detect and transform tail calls */
                 int argc;
                 argc = get_u16(bc_buf + pos + 1);
+                /* arcsx: a two-argument method call whose result feeds only a
+                   `.length` read -- the shape of `Buffer.from(s, enc).length`.
+                   Flag the call and drop the read; the interpreter answers
+                   from the string when its guards hold and performs the read
+                   itself when they do not. Checked before the tail-call
+                   transform below, which cannot apply once the `.length` is
+                   there. A label between the two makes code_match fail, so a
+                   jump into the middle of the expression cannot be broken. */
+                if (argc == 2 && !(argc & JS_CALL_METHOD_FUSED_LEN) &&
+                    code_match(&cc, pos_next, OP_get_field, -1) &&
+                    cc.atom == JS_ATOM_length) {
+                    if (cc.line_num >= 0) line_num = cc.line_num;
+                    if (cc.col_num >= 0) col_num = cc.col_num;
+                    add_pc2line_info(s, bc_out.size, line_num, col_num);
+                    put_short_code(&bc_out, op, argc | JS_CALL_METHOD_FUSED_LEN);
+                    JS_FreeAtom(ctx, cc.atom);   /* the elided read owned it */
+                    pos_next = cc.pos;
+                    break;
+                }
                 if (code_match(&cc, pos_next, OP_return, -1)) {
                     if (cc.line_num >= 0) line_num = cc.line_num;
                     if (cc.col_num >= 0) col_num = cc.col_num;
@@ -38922,7 +39103,7 @@ static __exception int compute_stack_size(JSContext *ctx,
         n_pop = oi->n_pop;
         /* call pops a variable number of arguments */
         if (oi->fmt == OP_FMT_npop || oi->fmt == OP_FMT_npop_u16) {
-            n_pop += get_u16(bc_buf + pos + 1);
+            n_pop += get_u16(bc_buf + pos + 1) & ~JS_CALL_METHOD_FUSED_LEN;
         } else if (oi->fmt == OP_FMT_npopx) {
             n_pop += op - OP_call0;
         }

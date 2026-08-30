@@ -1492,6 +1492,11 @@ JS_EXTERN uintptr_t js_std_cmd(int cmd, ...);
    a string. */
 JS_EXTERN int64_t JS_Utf8ByteLength(JSContext *ctx, JSValueConst val);
 
+/* arcsx: enable/disable the guarded `Buffer.from(s, "utf-8").length` fusion. */
+JS_EXTERN void JS_EnableBufferLengthFusion(JSContext *ctx, JSValueConst from_fn,
+                                           JSValueConst buffer_proto);
+JS_EXTERN void JS_DisableBufferLengthFusion(JSContext *ctx);
+
 #ifdef SXN_ABLATE_FUSION
 /* arcsx: fusion-ceiling ablations; see the block in quickjs.c. */
 JS_EXTERN JSValue sxn_abl_nop(JSContext *ctx, JSValueConst this_val,

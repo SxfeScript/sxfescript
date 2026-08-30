@@ -1101,6 +1101,14 @@ static void sxn_install_buffer_natives(JSContext *ctx) {
     if (!JS_IsUndefined(proto) && JS_IsFunction(ctx, orig_from)) {
         JSValueConst from_data[2] = { proto, orig_from };
         JS_SetPropertyStr(ctx, ctor, "from", JS_NewCFunctionData(ctx, js_buffer_from_fast, 2, 0, 2, from_data));
+        /* Enable the `Buffer.from(s, "utf-8").length` fusion against the
+           function just installed, so the call site's guard compares against
+           this exact object. Anything that replaces Buffer.from, or moves
+           `length` on the prototype chain, fails the guard and takes the
+           ordinary path. */
+        JSValue installed_from = JS_GetPropertyStr(ctx, ctor, "from");
+        JS_EnableBufferLengthFusion(ctx, installed_from, proto);
+        JS_FreeValue(ctx, installed_from);
     }
     /* Encoding-name atoms, used by both the Buffer.from fast path and the
        toString dispatch below, so they are interned before either is

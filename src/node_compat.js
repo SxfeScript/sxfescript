@@ -112,6 +112,9 @@
         // Uint8Array.fromHex/fromBase64 or the latin1 loop); reparenting it
         // to Buffer.prototype in place is measurably faster here than
         // constructing a second Buffer instance around its .buffer.
+        // Node ignores a non-string encoding rather than coercing it, so an
+        // object with a toString is treated as absent and never called.
+        if (typeof encoding !== "string") encoding = undefined;
         if (encoding === undefined || encoding === "utf-8" || encoding === "utf8") return new Buffer(__sxnUtf8EncodeArrayBuffer(data));
         if (encoding === "hex" || encoding === "base64" || encoding === "base64url") {
           return Object.setPrototypeOf(bufferBytesFromString(data, encoding), Buffer.prototype);
