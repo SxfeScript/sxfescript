@@ -134,8 +134,7 @@
   p.lede-s { color: var(--ink-mid); max-width: 62ch; margin: 0 0 32px; }
 
   .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
-  @media (max-width: 760px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
+  @media (max-width: 760px) { .grid-2 { grid-template-columns: 1fr; } }
 
   .card {
     background: var(--card); border: 1px solid var(--rule); border-radius: 10px;
@@ -156,7 +155,6 @@
   td.yes { color: var(--safe); font-weight: 600; }
   td.no { color: var(--ink-soft); }
   td code { background: none; border: 0; padding: 0; }
-
 
   /* pull quote / invariant box */
   .invariant {
@@ -385,7 +383,7 @@
       or estimated.
     </p>
 
-    <div class="grid-3">
+    <div class="grid-2">
       <div class="card">
         <h3>WinterCG surface &mdash; 45 of 55 names</h3>
         <p><code>fetch</code>, <code>Sxn.serve</code> (HTTP, SSE, WebSocket upgrade), Web
@@ -403,6 +401,13 @@
         <p><code>Sxn.ffi</code> calls a C function through libffi. It's an engine capability,
         not a Node one &mdash; the design reasoning for that split, and what it means for
         mobile, is in <a href="{{REPO_URL}}/blob/main/spec/NATIVE.md">spec/NATIVE.md</a>.</p>
+      </div>
+      <div class="card">
+        <h3>Precompiled bytecode</h3>
+        <p><code>sxn compile app.js</code> writes a <code>.sxbc</code> file that skips
+        parsing entirely on later runs &mdash; measured 12% faster on a one-line script, 37%
+        on a 618&nbsp;KB generated file. <code>--compile-cache</code> does the same thing
+        automatically, on every launch. <a href="{{REPO_URL}}/blob/main/spec/BYTECODE.md">spec/BYTECODE.md</a>.</p>
       </div>
     </div>
 
