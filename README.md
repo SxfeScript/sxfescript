@@ -86,19 +86,22 @@ throughput rows are the harness's own 1,000-run medians:
 |---|---|---|---|---|
 | Real-world end-to-end task (wall clock, as invoked) | **9.7 ms** | 74.7 ms | 15.4 ms | sxn |
 | Cold start | **8.8 ms** | 41.4 ms | 9.4 ms | sxn / Bun tie |
-| Sustained throughput: Buffer ops | **21.9 ms** | 24.2 ms | 27.2 ms | sxn |
-| Sustained throughput: TextEncoder | 14.2 ms | 39.5 ms | **6.2 ms** | Bun |
-| Sustained throughput: EventEmitter | 9.7 ms | **5.1 ms** | 9.2 ms | Node |
-| Pause consistency: total time | **134.6 ms** | 253.1 ms | 293.6 ms | sxn |
-| Pause consistency: worst single pause | **0.04 ms** | 0.31 ms | 3.25 ms | sxn |
+| Sustained throughput: Buffer ops | **21.7 ms** | 23.8 ms | 26.8 ms | sxn |
+| Sustained throughput: TextEncoder | 6.8 ms | 38.9 ms | **6.2 ms** | Bun, narrowly |
+| Sustained throughput: EventEmitter | 9.3 ms | **5.1 ms** | 9.0 ms | Node |
+| Pause consistency: total time | **145.8 ms** | 243.5 ms | 293.3 ms | sxn |
+| Pause consistency: worst single pause | **0.03 ms** | 0.22 ms | 2.63 ms | sxn |
 | Parse 32k-line generated file | **15.3 ms** | 49.7 ms | 24.0 ms | sxn |
 
-The EventEmitter row is Bun's by a nose and Node's outright: 9.7 ms against
-9.2 and 5.1, so read it as a tie with Bun and a 2x loss to Node. The two
+TextEncoder and EventEmitter are both effectively level with Bun, and both
+lost to Node and Bun respectively by margins narrower than the run-to-run
+spread. On TextEncoder over 15 interleaved runs sxn is faster at its best
+(5.20 ms against 5.80) and Bun is steadier, which is how Bun takes the median
+6.1 to 6.8; call it a tie rather than either runtime's row. The two
 pause rows are single-process maximums, the noisiest kind of sample there
 is, so both are medians of 7 interleaved runs rather than one reading;
-individual worst-pause samples ranged 0.02-0.06 ms here, 0.20-5.15 for Node
-and 2.78-8.57 for Bun -- and note which of those three is the stable one. On a workload that keeps objects live instead of
+individual worst-pause samples ranged 0.01-0.06 ms here, 0.19-0.80 for Node
+and 2.34-8.90 for Bun -- and note which of those three is the stable one. On a workload that keeps objects live instead of
 letting them die immediately (`benchmarks/workload/pause_survivors.js`: 2000
 survivors while churning 2M allocations) the worst pause is 0.040 ms here
 against Node's 0.197 and Bun's 0.344, and this runtime finishes that workload
@@ -107,15 +110,16 @@ the question is "how bad can a pause get" -- the bare-pause row above
 measures the allocation pattern most favourable to refcounting.
 
 The table above is macOS arm64. The same tree builds and passes all 36 tests
-on Ubuntu 6.5 x86_64 (gcc 13.2, Ryzen 7 5700G), and the standings are
-identical there -- the same six rows, won and lost for the same reasons:
+on Ubuntu 6.5 x86_64 (gcc 13.2, Ryzen 7 5700G), where the same work goes
+further: seven of eight rows, TextEncoder included, since Bun's own encode is
+slower on that box than on macOS:
 
 | Category | sxn | Node 18.13 | Bun 1.2.17 | Winner |
 |---|---|---|---|---|
 | Real-world end-to-end task | **9.6 ms** | 231.4 ms | 23.3 ms | sxn |
 | Cold start | **9.6 ms** | 120.4 ms | 14.3 ms | sxn |
 | Sustained throughput: Buffer ops | **40.1 ms** | 74.0 ms | 82.1 ms | sxn |
-| Sustained throughput: TextEncoder | 28.9 ms | 88.7 ms | **16.0 ms** | Bun |
+| Sustained throughput: TextEncoder | **10.6 ms** | 88.7 ms | 16.1 ms | sxn |
 | Sustained throughput: EventEmitter | 20.7 ms | **12.9 ms** | 23.5 ms | Node |
 | Pause consistency: total time | **2838.9 ms** | 3489.5 ms | 3244.6 ms | sxn |
 | Pause consistency: worst single pause | **0.09 ms** | 2.78 ms | 5.69 ms | sxn |
@@ -273,7 +277,16 @@ property read instead, so the two paths are indistinguishable. Pause total
 no opcode; three other fusions were measured and left unbuilt because their
 ceilings did not justify the machinery.
 
-The general form of what that fusion computes is `Buffer.byteLength`, which
+A second shape rides the same machinery: `encoder.encode(s).length`, which
+took TextEncoder from 14.2 ms to 6.8 against Bun's 6.2 -- a 2.3x loss turned
+into a tie. Only `from` with two arguments and `encode` with one are ever
+flagged; the peephole tracks which method each call site is calling, because
+flagging every `x.foo(a).length` would have made the fallback path a
+regression on ordinary code. The third fusion the plan proposed, for
+EventEmitter, remains unbuilt: its ceiling was 4.53 ms against Node's 4.41,
+so the machinery would buy a row it still would not win.
+
+The general form of what these fusions compute is `Buffer.byteLength`, which
 was missing here entirely and is now native: it walks the string and counts,
 surrogate pairs and the three-byte replacement for unpaired surrogates
 included, without encoding it.
