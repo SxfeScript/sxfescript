@@ -131,11 +131,12 @@ keying on a four-shape call site).
 
 iOS does not grant W^X/JIT entitlements to third-party apps, so a
 machine-code tier would make this runtime unusable on a target platform.
-That makes the dispatch floor above a permanent design property rather than
-a gap to be closed, and it rules out the single technique that would close
-it. Benchmarks against JIT runtimes should be read with that in mind: on
-JIT-bound microbenchmarks the comparison is against something this project
-structurally cannot do.
+That rules out the one technique -- generating machine code -- that a JIT
+uses to close this gap. It does not rule out closing it some other way; the
+dispatch floor above is the floor of what's been tried, not a proof that
+nothing faster exists. Benchmarks against JIT runtimes should be read with
+that in mind: on JIT-bound microbenchmarks the comparison is against a
+technique this project won't use, not necessarily a result it can't reach.
 
 ### The remaining collector rewrites are measured at ~zero ceiling
 

@@ -189,9 +189,10 @@ pattern most favourable to refcounting.
 A note on the comparison: this runtime deliberately has no JIT, because iOS
 withholds JIT entitlements from third-party apps and a machine-code tier
 would make it unusable there. The rows below where a JIT runtime pulls ahead
-are therefore measuring against a technique this project cannot adopt, not a
-gap awaiting optimization -- see `spec/IMPLEMENTATION.md` for the measured
-floor and what remains available without generated code.
+are measuring against that specific technique, which this project won't
+adopt -- closing them, if it happens, will have to come from somewhere else;
+see `spec/IMPLEMENTATION.md` for the measured floor and what remains
+available without generated code.
 
 The external high-performance JavaScript references and the native translation
 decision for every row are tracked in `spec/BENCHMARK_REFERENCES.md`.

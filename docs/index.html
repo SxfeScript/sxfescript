@@ -433,17 +433,19 @@
         JIT is not a missing feature; it's a category of solution that was never on the table.
       </p>
       <p>
-        That rules out the single technique that would close ArcSX's remaining gap against a
-        JIT runtime on call-heavy, allocation-heavy loops. It does not rule out performance
-        work &mdash; an arena allocator, polymorphic inline caches, and compile-time call
-        fusions took this runtime from behind Node and Bun on most rows to ahead of both on
-        seven of eight measured categories, all without generating a single byte of machine
-        code at runtime.
+        A JIT is the usual way an engine closes the gap on call-heavy, allocation-heavy
+        loops, and it's the one tool this project rules out. That doesn't rule out closing
+        the gap some other way &mdash; an arena allocator, polymorphic inline caches, and
+        compile-time call fusions already took this runtime from behind Node and Bun on
+        most rows to ahead of both on seven of eight measured categories, all without
+        generating a single byte of machine code at runtime. Whatever narrows what's left
+        will have to be an interpreter-side idea, not a machine-code one.
       </p>
     </div>
     <blockquote class="pull">
-      Every benchmark row where a JIT runtime pulls ahead is measured against a technique this
-      project structurally cannot adopt &mdash; not a gap waiting for someone to close it.
+      The one thing this project won't do to go faster is compile to machine code at
+      runtime. Everything else &mdash; allocator design, inline caches, call fusion, whatever
+      comes next &mdash; is fair game.
     </blockquote>
   </section>
 
