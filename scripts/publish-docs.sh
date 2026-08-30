@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Publishes docs/ to the SxfeScript/sxfescript.github.io repo, and installs
-# install.sh there at both a version-pinned and a "latest" path so
+# Publishes docs/ to the SxfeScript/sxfescript.github.io repo: the landing
+# page, every documentation page rendered from the repo's own markdown by
+# scripts/build-docs.py (which needs gh), and llms.txt/llms-full.txt beside
+# them. It also installs install.sh there at both a version-pinned and a
+# "latest" path so
 #   curl -fsSL https://sxfescript.github.io/latest/install.sh | bash
 # always gets the current script, while
 #   curl -fsSL https://sxfescript.github.io/vX.Y.Z/install.sh | bash
@@ -27,7 +30,14 @@ trap 'rm -rf "$tmp"' EXIT
 git clone -q "https://github.com/$DOCS_REPO.git" "$tmp"
 
 cp docs/logo.png "$tmp/logo.png"
+cp docs/site.css "$tmp/site.css"
 sed "s#{{REPO_URL}}#$REPO_URL#g" docs/index.html > "$tmp/index.html"
+
+# Every page under /docs/, plus llms.txt and llms-full.txt, generated from the
+# repo's own markdown. Regenerated from scratch each time, so a page whose
+# source file was renamed or dropped does not linger.
+rm -rf "$tmp/docs"
+scripts/build-docs.py "$tmp" "$REPO_URL"
 
 mkdir -p "$tmp/latest" "$tmp/$VERSION"
 cp install.sh "$tmp/latest/install.sh"

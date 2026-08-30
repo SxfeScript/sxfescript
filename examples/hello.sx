@@ -1,0 +1,31 @@
+// Run it: sxn examples/hello.sx
+//
+// This is a .sx file, so the type annotations below are parsed and stripped
+// by the runtime itself. There is no tsc, no bundler, and no build step --
+// sxn reads this file and runs it.
+
+interface Repo {
+  name: string;
+  stars: i32;
+}
+
+const describe = (repo: Repo): string =>
+  `${repo.name} has ${repo.stars} star${repo.stars === 1 ? "" : "s"}`;
+
+console.log(describe({ name: "sxfescript", stars: 1 }));
+
+// `let mut` is a mutable owner, `let` an immutable one. `&mut` borrows a
+// value exclusively, so a function can change what it was handed without
+// taking ownership of it.
+interface Counter {
+  hits: i32;
+}
+
+function bump(c: &mut Counter): void {
+  c.hits += 1;
+}
+
+let mut counter: Counter = { hits: 0 };
+bump(&mut counter);
+bump(&mut counter);
+console.log(`counter: ${counter.hits}`);

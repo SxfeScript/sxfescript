@@ -9,130 +9,11 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Public+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="site.css">
 <style>
-  :root {
-    --paper: #f2f5f4;
-    --card: #ffffff;
-    --card-2: #eaf0ee;
-    --rule: #d5dfdc;
-    --rule-soft: #e3eae8;
-    --ink: #131c1a;
-    --ink-mid: #43524d;
-    --ink-soft: #62706b;
-    --safe: #0e6e63;
-    --safe-wash: #ddeeea;
-    --unsafe: #a5540f;
-    --unsafe-wash: #f5e4d3;
-    --accent: #0e6e63;
-    --accent-wash: #ddeeea;
-    --stop: #9c3a3a;
-    --stop-wash: #f5dede;
-    --shadow: 0 1px 2px rgba(16,26,24,.05), 0 14px 34px -22px rgba(16,26,24,.35);
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      --paper: #130f18; --card: #1c1622; --card-2: #241d2a; --rule: #3c2e48;
-      --rule-soft: #2f2537; --ink: #f2f1f4; --ink-mid: #c7c1cd; --ink-soft: #a9a0b1;
-      --safe: #5fc9ba; --safe-wash: #1c3430;
-      --unsafe: #e5975a; --unsafe-wash: #3a2a17;
-      --accent: #5fc9ba; --accent-wash: #1c3430;
-      --stop: #e08a8a; --stop-wash: #3a2222;
-      --shadow: 0 1px 2px rgba(0,0,0,.5), 0 14px 34px -22px rgba(0,0,0,.8);
-    }
-  }
-  :root[data-theme="dark"] {
-    --paper: #130f18; --card: #1c1622; --card-2: #241d2a; --rule: #3c2e48;
-    --rule-soft: #2f2537; --ink: #f2f1f4; --ink-mid: #c7c1cd; --ink-soft: #a9a0b1;
-    --safe: #5fc9ba; --safe-wash: #1c3430;
-    --unsafe: #e5975a; --unsafe-wash: #3a2a17;
-    --accent: #5fc9ba; --accent-wash: #1c3430;
-    --stop: #e08a8a; --stop-wash: #3a2222;
-    --shadow: 0 1px 2px rgba(0,0,0,.5), 0 14px 34px -22px rgba(0,0,0,.8);
-  }
-
-  * { box-sizing: border-box; }
-  html {
-    scroll-behavior: smooth; overflow-x: hidden;
-    scrollbar-color: color-mix(in srgb, var(--accent) 55%, var(--rule)) transparent;
-    scrollbar-width: thin;
-  }
-  @media (prefers-reduced-motion: reduce) {
-    html { scroll-behavior: auto; }
-    * { transition: none !important; }
-  }
-  /* Firefox reads scrollbar-color above; everything else reads this. Kept
-     thin and low-contrast so it recedes -- a scrollbar is chrome, not content. */
-  ::-webkit-scrollbar { width: 11px; height: 11px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb {
-    background: color-mix(in srgb, var(--accent) 45%, var(--rule));
-    border-radius: 999px; border: 3px solid var(--paper); background-clip: padding-box;
-  }
-  ::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: padding-box; }
-  body {
-    margin: 0; color: var(--ink); overflow-x: hidden;
-    /* A bright violet-blue glow top-left, a faint warm counterpoint
-       top-right, fading to the flat page color by the time content
-       scrolls past them. */
-    background:
-      radial-gradient(1100px 620px at 15% -12%, color-mix(in srgb, #7c6cff 26%, transparent), transparent 60%),
-      radial-gradient(900px 520px at 105% -6%, color-mix(in srgb, var(--unsafe) 10%, transparent), transparent 55%),
-      var(--paper);
-    background-repeat: no-repeat;
-    background-attachment: fixed;
-    font-family: "Public Sans", ui-sans-serif, system-ui, sans-serif;
-    font-size: 16px; line-height: 1.62; -webkit-font-smoothing: antialiased;
-  }
-  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 22px; }
-  a { color: var(--accent); }
-  code, pre, .mono {
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
-  }
-  code {
-    font-size: .87em; background: var(--card-2); border: 1px solid var(--rule-soft);
-    border-radius: 4px; padding: .08em .36em;
-  }
-  pre {
-    background: var(--card-2); border: 1px solid var(--rule); border-radius: 10px;
-    padding: 18px 20px; overflow-x: auto; box-shadow: var(--shadow);
-  }
-  pre code { background: none; border: 0; padding: 0; font-size: .86em; line-height: 1.6; }
-  h1, h2, h3 { font-family: Newsreader, Georgia, serif; text-wrap: balance; letter-spacing: -.01em; }
-  p { max-width: 68ch; text-wrap: pretty; }
-  .kw-safe { color: var(--safe); font-weight: 600; }
-  .kw-unsafe { color: var(--unsafe); font-weight: 600; }
-
-  /* ---- nav ---- */
-  nav.top {
-    position: sticky; top: 0; z-index: 20; background: color-mix(in srgb, var(--paper) 88%, transparent);
-    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
-    border-bottom: 1px solid var(--rule-soft);
-  }
-  nav.top .row { display: flex; align-items: center; gap: 20px; padding: 14px 22px; max-width: 1120px; margin: 0 auto; }
-  .wordmark {
-    font-family: "JetBrains Mono", monospace; font-weight: 600; font-size: 15px;
-    color: var(--ink); text-decoration: none; letter-spacing: -.01em;
-    display: inline-flex; align-items: center; gap: 8px;
-  }
-  .wordmark img { width: 30px; height: 30px; border-radius: 7px; flex-shrink: 0; }
-  .wordmark .wm-accent { color: var(--safe); }
-  nav.top ul { list-style: none; display: flex; gap: 18px; margin: 0 0 0 auto; padding: 0; }
-  /* Below this width the link list can't fit next to the wordmark and GitHub
-     button without wrapping into a second, cramped row -- the page's own
-     scroll order already serves as navigation here, so the links step aside
-     rather than wrap. */
-  @media (max-width: 640px) { nav.top ul { display: none; } }
-  nav.top a.navlink {
-    color: var(--ink-mid); text-decoration: none; font-size: 14px; font-weight: 500;
-    padding-bottom: 2px; border-bottom: 1px solid transparent; transition: color .15s ease, border-color .15s ease;
-  }
-  nav.top a.navlink:hover { color: var(--ink); border-color: var(--accent); }
-  .gh-link {
-    display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px;
-    border: 1px solid var(--rule); border-radius: 999px; font-size: 13px; font-weight: 600;
-    color: var(--ink); text-decoration: none; background: var(--card);
-  }
-
+  /* Tokens, base typography, nav, buttons, the copy button and the footer
+     live in site.css, shared with every generated documentation page. What
+     is left here is the landing page's own layout. */
   /* ---- hero ---- */
   header.hero { padding: 76px 0 40px; }
   .kicker {
@@ -160,32 +41,10 @@
   }
   pre.install-cmd[hidden] { display: none; }
   pre.install-cmd code { color: var(--safe); }
-  .copy-btn {
-    position: absolute; top: 50%; right: 10px; transform: translateY(-50%);
-    width: 28px; height: 28px; padding: 0; display: flex; align-items: center; justify-content: center;
-    border: 1px solid var(--rule); border-radius: 6px; background: var(--card);
-    color: var(--ink-soft); cursor: pointer; font-size: 0;
-  }
-  .copy-btn:hover { color: var(--ink); border-color: var(--accent); }
-  .copy-btn::before {
-    content: ""; width: 14px; height: 14px;
-    background: currentColor;
-    -webkit-mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>') center / contain no-repeat;
-    mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>') center / contain no-repeat;
-  }
-  .copy-btn.copied { color: var(--safe); border-color: var(--safe); }
-  .copy-btn.copied::before {
-    -webkit-mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>');
-    mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>');
-  }
+  /* One line of text, so the button centers rather than sitting at the top
+     the way it does on a multi-line block. */
+  pre.install-cmd .copy-btn { top: 50%; transform: translateY(-50%); }
   p.install-note { font-size: 13px; color: var(--ink-soft); margin: 0 0 44px; }
-  .btn {
-    display: inline-flex; align-items: center; gap: 8px; padding: 11px 20px; border-radius: 8px;
-    font-weight: 600; font-size: 14.5px; text-decoration: none; border: 1px solid transparent;
-  }
-  .btn-primary { background: var(--ink); color: var(--paper); }
-  .btn-ghost { border-color: var(--rule); color: var(--ink); background: var(--card); }
-
   .hero-grid { display: grid; grid-template-columns: 1.15fr .85fr; gap: 48px; align-items: start; }
   @media (max-width: 860px) { .hero-grid { grid-template-columns: 1fr; } }
   .compare-hero { display: grid; grid-template-columns: 1fr; gap: 14px; }
@@ -194,6 +53,28 @@
     font-family: "JetBrains Mono", monospace; font-size: 11px; letter-spacing: .08em;
     text-transform: uppercase; color: var(--ink-mid); margin: 0 0 8px;
   }
+
+  /* ---- runnable examples ---- */
+  .ex-tabs { display: flex; gap: 2px; margin-bottom: 14px; flex-wrap: wrap; }
+  .ex-tab {
+    font-family: "JetBrains Mono", monospace; font-size: 12.5px; font-weight: 600;
+    padding: 7px 14px; border: 1px solid var(--rule); border-radius: 7px;
+    background: var(--card); color: var(--ink-soft); cursor: pointer;
+  }
+  .ex-tab:hover { color: var(--ink); }
+  .ex-tab.active { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+  .ex-panel[hidden] { display: none; }
+  .ex-panel .ex-file {
+    font-family: "JetBrains Mono", monospace; font-size: 11.5px; letter-spacing: .06em;
+    color: var(--ink-soft); margin: 0 0 8px;
+  }
+  .ex-panel pre { position: relative; margin: 0; font-size: 13px; }
+  .ex-run {
+    font-family: "JetBrains Mono", monospace; font-size: 11px; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--ink-soft); margin: 18px 0 8px;
+  }
+  pre.ex-out { background: var(--card); box-shadow: none; }
+  pre.ex-out code { color: var(--ink-mid); }
 
   /* ---- sections ---- */
   section { padding: 56px 0; border-top: 1px solid var(--rule-soft); }
@@ -256,14 +137,6 @@
   ul.check li::before { content: "\2713"; position: absolute; left: 0; color: var(--safe); font-weight: 700; }
   ul.plain li::before { content: "\00b7"; position: absolute; left: 4px; color: var(--ink-soft); font-weight: 700; }
 
-  footer {
-    padding: 44px 0 60px; border-top: 1px solid var(--rule-soft); margin-top: 20px;
-  }
-  footer .row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px; }
-  footer p { color: var(--ink-soft); font-size: 13.5px; margin: 0; }
-  footer .links { display: flex; gap: 16px; flex-wrap: wrap; }
-  footer a { color: var(--ink-mid); font-size: 13.5px; text-decoration: none; }
-  footer a:hover { color: var(--ink); }
 </style>
 </head>
 <body>
@@ -272,7 +145,8 @@
   <div class="row">
     <a class="wordmark" href="#top"><img src="logo.png" alt="" width="30" height="30"><span>Sxfe<span class="wm-accent">Script</span></span></a>
     <ul>
-      <li><a class="navlink" href="#what-is">Overview</a></li>
+      <li><a class="navlink" href="docs/">Docs</a></li>
+      <li><a class="navlink" href="#code">Code</a></li>
       <li><a class="navlink" href="#vs-typescript">vs TypeScript</a></li>
       <li><a class="navlink" href="#arcsx">ArcSX runtime</a></li>
       <li><a class="navlink" href="#contributing">Contributing</a></li>
@@ -294,8 +168,9 @@
           QuickJS-based runtime built to run the same on a phone as it does on a server.
         </p>
         <div class="cta-row">
-          <a class="btn btn-primary" href="{{REPO_URL}}">View the source</a>
-          <a class="btn btn-ghost" href="{{REPO_URL}}/blob/main/spec/LANGUAGE.md">Read the language spec</a>
+          <a class="btn btn-primary" href="docs/">Read the docs</a>
+          <a class="btn btn-ghost" href="{{REPO_URL}}">View the source</a>
+          <a class="btn btn-ghost" href="docs/quickstart/">Quick start</a>
           <a class="btn btn-ghost" href="#contributing">Contribute</a>
         </div>
         <div class="install-tabs" role="tablist" aria-label="Install command">
@@ -330,6 +205,114 @@
       </div>
     </div>
   </header>
+
+  <section id="code">
+    <h2 class="h">What it looks like</h2>
+    <p class="lede-s">
+      Each of these is a real file in
+      <a href="{{REPO_URL}}/tree/main/examples"><code>examples/</code></a>, and the
+      output under it is what that file actually prints. Nothing here needs a
+      config file, a bundler, or a step before <code>sxn</code> runs it.
+    </p>
+
+    <div class="ex-tabs" role="tablist" aria-label="Example">
+      <button type="button" class="ex-tab active" role="tab" aria-selected="true" data-ex="server">HTTP server</button>
+      <button type="button" class="ex-tab" role="tab" aria-selected="false" data-ex="sx">Ownership</button>
+      <button type="button" class="ex-tab" role="tab" aria-selected="false" data-ex="fetch">fetch &amp; streams</button>
+      <button type="button" class="ex-tab" role="tab" aria-selected="false" data-ex="ffi">Calling C</button>
+    </div>
+
+    <div class="ex-panel" data-ex="server">
+      <p class="ex-file">examples/server.mjs</p>
+      <pre><code>const server = Sxn.serve({ port: 0 }, async (req) =&gt; {
+  const url = new URL(req.url);
+
+  if (url.pathname === "/notes" &amp;&amp; req.method === "GET") {
+    return Response.json([...notes].map(([id, text]) =&gt; ({ id, text })));
+  }
+
+  if (url.pathname === "/notes" &amp;&amp; req.method === "POST") {
+    const { text } = await req.json();
+    const id = nextId++;
+    notes.set(id, text);
+    return Response.json({ id, text }, { status: 201 });
+  }
+
+  return new Response("not found", { status: 404 });
+});
+
+console.log(`listening on ${server.url}`);</code></pre>
+      <p class="ex-run">sxn examples/server.mjs</p>
+      <pre class="ex-out"><code>listening on http://127.0.0.1:56690
+POST /notes -&gt; 201 {"id":2,"text":"written by the example"}
+GET  /notes -&gt; 200 [{"id":1,"text":"the first note"},{"id":2,"text":"written by the example"}]</code></pre>
+    </div>
+
+    <div class="ex-panel" data-ex="sx" hidden>
+      <p class="ex-file">examples/hello.sx</p>
+      <pre><code>interface Counter {
+  hits: i32;
+}
+
+// &amp;mut borrows the counter exclusively: bump can change what it was
+// handed without taking ownership of it.
+function bump(c: <span class="kw-unsafe">&amp;mut</span> Counter): void {
+  c.hits += 1;
+}
+
+<span class="kw-safe">let mut</span> counter: Counter = { hits: 0 };
+bump(&amp;mut counter);
+bump(&amp;mut counter);
+console.log(`counter: ${counter.hits}`);</code></pre>
+      <p class="ex-run">sxn examples/hello.sx</p>
+      <pre class="ex-out"><code>counter: 2</code></pre>
+    </div>
+
+    <div class="ex-panel" data-ex="fetch" hidden>
+      <p class="ex-file">examples/fetch.mjs</p>
+      <pre><code>const res = await fetch("https://example.com/");
+console.log(res.status, res.headers.get("content-type"));
+
+// A response body is a real ReadableStream, so it can be read a
+// chunk at a time instead of all at once.
+const streamed = await fetch("https://example.com/");
+let chunks = 0, characters = 0;
+for await (const chunk of streamed.body.pipeThrough(new TextDecoderStream())) {
+  chunks += 1;
+  characters += chunk.length;
+}
+console.log(`${chunks} chunk(s), ${characters} characters`);</code></pre>
+      <p class="ex-run">sxn examples/fetch.mjs</p>
+      <pre class="ex-out"><code>200 text/html
+559 bytes
+1 chunk(s), 559 characters</code></pre>
+    </div>
+
+    <div class="ex-panel" data-ex="ffi" hidden>
+      <p class="ex-file">examples/ffi.mjs</p>
+      <pre><code>const libm = {
+  darwin: "libSystem.B.dylib",
+  linux: "libm.so.6",
+  win32: "msvcrt.dll",
+}[process.platform];
+
+const pow = Sxn.ffi(libm, "pow", ["f64", "f64"], "f64");
+const sqrt = Sxn.ffi(libm, "sqrt", ["f64"], "f64");
+
+console.log("pow(2, 10) =", pow(2, 10));
+console.log("sqrt(144)  =", sqrt(144));</code></pre>
+      <p class="ex-run">sxn examples/ffi.mjs</p>
+      <pre class="ex-out"><code>pow(2, 10) = 1024
+sqrt(144)  = 12</code></pre>
+    </div>
+
+    <p style="margin-top:26px;">
+      More of them, each with its output, on the
+      <a href="docs/examples/">examples page</a>. The
+      <a href="docs/quickstart/">quick start</a> goes from an empty directory to
+      a running server.
+    </p>
+  </section>
 
   <section id="what-is">
     <h2 class="h">What SxfeScript actually adds</h2>
@@ -415,7 +398,7 @@
       TypeScript documents intent for humans and tooling. SxfeScript's safe subset makes a
       narrower, different claim: a runtime contract, smaller in scope than TypeScript's type
       system today (see the honest gap list in
-      <a href="{{REPO_URL}}/blob/main/spec/IMPLEMENTATION.md">spec/IMPLEMENTATION.md</a>), and
+      <a href="docs/implementation/">spec/IMPLEMENTATION.md</a>), and
       still growing, but real where it applies rather than a promise the runtime never checks.
     </p>
   </section>
@@ -432,7 +415,7 @@
     <p style="color:var(--ink-mid); font-size:14.5px; max-width:68ch; margin-bottom:12px;">
       What that's actually good for, measured against Node 25 and Bun 1.2 on the same Apple
       M4 (full methodology, a second machine, and the interpreter-level work behind these
-      numbers are in the <a href="{{REPO_URL}}/blob/main/README.md">README</a>):
+      numbers are in the <a href="docs/readme/">README</a>):
     </p>
     <div class="scroll">
       <table>
@@ -489,21 +472,21 @@
         <h3>Calling native code</h3>
         <p><code>Sxn.ffi</code> calls a C function through libffi. It's an engine capability,
         not a Node one. The design reasoning for that split, and what it means for
-        mobile, is in <a href="{{REPO_URL}}/blob/main/spec/NATIVE.md">spec/NATIVE.md</a>.</p>
+        mobile, is in <a href="docs/native/">spec/NATIVE.md</a>.</p>
       </div>
       <div class="card">
         <h3>Precompiled bytecode</h3>
         <p><code>sxn compile app.js</code> writes a <code>.sxbc</code> file that skips
         parsing entirely on later runs, measured 12% faster on a one-line script, 37%
         on a 618&nbsp;KB generated file. <code>--compile-cache</code> does the same thing
-        automatically, on every launch. <a href="{{REPO_URL}}/blob/main/spec/BYTECODE.md">spec/BYTECODE.md</a>.</p>
+        automatically, on every launch. <a href="docs/bytecode/">spec/BYTECODE.md</a>.</p>
       </div>
     </div>
 
     <p style="margin-top:26px; color:var(--ink-mid); font-size:14.5px; max-width:66ch;">
       Every number above is measured, not estimated. The full benchmark methodology,
       both test machines' specs, and the interpreter-level optimizations behind them are in
-      the <a href="{{REPO_URL}}/blob/main/README.md">project README</a>.
+      the <a href="docs/readme/">project README</a>.
     </p>
   </section>
 
@@ -546,10 +529,10 @@
       project, not settled history:
     </p>
     <ul class="plain" style="margin-bottom: 20px;">
-      <li><a href="{{REPO_URL}}/blob/main/spec/LANGUAGE.md">spec/LANGUAGE.md</a>: the language contract</li>
-      <li><a href="{{REPO_URL}}/blob/main/spec/ABI.md">spec/ABI.md</a>: the native/JS boundary</li>
-      <li><a href="{{REPO_URL}}/blob/main/spec/IMPLEMENTATION.md">spec/IMPLEMENTATION.md</a>: what's real today, and what isn't yet</li>
-      <li><a href="{{REPO_URL}}/blob/main/spec/RUNTIME.md">spec/RUNTIME.md</a> &amp; <a href="{{REPO_URL}}/blob/main/spec/NODE.md">spec/NODE.md</a>: the two compatibility surfaces</li>
+      <li><a href="docs/language/">spec/LANGUAGE.md</a>: the language contract</li>
+      <li><a href="docs/abi/">spec/ABI.md</a>: the native/JS boundary</li>
+      <li><a href="docs/implementation/">spec/IMPLEMENTATION.md</a>: what's real today, and what isn't yet</li>
+      <li><a href="docs/runtime/">spec/RUNTIME.md</a> &amp; <a href="docs/node/">spec/NODE.md</a>: the two compatibility surfaces</li>
     </ul>
     <div class="cta-row">
       <a class="btn btn-primary" href="{{REPO_URL}}/issues/new">Open an issue</a>
@@ -559,11 +542,11 @@
 
   <footer>
     <div class="row">
-      <p>SxfeScript / ArcSX &middot; this page is generated from <code>docs/</code> and deployed by GitHub Actions.</p>
+      <p>SxfeScript / ArcSX &middot; the docs pages are generated from the repo's own markdown.</p>
       <div class="links">
         <a href="{{REPO_URL}}">Source</a>
-        <a href="{{REPO_URL}}/blob/main/README.md">README</a>
-        <a href="{{REPO_URL}}/tree/main/spec">Specs</a>
+        <a href="docs/">Docs</a>
+        <a href="llms.txt">llms.txt</a>
         <a href="{{REPO_URL}}/issues">Issues</a>
       </div>
     </div>
@@ -581,13 +564,36 @@
     tabs.forEach(function (t) { t.addEventListener("click", function () { show(t.dataset.os); }); });
     if (/Win/.test(navigator.platform || navigator.userAgent)) show("windows");
 
+    // Every example block gets a copy button too, so the button is attached
+    // here rather than written out four more times in the markup. The output
+    // blocks are excluded: nobody wants to copy a program's output.
+    document.querySelectorAll(".ex-panel pre:not(.ex-out)").forEach(function (pre) {
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "copy-btn";
+      btn.setAttribute("aria-label", "Copy code");
+      pre.appendChild(btn);
+    });
+
     document.querySelectorAll(".copy-btn").forEach(function (btn) {
       btn.addEventListener("click", function () {
-        var code = btn.previousElementSibling.textContent;
+        var code = btn.parentNode.querySelector("code").textContent;
         navigator.clipboard.writeText(code).then(function () {
           btn.classList.add("copied");
           setTimeout(function () { btn.classList.remove("copied"); }, 1800);
         });
+      });
+    });
+
+    var exTabs = document.querySelectorAll(".ex-tab");
+    var exPanels = document.querySelectorAll(".ex-panel");
+    exTabs.forEach(function (t) {
+      t.addEventListener("click", function () {
+        exTabs.forEach(function (o) {
+          o.classList.toggle("active", o === t);
+          o.setAttribute("aria-selected", o === t);
+        });
+        exPanels.forEach(function (p) { p.hidden = p.dataset.ex !== t.dataset.ex; });
       });
     });
   })();

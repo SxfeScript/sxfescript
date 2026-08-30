@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{TITLE}} &middot; SxfeScript</title>
+<meta name="description" content="{{DESCRIPTION}}">
+<link rel="icon" type="image/png" href="{{ROOT}}logo.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Public+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ROOT}}site.css">
+<style>
+  .docs-layout {
+    display: grid; grid-template-columns: 232px minmax(0, 1fr);
+    gap: 52px; align-items: start; padding: 34px 0 0;
+  }
+  @media (max-width: 900px) { .docs-layout { grid-template-columns: 1fr; gap: 24px; } }
+
+  /* ---- sidebar ---- */
+  .sidebar { position: sticky; top: 78px; max-height: calc(100vh - 100px); overflow-y: auto; }
+  @media (max-width: 900px) {
+    .sidebar { position: static; max-height: none; border-bottom: 1px solid var(--rule-soft); padding-bottom: 18px; }
+  }
+  .sidebar h4 {
+    font-family: "JetBrains Mono", monospace; font-size: 10.5px; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--ink-soft); margin: 22px 0 8px; font-weight: 600;
+  }
+  .sidebar h4:first-child { margin-top: 0; }
+  .sidebar ul { list-style: none; margin: 0; padding: 0; }
+  .sidebar li a {
+    display: block; padding: 5px 10px; margin-left: -10px; border-radius: 6px;
+    color: var(--ink-mid); text-decoration: none; font-size: 14px; line-height: 1.45;
+  }
+  .sidebar li a:hover { color: var(--ink); background: var(--card-2); }
+  .sidebar li a.current { color: var(--accent); background: var(--accent-wash); font-weight: 600; }
+
+  /* ---- rendered markdown ---- */
+  .doc { min-width: 0; padding-bottom: 40px; }
+  .doc > h1:first-child { margin-top: 0; }
+  .doc h1 { font-size: clamp(30px, 4vw, 40px); font-weight: 600; margin: 0 0 20px; }
+  .doc h2 {
+    font-size: 25px; font-weight: 600; margin: 46px 0 12px;
+    padding-top: 18px; border-top: 1px solid var(--rule-soft);
+  }
+  .doc h3 { font-size: 19px; font-weight: 600; margin: 30px 0 8px; }
+  .doc h4 { font-size: 16px; font-weight: 700; margin: 22px 0 6px; font-family: "Public Sans", sans-serif; }
+  .doc p { color: var(--ink-mid); margin: 0 0 15px; }
+  .doc li { color: var(--ink-mid); margin: 4px 0; }
+  .doc ul, .doc ol { padding-left: 22px; margin: 0 0 15px; }
+  .doc li > p { margin: 0 0 6px; }
+  .doc strong { color: var(--ink); font-weight: 600; }
+  .doc a { text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+  .doc blockquote {
+    margin: 0 0 15px; padding: 2px 0 2px 18px; border-left: 3px solid var(--rule);
+    color: var(--ink-soft);
+  }
+  .doc hr { border: 0; border-top: 1px solid var(--rule-soft); margin: 34px 0; }
+  /* Room on the right for the copy button, so a long line scrolls under
+     nothing but empty padding. */
+  .doc pre { position: relative; margin: 0 0 18px; padding-right: 52px; }
+  /* A highlighted fence arrives as .highlight > pre with the tokens as bare
+     spans and no <code>, so the code-sized type has to be set on the pre. */
+  .doc .highlight { margin: 0 0 18px; }
+  .doc .highlight pre { margin: 0; font-size: 13.5px; line-height: 1.6; }
+  /* A fence with no language is a command or a program's output rather than
+     source; the renderer leaves those bare, while highlighted code arrives
+     wrapped in .highlight. Flatten them so the two read differently. */
+  .doc > pre, .doc li > pre { background: var(--card); box-shadow: none; }
+  .doc > pre code, .doc li > pre code { color: var(--ink-mid); }
+  .doc img { max-width: 100%; }
+
+  /* Tables come out of the renderer wrapped in this element, which has no
+     display of its own, so it has to be told to be a scroll container --
+     otherwise a wide table pushes the whole page sideways. */
+  .doc .table-scroll {
+    display: block; overflow-x: auto; margin: 0 0 18px;
+    border: 1px solid var(--rule); border-radius: 8px; background: var(--card);
+  }
+  .doc table { border-collapse: collapse; width: 100%; }
+  .doc th, .doc td {
+    text-align: left; padding: 10px 15px; border-bottom: 1px solid var(--rule-soft);
+    vertical-align: top; font-size: 14px; color: var(--ink-mid);
+  }
+  .doc thead th {
+    font-family: "JetBrains Mono", monospace; font-size: 10.5px; letter-spacing: .09em;
+    text-transform: uppercase; color: var(--ink-mid); font-weight: 600;
+    background: var(--card-2); border-bottom: 2px solid var(--rule); white-space: nowrap;
+  }
+  .doc tbody tr:last-child td { border-bottom: 0; }
+  .doc td code { background: none; border: 0; padding: 0; }
+
+  /* Anchor links on headings: present for linking, invisible until hovered. */
+  .doc .anchor {
+    float: left; margin-left: -22px; padding-right: 8px; text-decoration: none;
+    color: var(--ink-soft); opacity: 0; font-weight: 400;
+  }
+  .doc h2:hover .anchor, .doc h3:hover .anchor, .doc .anchor:focus { opacity: 1; }
+
+  /* The renderer emits GitHub's own token classes. Map the handful that
+     actually appear onto this site's palette rather than shipping GitHub's
+     stylesheet for them. */
+  .pl-c { color: var(--ink-soft); font-style: italic; }
+  .pl-k { color: var(--unsafe); }
+  .pl-s, .pl-pds, .pl-sr { color: var(--safe); }
+  .pl-c1, .pl-cce { color: var(--accent); }
+  .pl-en, .pl-e, .pl-ent { color: var(--ink); font-weight: 600; }
+  .pl-s1, .pl-smi, .pl-v { color: var(--ink-mid); }
+
+  /* ---- prev/next ---- */
+  .doc-nav { display: flex; justify-content: space-between; gap: 14px; margin-top: 46px; flex-wrap: wrap; }
+  .doc-nav a {
+    flex: 1 1 220px; border: 1px solid var(--rule); border-radius: 10px; padding: 13px 16px;
+    background: var(--card); text-decoration: none; color: var(--ink); font-weight: 600; font-size: 14.5px;
+  }
+  .doc-nav a:hover { border-color: color-mix(in srgb, var(--accent) 40%, var(--rule)); }
+  .doc-nav a span {
+    display: block; font-family: "JetBrains Mono", monospace; font-size: 10.5px;
+    letter-spacing: .1em; text-transform: uppercase; color: var(--ink-soft);
+    font-weight: 600; margin-bottom: 3px;
+  }
+  .doc-nav a.next { text-align: right; }
+  .doc-source { margin-top: 26px; font-size: 13px; color: var(--ink-soft); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <div class="row">
+    <a class="wordmark" href="{{ROOT}}"><img src="{{ROOT}}logo.png" alt="" width="30" height="30"><span>Sxfe<span class="wm-accent">Script</span></span></a>
+    <ul>
+      <li><a class="navlink current" href="{{ROOT}}docs/">Docs</a></li>
+      <li><a class="navlink" href="{{ROOT}}#vs-typescript">vs TypeScript</a></li>
+      <li><a class="navlink" href="{{ROOT}}#arcsx">ArcSX runtime</a></li>
+      <li><a class="navlink" href="{{ROOT}}#contributing">Contributing</a></li>
+    </ul>
+    <a class="gh-link" href="{{REPO_URL}}">GitHub</a>
+  </div>
+</nav>
+
+<div class="wrap">
+  <div class="docs-layout">
+    <aside class="sidebar">
+{{SIDEBAR}}
+    </aside>
+    <article class="doc">
+{{CONTENT}}
+      <div class="doc-nav">
+{{PREVNEXT}}
+      </div>
+      <p class="doc-source">This page is generated from
+        <a href="{{REPO_URL}}/blob/main/{{SOURCE}}"><code>{{SOURCE}}</code></a>.
+        Machine-readable copies of the whole set:
+        <a href="{{ROOT}}llms.txt">llms.txt</a>,
+        <a href="{{ROOT}}llms-full.txt">llms-full.txt</a>.</p>
+    </article>
+  </div>
+
+  <footer>
+    <div class="row">
+      <p>SxfeScript / ArcSX</p>
+      <div class="links">
+        <a href="{{ROOT}}">Home</a>
+        <a href="{{ROOT}}docs/">Docs</a>
+        <a href="{{REPO_URL}}">Source</a>
+        <a href="{{REPO_URL}}/issues">Issues</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+<script>
+  (function () {
+    document.querySelectorAll(".doc pre").forEach(function (pre) {
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "copy-btn";
+      btn.setAttribute("aria-label", "Copy code");
+      btn.addEventListener("click", function () {
+        navigator.clipboard.writeText(pre.textContent).then(function () {
+          btn.classList.add("copied");
+          setTimeout(function () { btn.classList.remove("copied"); }, 1800);
+        });
+      });
+      pre.appendChild(btn);
+    });
+  })();
+</script>
+</body>
+</html>

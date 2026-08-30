@@ -18,10 +18,32 @@ ArcSX actually runs, and what's open for debate versus fixed -- lives at
 current design, are welcome** -- see [`CONTRIBUTING.md`](CONTRIBUTING.md) for
 what's genuinely open and the one constraint that isn't (no JIT, for mobile).
 
+## Documentation
+
+[**sxfescript.github.io/docs**](https://sxfescript.github.io/docs/) is every
+one of these markdown files rendered as a browsable site, generated from this
+repo by `scripts/publish-docs.sh` so a spec edit is a docs edit. Start with
+the [quick start](https://sxfescript.github.io/docs/quickstart/), or the
+[examples](https://sxfescript.github.io/docs/examples/) if you'd rather read
+code first. There is an [`llms.txt`](https://sxfescript.github.io/llms.txt)
+index and a single-file
+[`llms-full.txt`](https://sxfescript.github.io/llms-full.txt) for tooling.
+
 Everything past what's here -- the language, the ABI, the runtime and Node
 surfaces, native calling, bytecode, and the full performance write-up behind
 the two tables below -- lives in [`spec/`](spec/); see that directory's own
 files for each topic.
+
+Complete programs that run as-is are in [`examples/`](examples/):
+
+| File | What it shows |
+|---|---|
+| [`hello.sx`](examples/hello.sx) | Erasable types, `let mut`, and an `&mut` borrow |
+| [`velocity.sx`](examples/velocity.sx) | A primitive-only interface as a fixed-layout struct |
+| [`server.mjs`](examples/server.mjs) | `Sxn.serve` with `Request`/`Response` routing and a JSON body |
+| [`fetch.mjs`](examples/fetch.mjs) | `fetch`, then the same response read as a stream |
+| [`files.mjs`](examples/files.mjs) | `Sxn.file`/`Sxn.write`, and `node:fs` over the same file |
+| [`ffi.mjs`](examples/ffi.mjs) | Calling a C function through `Sxn.ffi` |
 
 ## Install
 

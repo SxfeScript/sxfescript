@@ -1,0 +1,164 @@
+/* Shared by the landing page and every generated documentation page.
+   Page-specific rules stay in the page that needs them; anything both the
+   hand-written index.html and the markdown-rendered doc pages depend on --
+   the color tokens above all -- lives here so it is defined once. */
+
+:root {
+  --paper: #f2f5f4;
+  --card: #ffffff;
+  --card-2: #eaf0ee;
+  --rule: #d5dfdc;
+  --rule-soft: #e3eae8;
+  --ink: #131c1a;
+  --ink-mid: #43524d;
+  --ink-soft: #62706b;
+  --safe: #0e6e63;
+  --safe-wash: #ddeeea;
+  --unsafe: #a5540f;
+  --unsafe-wash: #f5e4d3;
+  --accent: #0e6e63;
+  --accent-wash: #ddeeea;
+  --stop: #9c3a3a;
+  --stop-wash: #f5dede;
+  --shadow: 0 1px 2px rgba(16,26,24,.05), 0 14px 34px -22px rgba(16,26,24,.35);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #130f18; --card: #1c1622; --card-2: #241d2a; --rule: #3c2e48;
+    --rule-soft: #2f2537; --ink: #f2f1f4; --ink-mid: #c7c1cd; --ink-soft: #a9a0b1;
+    --safe: #5fc9ba; --safe-wash: #1c3430;
+    --unsafe: #e5975a; --unsafe-wash: #3a2a17;
+    --accent: #5fc9ba; --accent-wash: #1c3430;
+    --stop: #e08a8a; --stop-wash: #3a2222;
+    --shadow: 0 1px 2px rgba(0,0,0,.5), 0 14px 34px -22px rgba(0,0,0,.8);
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #130f18; --card: #1c1622; --card-2: #241d2a; --rule: #3c2e48;
+  --rule-soft: #2f2537; --ink: #f2f1f4; --ink-mid: #c7c1cd; --ink-soft: #a9a0b1;
+  --safe: #5fc9ba; --safe-wash: #1c3430;
+  --unsafe: #e5975a; --unsafe-wash: #3a2a17;
+  --accent: #5fc9ba; --accent-wash: #1c3430;
+  --stop: #e08a8a; --stop-wash: #3a2222;
+  --shadow: 0 1px 2px rgba(0,0,0,.5), 0 14px 34px -22px rgba(0,0,0,.8);
+}
+
+* { box-sizing: border-box; }
+html {
+  scroll-behavior: smooth; overflow-x: hidden;
+  scrollbar-color: color-mix(in srgb, var(--accent) 55%, var(--rule)) transparent;
+  scrollbar-width: thin;
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  * { transition: none !important; }
+}
+/* Firefox reads scrollbar-color above; everything else reads this. Kept
+   thin and low-contrast so it recedes -- a scrollbar is chrome, not content. */
+::-webkit-scrollbar { width: 11px; height: 11px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--accent) 45%, var(--rule));
+  border-radius: 999px; border: 3px solid var(--paper); background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: padding-box; }
+body {
+  margin: 0; color: var(--ink); overflow-x: hidden;
+  /* A bright violet-blue glow top-left, a faint warm counterpoint
+     top-right, fading to the flat page color by the time content
+     scrolls past them. */
+  background:
+    radial-gradient(1100px 620px at 15% -12%, color-mix(in srgb, #7c6cff 26%, transparent), transparent 60%),
+    radial-gradient(900px 520px at 105% -6%, color-mix(in srgb, var(--unsafe) 10%, transparent), transparent 55%),
+    var(--paper);
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+  font-family: "Public Sans", ui-sans-serif, system-ui, sans-serif;
+  font-size: 16px; line-height: 1.62; -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 22px; }
+a { color: var(--accent); }
+code, pre, .mono {
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+code {
+  font-size: .87em; background: var(--card-2); border: 1px solid var(--rule-soft);
+  border-radius: 4px; padding: .08em .36em;
+}
+pre {
+  background: var(--card-2); border: 1px solid var(--rule); border-radius: 10px;
+  padding: 18px 20px; overflow-x: auto; box-shadow: var(--shadow);
+}
+pre code { background: none; border: 0; padding: 0; font-size: .86em; line-height: 1.6; }
+h1, h2, h3 { font-family: Newsreader, Georgia, serif; text-wrap: balance; letter-spacing: -.01em; }
+p { max-width: 68ch; text-wrap: pretty; }
+.kw-safe { color: var(--safe); font-weight: 600; }
+.kw-unsafe { color: var(--unsafe); font-weight: 600; }
+
+/* ---- nav ---- */
+nav.top {
+  position: sticky; top: 0; z-index: 20; background: color-mix(in srgb, var(--paper) 88%, transparent);
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--rule-soft);
+}
+nav.top .row { display: flex; align-items: center; gap: 20px; padding: 14px 22px; max-width: 1120px; margin: 0 auto; }
+.wordmark {
+  font-family: "JetBrains Mono", monospace; font-weight: 600; font-size: 15px;
+  color: var(--ink); text-decoration: none; letter-spacing: -.01em;
+  display: inline-flex; align-items: center; gap: 8px;
+}
+.wordmark img { width: 30px; height: 30px; border-radius: 7px; flex-shrink: 0; }
+.wordmark .wm-accent { color: var(--safe); }
+nav.top ul { list-style: none; display: flex; gap: 18px; margin: 0 0 0 auto; padding: 0; }
+/* Below this width the link list can't fit next to the wordmark and GitHub
+   button without wrapping into a second, cramped row -- the page's own
+   scroll order already serves as navigation here, so the links step aside
+   rather than wrap. */
+@media (max-width: 640px) { nav.top ul { display: none; } }
+nav.top a.navlink {
+  color: var(--ink-mid); text-decoration: none; font-size: 14px; font-weight: 500;
+  padding-bottom: 2px; border-bottom: 1px solid transparent; transition: color .15s ease, border-color .15s ease;
+}
+nav.top a.navlink:hover { color: var(--ink); border-color: var(--accent); }
+nav.top a.navlink.current { color: var(--ink); border-color: var(--accent); }
+.gh-link {
+  display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px;
+  border: 1px solid var(--rule); border-radius: 999px; font-size: 13px; font-weight: 600;
+  color: var(--ink); text-decoration: none; background: var(--card);
+}
+
+.btn {
+  display: inline-flex; align-items: center; gap: 8px; padding: 11px 20px; border-radius: 8px;
+  font-weight: 600; font-size: 14.5px; text-decoration: none; border: 1px solid transparent;
+}
+.btn-primary { background: var(--ink); color: var(--paper); }
+.btn-ghost { border-color: var(--rule); color: var(--ink); background: var(--card); }
+
+/* ---- copy button, on any <pre> that gets one ---- */
+.copy-btn {
+  position: absolute; top: 10px; right: 10px;
+  width: 28px; height: 28px; padding: 0; display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--rule); border-radius: 6px; background: var(--card);
+  color: var(--ink-soft); cursor: pointer; font-size: 0;
+}
+.copy-btn:hover { color: var(--ink); border-color: var(--accent); }
+.copy-btn::before {
+  content: ""; width: 14px; height: 14px;
+  background: currentColor;
+  -webkit-mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>') center / contain no-repeat;
+  mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>') center / contain no-repeat;
+}
+.copy-btn.copied { color: var(--safe); border-color: var(--safe); }
+.copy-btn.copied::before {
+  -webkit-mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>');
+  mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>');
+}
+
+footer {
+  padding: 44px 0 60px; border-top: 1px solid var(--rule-soft); margin-top: 20px;
+}
+footer .row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px; }
+footer p { color: var(--ink-soft); font-size: 13.5px; margin: 0; }
+footer .links { display: flex; gap: 16px; flex-wrap: wrap; }
+footer a { color: var(--ink-mid); font-size: 13.5px; text-decoration: none; }
+footer a:hover { color: var(--ink); }

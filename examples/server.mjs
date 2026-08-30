@@ -1,0 +1,46 @@
+// An HTTP server. Run it: sxn examples/server.mjs
+//
+// The handler takes a Request and returns a Response, the same two objects a
+// handler on Cloudflare Workers, Deno or Bun receives. `port: 0` asks the OS
+// for a free port; pass a real one to pick it yourself.
+
+const notes = new Map([[1, "the first note"]]);
+let nextId = 2;
+
+const server = Sxn.serve({ port: 0 }, async (req) => {
+  const url = new URL(req.url);
+
+  if (url.pathname === "/") {
+    return new Response("try /notes");
+  }
+
+  if (url.pathname === "/notes" && req.method === "GET") {
+    return Response.json([...notes].map(([id, text]) => ({ id, text })));
+  }
+
+  if (url.pathname === "/notes" && req.method === "POST") {
+    const { text } = await req.json();
+    const id = nextId++;
+    notes.set(id, text);
+    return Response.json({ id, text }, { status: 201 });
+  }
+
+  return new Response("not found", { status: 404 });
+});
+
+console.log(`listening on ${server.url}`);
+
+// Call the server we just started, from the same process.
+const created = await fetch(`${server.url}/notes`, {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ text: "written by the example" }),
+});
+console.log("POST /notes ->", created.status, await created.text());
+
+const all = await fetch(`${server.url}/notes`);
+console.log("GET  /notes ->", all.status, await all.text());
+
+// Without stop() the listening socket keeps the process alive, which is what
+// you want for a real server and not for a script that has finished.
+server.stop();
