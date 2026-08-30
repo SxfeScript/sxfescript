@@ -8,6 +8,12 @@
 #include "sxfe.h"
 #include "sxn_bootstrap.h"
 
+/* Sxn.ffi lives in src/ffi.c: calling native code is an engine capability
+   rather than a Node emulation, so it sits beside the runtime's own surface
+   and not in the node: layer. See the header comment there. */
+JSValue sxn_ffi(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+void sxn_ffi_init(JSContext *ctx);
+
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -174,13 +180,6 @@ static JSValue sxn_memory_usage(JSContext *ctx, JSValueConst this_val,
     MEM_FIELD("gcMaxNs", gc.max_ns);
 #undef MEM_FIELD
     return result;
-}
-
-static JSValue sxn_ffi(JSContext *ctx, JSValueConst this_val, int argc,
-                       JSValueConst *argv) {
-    (void)this_val; (void)argc; (void)argv;
-    return JS_ThrowTypeError(ctx,
-        "FFI calls require the native SX parser/ABI backend (not enabled in this build)");
 }
 
 static char *header_value(char *request, const char *name) {
@@ -1856,7 +1855,8 @@ int sxn_install_network(JSContext *ctx) {
     JS_SetPropertyStr(ctx, runtime, "file", JS_NewCFunction(ctx, sxn_file, "file", 1));
     JS_SetPropertyStr(ctx, runtime, "write", JS_NewCFunction(ctx, sxn_write, "write", 2));
     JS_SetPropertyStr(ctx, runtime, "memoryUsage", JS_NewCFunction(ctx, sxn_memory_usage, "memoryUsage", 0));
-    JS_SetPropertyStr(ctx, runtime, "ffi", JS_NewCFunction(ctx, sxn_ffi, "ffi", 3));
+    sxn_ffi_init(ctx);
+    JS_SetPropertyStr(ctx, runtime, "ffi", JS_NewCFunction(ctx, sxn_ffi, "ffi", 4));
     JS_SetPropertyStr(ctx, global, "Sxn", runtime);
     JS_SetPropertyStr(ctx, global, "__sxnServe", JS_NewCFunction(ctx, js_serve, "__sxnServe", 2));
 

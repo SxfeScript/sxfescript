@@ -126,7 +126,7 @@ static bool sxn_is_file(const char *path) {
 /* A file, or the same name with an extension appended, in this runtime's
    documented resolution order. Returns a fresh string or NULL. */
 static char *sxn_resolve_file(JSContext *ctx, const char *base) {
-    static const char *ext[] = { "", ".sx", ".mjs", ".js", ".cjs", ".json", ".ts" };
+    static const char *ext[] = { "", ".sx", ".mjs", ".js", ".cjs", ".json", ".node", ".ts" };
     char buf[PATH_MAX];
     for (size_t i = 0; i < sizeof(ext)/sizeof(ext[0]); i++) {
         if (snprintf(buf, sizeof(buf), "%s%s", base, ext[i]) >= (int)sizeof(buf)) continue;
@@ -373,6 +373,45 @@ static JSValue sxn_require_fn(JSContext *ctx, JSValueConst this_val,
         return ex;
     }
     JS_FreeValue(ctx, hit);
+
+    /* A .node file is a compiled addon, not source: hand it to
+       process.dlopen, which is where the Node-API loader lives. It is only
+       present when the node: layer installed one. */
+    if (suffix(path, ".node")) {
+        JSValue module_obj = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, module_obj, "exports", JS_NewObject(ctx));
+        JS_SetPropertyStr(ctx, module_obj, "id", JS_NewString(ctx, path));
+        JS_SetPropertyStr(ctx, module_obj, "filename", JS_NewString(ctx, path));
+        JS_SetPropertyStr(ctx, cache, path, JS_DupValue(ctx, module_obj));
+
+        JSValue global = JS_GetGlobalObject(ctx);
+        JSValue process = JS_GetPropertyStr(ctx, global, "process");
+        JSValue dlopen = JS_GetPropertyStr(ctx, process, "dlopen");
+        JS_FreeValue(ctx, global);
+        JSValue result;
+        if (!JS_IsFunction(ctx, dlopen)) {
+            result = JS_ThrowTypeError(ctx,
+                "cannot load '%s': native addons need the node compatibility layer", path);
+        } else {
+            JSValue file = JS_NewString(ctx, path);
+            JSValueConst args[2] = { module_obj, file };
+            result = JS_Call(ctx, dlopen, process, 2, args);
+            JS_FreeValue(ctx, file);
+        }
+        JS_FreeValue(ctx, dlopen);
+        JS_FreeValue(ctx, process);
+        if (JS_IsException(result)) {
+            JSAtom a = JS_NewAtom(ctx, path);
+            JS_DeleteProperty(ctx, cache, a, 0);
+            JS_FreeAtom(ctx, a);
+            JS_FreeValue(ctx, module_obj); JS_FreeValue(ctx, cache); js_free(ctx, path);
+            return result;
+        }
+        JS_FreeValue(ctx, result);
+        JSValue exports = JS_GetPropertyStr(ctx, module_obj, "exports");
+        JS_FreeValue(ctx, module_obj); JS_FreeValue(ctx, cache); js_free(ctx, path);
+        return exports;
+    }
 
     size_t len = 0;
     uint8_t *src = js_load_file(ctx, &len, path);

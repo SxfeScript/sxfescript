@@ -173,13 +173,24 @@ int sxfe_compile(const char *source, size_t length, SxfeCompileResult *out) {
             const char *quote = from ? strchr(from, '"') : NULL;
             const char *close = quote ? strchr(quote + 1, '"') : NULL;
             const char *open = strchr(source + p, '(');
-            const char *colon = open ? strchr(open, ':') : NULL;
-            if (name_len && from && quote && close && open && colon) {
+            const char *shut = open ? strchr(open, ')') : NULL;
+            const char *colon = shut ? strchr(shut, ':') : NULL;
+            if (name_len && from && quote && close && open && shut && colon) {
+                /* Sxn.ffi prepares the call once and returns the callable, so
+                   the declaration lowers to the binding itself rather than to
+                   a wrapper that re-resolves the symbol on every call. The
+                   argument list stops at the closing paren; the return type
+                   is what follows the colon, trimmed of its trailing `from`. */
+                const char *ret = colon + 1;
+                while (*ret == ' ') ret++;
+                const char *ret_end = ret;
+                while (ret_end < from && *ret_end != ' ' && *ret_end != ';') ret_end++;
                 char line[1024];
                 int n = snprintf(line, sizeof(line),
-                    "const %.*s = (...args) => Sxn.ffi(\"%.*s\", \"%.*s\", \"%.*s\", args);",
+                    "const %.*s = Sxn.ffi(\"%.*s\", \"%.*s\", \"%.*s\", \"%.*s\");",
                     (int)name_len, source + ns, (int)(close - quote - 1), quote + 1,
-                    (int)name_len, source + ns, (int)(colon - open - 1), open + 1);
+                    (int)name_len, source + ns, (int)(shut - open - 1), open + 1,
+                    (int)(ret_end - ret), ret);
                 if (n < 0 || (size_t)n >= sizeof(line) || append(&result, line, (size_t)n)) goto oom;
                 i = end;
                 continue;

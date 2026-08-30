@@ -41,8 +41,16 @@ yet represented as complete production implementations.
 
 The runtime also includes native HTTP serving with SSE/WebSocket response modes
 and a libcurl-backed global `fetch`; see `spec/NETWORK.md`. Applications use the
-Bun-style `Sxn` namespace (`Sxn.serve`, `Sxn.file`, `Sxn.write`, and
-`Sxn.fetch`). The `qjs:*` modules remain internal compatibility modules.
+Bun-style `Sxn` namespace (`Sxn.serve`, `Sxn.file`, `Sxn.write`, `Sxn.fetch`
+and `Sxn.ffi`). The `qjs:*` modules remain internal compatibility modules.
+
+Two separate things call into machine code, and `spec/NATIVE.md` explains why
+they are separate. `Sxn.ffi` calls a C function in a shared library through
+libffi, and belongs to the runtime: it is an engine capability, and it is the
+half that travels when this engine is embedded elsewhere. `.node` addons load
+through a Node-API implementation on QuickJS, and belong to the node: layer:
+that exists only to run npm's compiled addons, and a build without the Node
+surface drops it entirely.
 
 ## Benchmarks: sxn vs Node vs Bun
 

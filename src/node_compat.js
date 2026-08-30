@@ -523,6 +523,10 @@
       return [ds, dn];
     },
     { bigint: () => BigInt(Math.round(performance.now() * 1e6)) });
+  // What require() calls for a .node file. The addon's own napi_* imports
+  // resolve back to this executable, so there is nothing to pass but the
+  // module object it should fill in.
+  if (typeof __sxnDlopen === "function") process.dlopen = __sxnDlopen;
   process.emitWarning = function (w) { console.error("Warning: " + (w && w.message ? w.message : w)); };
   process.uptime = function () { return performance.now() / 1000; };
   process.pid = 0;

@@ -22,10 +22,16 @@ unsafe extern add(i32, i32): i32 from "add.dylib";
 Native parsing does not implement this lowering yet and rejects `extern`
 declarations with an explicit "not yet supported" error rather than
 mis-parsing them; the standalone compatibility transformer (src/frontend.c)
-still lowers the declaration to `Sxn.ffi` as a reference implementation, but
-it is no longer wired into execution. Calls must eventually be restricted to
-the declared C-ABI scalar types; strings, callbacks, pointers, structs, and
-variadics require separate ownership rules.
+lowers the declaration to
+
+```js
+const add = Sxn.ffi("add.dylib", "add", "i32, i32", "i32");
+```
+
+which is a call that now works -- see `spec/NATIVE.md` for the type list and
+what it does with pointers and strings. Structs by value, callbacks and
+variadics are still rejected there, because each needs ownership rules this
+document has not written down.
 
 ## Ownership
 

@@ -16,6 +16,18 @@ endif()
 # macOS/Linux, so this is a find, not a vendor.
 find_package(ZLIB REQUIRED)
 
+# libffi backs Sxn.ffi. It is a runtime capability rather than a Node one, so
+# it is not tied to the node: layer, but it is still optional: a build without
+# it keeps Sxn.ffi as a function that explains its own absence.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(LIBFFI QUIET IMPORTED_TARGET libffi)
+endif()
+if(NOT LIBFFI_FOUND)
+  find_path(LIBFFI_INCLUDE_DIR ffi.h PATH_SUFFIXES ffi)
+  find_library(LIBFFI_LIBRARY NAMES ffi)
+endif()
+
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -87,10 +99,27 @@ add_executable(sxn
   src/lsp.c
   src/network.c
   src/node.c
+  src/ffi.c
+  src/napi.c
 )
 add_dependencies(sxn sxn_bootstrap_header sxn_node_compat_header)
-target_include_directories(sxn PRIVATE include third_party/quickjs ${CMAKE_CURRENT_BINARY_DIR}/generated)
+target_include_directories(sxn PRIVATE include third_party/quickjs third_party/node-api ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(sxn PRIVATE sxfe qjs qjs-libc OpenSSL::Crypto CURL::libcurl libuv::uv_a ZLIB::ZLIB)
+if(LIBFFI_FOUND)
+  target_link_libraries(sxn PRIVATE PkgConfig::LIBFFI)
+elseif(LIBFFI_LIBRARY AND LIBFFI_INCLUDE_DIR)
+  target_include_directories(sxn PRIVATE ${LIBFFI_INCLUDE_DIR})
+  target_link_libraries(sxn PRIVATE ${LIBFFI_LIBRARY})
+else()
+  message(FATAL_ERROR "libffi not found; it backs Sxn.ffi (brew install libffi / apt install libffi-dev)")
+endif()
+if(NOT WIN32)
+  target_link_libraries(sxn PRIVATE ${CMAKE_DL_LIBS})
+endif()
+# A .node addon imports its napi_* functions from whoever loaded it, so this
+# executable has to hand its dynamic symbols to dlopen rather than keep them
+# private. Without this the addon loads and then cannot find napi_get_cb_info.
+set_target_properties(sxn PROPERTIES ENABLE_EXPORTS ON)
 if(WIN32)
   target_compile_definitions(sxn PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN)
 endif()
@@ -274,6 +303,26 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   add_test(NAME sxn-entry-commonjs COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/cjsentry/plain.js)
   add_test(NAME sxn-entry-esm-package COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/cjsentry/esmpkg/mod.js)
   add_test(NAME sxn-entry-extensionless COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/cjsentry/tool)
+  # Sxn.ffi against the platform's own C library, so there is nothing to build
+  # and the functions behave the same on every target.
+  add_test(NAME sxn-ffi COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/ffi.mjs)
+  # A real Node-API addon, compiled here against Node's own headers so the
+  # thing under test is the same binary shape npm ships.
+  add_library(sxn_test_addon MODULE ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/napi/hello.c)
+  set_target_properties(sxn_test_addon PROPERTIES
+    PREFIX "" OUTPUT_NAME "hello" SUFFIX ".node"
+    C_VISIBILITY_PRESET default)
+  target_include_directories(sxn_test_addon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/node-api)
+  target_compile_definitions(sxn_test_addon PRIVATE NODE_GYP_MODULE_NAME=hello)
+  if(APPLE)
+    target_link_options(sxn_test_addon PRIVATE -undefined dynamic_lookup)
+  elseif(UNIX)
+    target_link_options(sxn_test_addon PRIVATE -Wl,--unresolved-symbols=ignore-all)
+  endif()
+  add_test(NAME sxn-napi-addon COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/napi.mjs)
+  set_tests_properties(sxn-napi-addon PROPERTIES
+    ENVIRONMENT "SXN_TEST_ADDON=$<TARGET_FILE:sxn_test_addon>")
+  add_dependencies(sxn sxn_test_addon)
   set_tests_properties(sxn-node-http PROPERTIES TIMEOUT 40 FAIL_REGULAR_EXPRESSION "FAIL")
   add_test(NAME sxn-web-streams COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/web_streams.mjs)
   # Crypto/SubtleCrypto brands, and MessageChannel's two ports.

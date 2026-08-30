@@ -1644,6 +1644,11 @@ void sxn_free_node_compat(JSContext *ctx) {
     sxn_atom_error = JS_ATOM_NULL;
 }
 
+/* Node-API lives in src/napi.c and is installed from here, not from the
+   runtime's own surface: loading npm's compiled addons is Node emulation.
+   Sxn.ffi is the other half of the pair and sits on the runtime side. */
+void sxn_install_napi(JSContext *ctx, uv_loop_t *loop);
+
 int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
     if (sxn_atom_events == JS_ATOM_NULL) sxn_atom_events = JS_NewAtom(ctx, "_events");
     if (sxn_atom_length == JS_ATOM_NULL) sxn_atom_length = JS_NewAtom(ctx, "length");
@@ -1692,6 +1697,8 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
        import/export of its own -- it only assigns onto globalThis, which
        module vs. global evaluation doesn't affect -- so this is a pure
        bytecode-shape win with no behavior change. */
+    sxn_install_napi(ctx, uv_default_loop());
+
     JSValue result = JS_ReadObject(ctx, sxn_node_compat_bc, sxn_node_compat_bc_size,
                                    JS_READ_OBJ_BYTECODE);
     if (JS_IsException(result)) { JS_FreeValue(ctx, result); return -1; }

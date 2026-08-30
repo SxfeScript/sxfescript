@@ -18,4 +18,5 @@ FFI declarations are unsafe by default and are expected to use the platform C
 ABI. The initial syntax is `unsafe extern name(types): return from "library"`.
 Library handles must be runtime-owned and remain live until all wrappers and
 callbacks are released; native pointers may not outlive a call unless an
-explicit ownership type is added.
+explicit ownership type is added. What is implemented today, and where it
+sits relative to the Node compatibility layer, is `spec/NATIVE.md`.

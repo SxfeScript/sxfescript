@@ -18,11 +18,14 @@
 - LSP JSON-RPC transport and VS Code language registration.
 - Contextual `safe let`/`safe const` compatibility parsing and CLI
   `--memory-report`/`--leak-check` diagnostics using QuickJS accounting.
-- Primitive `unsafe extern` declaration lowering to the explicit `Sxn.ffi`
-  boundary exists in the standalone compatibility transformer, but native
-  parsing does not implement the FFI codegen yet -- it rejects `extern`
-  declarations with a clear "not yet supported" error rather than
-  mis-parsing them; dynamic loading and libffi trampolines remain pending.
+- `Sxn.ffi` is implemented on libffi and `dlopen`: scalars, pointers and
+  NUL-terminated strings, with structs by value, callbacks and variadics
+  rejected rather than half-supported. `.node` addons load through a
+  Node-API implementation on QuickJS. Which of the two lives in the runtime
+  and which in the node: layer, and why, is `spec/NATIVE.md`. Native parsing
+  of `unsafe extern` still rejects the declaration with a "not yet
+  supported" error rather than mis-parsing it; the standalone compatibility
+  transformer lowers it to the `Sxn.ffi` call that now works.
 - Native SX execution is unconditional; `SXN_NATIVE_SX` is no longer read
   and has no effect.
 
