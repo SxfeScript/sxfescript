@@ -102,39 +102,41 @@ runtime's startup cost.
 
 | Category | sxn | Node | Bun | Winner |
 |---|---|---|---|---|
-| Real-world end-to-end task | **9.0 ms** | 72.6 ms | 15.2 ms | sxn |
-| Cold start | **8.1 ms** | 41.7 ms | 8.9 ms | sxn / Bun tie |
-| Sustained throughput: Buffer ops | **21.3 ms** | 23.5 ms | 26.4 ms | sxn |
-| Sustained throughput: TextEncoder | 6.8 ms | 38.5 ms | **6.1 ms** | Bun, narrowly |
-| Sustained throughput: EventEmitter | 7.4 ms | **5.0 ms** | 8.9 ms | Node |
-| Pause consistency: total time | **134.0 ms** | 239.1 ms | 275.5 ms | sxn |
-| Pause consistency: worst single pause | **0.03 ms** | 0.20 ms | 3.27 ms | sxn |
-| Parse 32k-line generated file | **17.3 ms** | 54.7 ms | 24.9 ms | sxn |
+| Real-world end-to-end task | **8.4 ms** | 77.2 ms | 16.7 ms | sxn |
+| Cold start | **8.3 ms** | 42.6 ms | 9.5 ms | sxn |
+| Sustained throughput: Buffer ops | **19.2 ms** | 23.5 ms | 26.9 ms | sxn |
+| Sustained throughput: TextEncoder | **4.6 ms** | 38.5 ms | 6.2 ms | sxn |
+| Sustained throughput: EventEmitter | 6.6 ms | **5.0 ms** | 9.2 ms | Node |
+| Pause consistency: total time | **143.9 ms** | 263.7 ms | 308.9 ms | sxn |
+| Pause consistency: worst single pause | **0.04 ms** | 1.68 ms | 3.28 ms | sxn |
+| Parse 32k-line generated file | **15.0 ms** | 48.7 ms | 24.0 ms | sxn |
 
-Six of eight. TextEncoder is a tie in all but name -- over 15 interleaved
-runs sxn is the faster of the two at its best, 5.20 ms against 5.80, and Bun
-is the steadier, which is how Bun takes the median. EventEmitter is the one
-row with a real gap, and Node's 2x there is a JIT inlining a call to nothing.
+Seven of eight. TextEncoder and cold start both changed hands this pass:
+counting UTF-8 bytes eight units at a time turned a narrow loss into a 1.3x
+win, and compiling the bootstrap at build time rather than parsing it at
+launch took cold start past Bun. EventEmitter is the one row left, and Node's
+1.3x there is a JIT inlining a call to nothing -- an ablation that skips the
+fused call's guards entirely still only reaches 4.7 ms, because roughly a
+third of the row is this interpreter's own loop dispatch.
 
 ### Linux PC (Ryzen 7 5700G)
 
 | Category | sxn | Node 18 | Bun | Winner |
 |---|---|---|---|---|
-| Real-world end-to-end task | **9.6 ms** | 226.1 ms | 22.7 ms | sxn |
-| Cold start | **8.7 ms** | 115.7 ms | 14.1 ms | sxn |
-| Sustained throughput: Buffer ops | **42.3 ms** | 74.5 ms | 83.6 ms | sxn |
-| Sustained throughput: TextEncoder | **10.4 ms** | 89.2 ms | 16.0 ms | sxn |
-| Sustained throughput: EventEmitter | 16.5 ms | **13.0 ms** | 23.2 ms | Node |
-| Pause consistency: total time | **2835.9 ms** | 3493.2 ms | 3243.9 ms | sxn |
-| Pause consistency: worst single pause | **0.13 ms** | 2.81 ms | 6.54 ms | sxn |
-| Parse 32k-line generated file | **26.7 ms** | 148.0 ms | 52.0 ms | sxn |
+| Real-world end-to-end task | **8.2 ms** | 225.0 ms | 23.4 ms | sxn |
+| Cold start | **8.1 ms** | 114.8 ms | 14.5 ms | sxn |
+| Sustained throughput: Buffer ops | **38.5 ms** | 75.6 ms | 82.8 ms | sxn |
+| Sustained throughput: TextEncoder | **8.5 ms** | 89.1 ms | 16.1 ms | sxn |
+| Sustained throughput: EventEmitter | 14.3 ms | **13.0 ms** | 23.1 ms | Node |
+| Pause consistency: total time | **2899.4 ms** | 3507.0 ms | 3215.8 ms | sxn |
+| Pause consistency: worst single pause | **0.22 ms** | 2.83 ms | 5.63 ms | sxn |
+| Parse 32k-line generated file | **26.1 ms** | 145.0 ms | 53.8 ms | sxn |
 
 Seven of eight, and the numbers are far steadier than anything the laptop can
-produce -- sxn's seven throughput samples spanned 0.4 ms. Cold start is an
-outright win rather than a tie because Bun's own startup is slower here, and
-TextEncoder is a win rather than a tie because Bun's encode is. EventEmitter
-is Node's on both machines, which is the point: it is the one row where the
-gap is architectural rather than incidental.
+produce. Both machines now agree on which row is which: sxn takes everything
+except EventEmitter, and that one is Node's on both, which is the point --
+it is the one row where the gap is architectural rather than incidental. The
+Linux gap is the narrower of the two, 1.1x against the Mac's 1.3x.
 
 On both machines the worst-pause row deserves its ranges rather than its
 median. On the Mac, individual samples were 0.01-0.05 ms here against Node's
@@ -167,11 +169,10 @@ win outright.
 
 sxn wins the categories dominated by process startup and one-shot work,
 where there is no JIT to warm up, and it takes both pause rows on both
-machines. On Buffer throughput it is ahead of both JIT runtimes everywhere.
-TextEncoder is a tie on the Mac and a win on Linux. EventEmitter is Node's on
-both, by 1.3-1.5x after the fusion below: what is left there is the
-listener's own bytecode running on every emit, and Node removes it by
-inlining, which is what a JIT is.
+machines. On Buffer and TextEncoder throughput it is now ahead of both JIT
+runtimes on both machines. EventEmitter is Node's on both, by 1.1-1.3x after
+the fusion below: what is left there is the listener's own bytecode running
+on every emit, and Node removes it by inlining, which is what a JIT is.
 
 One thing the deeper microbenchmarks show is worth stating plainly: with the
 arena allocator in place, allocation *count* is no longer the limiting
@@ -268,6 +269,37 @@ named for but which every program does:
   call: 34.9 -> 24.2 ns against Node's 23.3. The remaining ~10 ns is the
   `uv_hrtime` clock read itself.
 
+- **The bootstrap is compiled at build time, not parsed at launch.**
+  `bootstrap.js` and `node_compat.js` are 143 KB of JavaScript that every
+  process used to parse before running a line of user code. `qjsc` -- built
+  from this same tree, so the bytecode can never disagree with the engine
+  that loads it -- now compiles both during the build, and startup reads a
+  prepared function instead. Cold start 10.7 -> 8.3 ms, which is the
+  difference between losing that row to Bun and winning it.
+- **The UTF-8 byte counter skips ASCII eight units at a time.** Counting how
+  many bytes a string would occupy is what `encoder.encode(s).length` and
+  `Buffer.byteLength` both reduce to, and it was one branch per character.
+  Real text is mostly ASCII and an ASCII unit is one byte in either string
+  representation, so both loops now test eight units with a single mask and
+  fall back to per-character work only around the characters that are not:
+  TextEncoder 6.8 -> 4.6 ms.
+- **Encoding names are recognised by identity, not interned.** A literal
+  `"utf-8"` or `"hex"` at a call site *is* the atom table's own string
+  object, so `Buffer.from` and `Buffer.prototype.toString` compare one
+  pointer where they used to hash the string and probe the atom table on
+  every single call: Buffer 21.3 -> 19.2 ms.
+- **The atom-to-string digit buffer moved out of line.** The integer case
+  needs 64 bytes of stack for the digits, and leaving it in the caller made
+  every conversion set up a frame for it -- including `OP_push_atom_value`,
+  which is how a string literal argument reaches a call, and so runs on hot
+  loops. Worth about 10% of the EventEmitter row on its own.
+- **The fused `emit` reaches its guards from pointers it already holds.**
+  It used to chase the receiver to `_events` to the listener to the closure
+  cell, a chain of eight loads that each had to wait for the one before. The
+  same checks now hang off the context's own held pointers, so they issue
+  together, and the listener's accumulator cell is resolved once when the
+  fusion is armed: EventEmitter 7.4 -> 6.5 ms.
+
 Together those took the pause row's own expression,
 `Buffer.from("payload " + i, "utf-8").length`, from 114.7 ns against Node's
 94.3 to 105.0 against 103.8, and the row's total from 511 ms to 277 against
@@ -287,7 +319,7 @@ ceilings did not justify the machinery.
 
 A second shape rides the same machinery: `encoder.encode(s).length`, which
 took TextEncoder from 14.2 ms to 6.8 against Bun's 6.2 -- a 2.3x loss turned
-into a tie. Only `from` with two arguments and `encode` with one are ever
+into a tie, and the ASCII-run counter below then took it to 4.6, a win. Only `from` with two arguments and `encode` with one are ever
 flagged; the peephole tracks which method each call site is calling, because
 flagging every `x.foo(a).length` would have made the fallback path a
 regression on ordinary code. A third rides it too: `ee.emit(name, value)`
@@ -295,16 +327,17 @@ where the sole listener is a captured numeric add. Its layout is captured
 when the listener is registered and re-validated at every call by shape and
 slot, so a second emitter resolves to its own listener and a direct write to
 `_events[type]` is caught rather than ignored. That took EventEmitter 9.3 ->
-7.4 ms, past Bun and not past Node -- which its ablation had predicted, and
-which is why it was built last.
+7.4 ms, and shortening its guard chain took it to 6.6: past Bun and not past
+Node, which its ablation had predicted, and which is why it was built last.
 
 The general form of what these fusions compute is `Buffer.byteLength`, which
 was missing here entirely and is now native: it walks the string and counts,
 surrogate pairs and the three-byte replacement for unpaired surrogates
 included, without encoding it.
 
-Cumulatively, on the Mac: Buffer 102->21.3 ms, TextEncoder 76->6.8 ms,
-EventEmitter 37->7.4 ms, and the pause benchmark's total 1.1 s->134 ms, with
+Cumulatively, on the Mac: Buffer 102->19.2 ms, TextEncoder 76->4.6 ms,
+EventEmitter 37->6.6 ms, cold start 10.7->8.3 ms, and the pause benchmark's
+total 1.1 s->143.9 ms, with
 zero GC cycles during the loops throughout. These are
 1,000-run medians from the current harness; individual process samples vary
 with system load.

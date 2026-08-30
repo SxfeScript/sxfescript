@@ -46,30 +46,38 @@ if(SXN_ENABLE_POISON)
 endif()
 
 # WinterCG globals (TextEncoder, URL, Headers, fetch's JS glue, ...) are
-# authored as plain JS in src/bootstrap.js and embedded as a byte array so
-# network.c can JS_Eval it at startup without shipping a loose file.
+# authored as plain JS in src/bootstrap.js and compiled to bytecode at build
+# time, so startup reads a prepared function instead of parsing 140KB of
+# JavaScript on every launch -- worth about 3ms of a 10ms cold start.
+#
+# The compiler is the qjsc built from this same tree, so the bytecode can
+# never disagree with the engine that loads it about the format version or
+# the atom table. That is the failure the checked-in lazy-builtin blobs are
+# exposed to and this is not.
 set(SXN_BOOTSTRAP_JS ${CMAKE_CURRENT_SOURCE_DIR}/src/bootstrap.js)
 set(SXN_BOOTSTRAP_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/sxn_bootstrap.h)
 add_custom_command(
   OUTPUT ${SXN_BOOTSTRAP_HEADER}
-  COMMAND ${CMAKE_COMMAND} -DIN=${SXN_BOOTSTRAP_JS} -DOUT=${SXN_BOOTSTRAP_HEADER} -DVAR=sxn_bootstrap_js
-          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_js.cmake
-  DEPENDS ${SXN_BOOTSTRAP_JS} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_js.cmake
-  COMMENT "Embedding bootstrap.js"
+  COMMAND qjsc -C -s -N sxn_bootstrap_bc -n "<sxn:bootstrap>"
+          -o ${SXN_BOOTSTRAP_HEADER} ${SXN_BOOTSTRAP_JS}
+  DEPENDS ${SXN_BOOTSTRAP_JS} qjsc
+  COMMENT "Compiling bootstrap.js"
+  VERBATIM
 )
 add_custom_target(sxn_bootstrap_header DEPENDS ${SXN_BOOTSTRAP_HEADER})
 
-# node:buffer/path/events/process are authored the same way (src/node_compat.js
-# embedded as a byte array), kept as a separate file/header from bootstrap.js
+# node:buffer/path/events/process are authored and compiled the same way
+# (src/node_compat.js), kept as a separate file/header from bootstrap.js
 # since it's a distinct WinterCG-vs-Node-compat concern.
 set(SXN_NODE_COMPAT_JS ${CMAKE_CURRENT_SOURCE_DIR}/src/node_compat.js)
 set(SXN_NODE_COMPAT_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/sxn_node_compat.h)
 add_custom_command(
   OUTPUT ${SXN_NODE_COMPAT_HEADER}
-  COMMAND ${CMAKE_COMMAND} -DIN=${SXN_NODE_COMPAT_JS} -DOUT=${SXN_NODE_COMPAT_HEADER} -DVAR=sxn_node_compat_js
-          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_js.cmake
-  DEPENDS ${SXN_NODE_COMPAT_JS} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_js.cmake
-  COMMENT "Embedding node_compat.js"
+  COMMAND qjsc -m -s -N sxn_node_compat_bc -n "<sxn:node_compat>"
+          -o ${SXN_NODE_COMPAT_HEADER} ${SXN_NODE_COMPAT_JS}
+  DEPENDS ${SXN_NODE_COMPAT_JS} qjsc
+  COMMENT "Compiling node_compat.js"
+  VERBATIM
 )
 add_custom_target(sxn_node_compat_header DEPENDS ${SXN_NODE_COMPAT_HEADER})
 
@@ -257,6 +265,9 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   add_test(NAME sxn-node-http COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_http.mjs)
   add_test(NAME sxn-node-zlib COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_zlib.mjs)
   add_test(NAME sxn-node-crypto-net COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_crypto_net.mjs)
+  # Every Buffer encoding in both directions, including Node's lenient hex and
+  # base64 readers. Expectations are Node's own output, so a divergence fails.
+  add_test(NAME sxn-buffer-encodings COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/buffer_encodings.mjs)
   set_tests_properties(sxn-node-http PROPERTIES TIMEOUT 40 FAIL_REGULAR_EXPRESSION "FAIL")
   add_test(NAME sxn-web-streams COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/web_streams.mjs)
   # Crypto/SubtleCrypto brands, and MessageChannel's two ports.

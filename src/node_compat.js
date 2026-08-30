@@ -73,7 +73,8 @@
   // Node's events module is the class with a self-reference on it, so both
   // `require('events')` and `require('events').EventEmitter` give the class.
   EventEmitter.EventEmitter = EventEmitter;
-  EventEmitter.default = EventEmitter;
+  // No `.default` here: Node does not define one, and the ESM default export
+  // is set on the module itself rather than as a property of the class.
   EventEmitter.captureRejectionSymbol = Symbol.for("nodejs.rejection");
   EventEmitter.defaultMaxListeners = 10;
   globalThis.__sxnEventEmitter = EventEmitter;
@@ -89,10 +90,79 @@
   // handles utf-8 itself via a native primitive that skips the extra
   // allocation this returns-a-bare-Uint8Array shape would otherwise cost.
   // `encoding` arrives already-lowercased from that call site.
+  // Node decodes as much as it can and stops, where the standard
+  // Uint8Array.fromHex throws. Take the strict, native path first and fall
+  // back only when it refuses, so valid input keeps its speed.
+  function hexBytesLenient(str) {
+    var out = new Uint8Array(str.length >> 1), n = 0;
+    for (var i = 0; i + 1 < str.length; i += 2) {
+      var hi = hexDigit(str.charCodeAt(i) & 0xff), lo = hexDigit(str.charCodeAt(i + 1) & 0xff);
+      if (hi < 0 || lo < 0) break;
+      out[n++] = (hi << 4) | lo;
+    }
+    return out.subarray(0, n);
+  }
+  function hexDigit(c) {
+    if (c >= 48 && c <= 57) return c - 48;
+    if (c >= 97 && c <= 102) return c - 87;
+    if (c >= 65 && c <= 70) return c - 55;
+    return -1;
+  }
+
+  // Node's base64 reader takes either alphabet, skips anything that is not a
+  // base64 character, and does not require padding.
+  var B64 = (function () {
+    var t = new Int8Array(128).fill(-1);
+    var a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    for (var i = 0; i < a.length; i++) t[a.charCodeAt(i)] = i;
+    t[43] = 62; t[47] = 63;   // + /
+    t[45] = 62; t[95] = 63;   // - _  (base64url)
+    return t;
+  })();
+  function base64BytesLenient(str) {
+    var out = new Uint8Array((str.length * 3) >> 2), n = 0, acc = 0, bits = 0;
+    for (var i = 0; i < str.length; i++) {
+      // Node reads the string one byte at a time, so a code unit above 0xff is
+      // truncated rather than skipped -- which is why an emoji ends a base64
+      // string: the high half of its surrogate pair masks down to '='.
+      var c = str.charCodeAt(i) & 0xff;
+      if (c === 61) break;                        // '=' ends the data
+      var v = c < 128 ? B64[c] : -1;
+      if (v < 0) continue;
+      acc = (acc << 6) | v; bits += 6;
+      if (bits >= 8) { bits -= 8; out[n++] = (acc >> bits) & 0xff; }
+    }
+    return out.subarray(0, n);
+  }
+
+  function utf16leBytes(str) {
+    var out = new Uint8Array(str.length * 2);
+    for (var i = 0; i < str.length; i++) {
+      var c = str.charCodeAt(i);
+      out[i * 2] = c & 0xff;
+      out[i * 2 + 1] = c >> 8;
+    }
+    return out;
+  }
+  function utf16leString(bytes) {
+    var out = "";
+    for (var i = 0; i + 1 < bytes.length; i += 2)
+      out += String.fromCharCode(bytes[i] | (bytes[i + 1] << 8));
+    return out;
+  }
+
   function bufferBytesFromString(str, encoding) {
-    if (encoding === "hex") return Uint8Array.fromHex(str);
-    if (encoding === "base64") return Uint8Array.fromBase64(str);
-    if (encoding === "base64url") return Uint8Array.fromBase64(str, { alphabet: "base64url" });
+    if (encoding === "hex") {
+      try { return Uint8Array.fromHex(str); } catch { return hexBytesLenient(str); }
+    }
+    if (encoding === "base64" || encoding === "base64url") {
+      try {
+        return encoding === "base64" ? Uint8Array.fromBase64(str)
+                                     : Uint8Array.fromBase64(str, { alphabet: "base64url" });
+      } catch { return base64BytesLenient(str); }
+    }
+    if (encoding === "ucs2" || encoding === "ucs-2" ||
+        encoding === "utf16le" || encoding === "utf-16le") return utf16leBytes(str);
     if (encoding === "latin1" || encoding === "binary" || encoding === "ascii") {
       var bytes = new Uint8Array(str.length);
       for (var i = 0; i < str.length; i++) bytes[i] = str.charCodeAt(i) & 0xff;
@@ -117,6 +187,8 @@
       if (encoding === "hex") return this.toHex();
       if (encoding === "base64") return this.toBase64();
       if (encoding === "base64url") return this.toBase64({ alphabet: "base64url", omitPadding: true }); // Node emits base64url unpadded
+      if (encoding === "ucs2" || encoding === "ucs-2" ||
+          encoding === "utf16le" || encoding === "utf-16le") return utf16leString(this);
       if (encoding === "latin1" || encoding === "binary") {
         var out = "";
         for (var i = 0; i < this.length; i++) out += String.fromCharCode(this[i]);
@@ -158,7 +230,8 @@
         // object with a toString is treated as absent and never called.
         if (typeof encoding !== "string") encoding = undefined;
         if (encoding === undefined || encoding === "utf-8" || encoding === "utf8") return new Buffer(__sxnUtf8EncodeArrayBuffer(data));
-        if (encoding === "hex" || encoding === "base64" || encoding === "base64url") {
+        if (encoding === "hex" || encoding === "base64" || encoding === "base64url" ||
+            encoding === "ucs2" || encoding === "utf16le") {
           return Object.setPrototypeOf(bufferBytesFromString(data, encoding), Buffer.prototype);
         }
         var enc = String(encoding).toLowerCase();
@@ -610,12 +683,35 @@
     return this;
   };
   Readable.prototype.pipe = function (dest, options) {
-    this.on("data", (chunk) => { if (dest.write(chunk) === false) this.pause(); });
-    dest.on("drain", () => this.resume());
-    this.on("end", () => { if (!options || options.end !== false) dest.end(); });
-    this.on("error", (e) => dest.emit("error", e));
+    const onData = (chunk) => { if (dest.write(chunk) === false) this.pause(); };
+    const onDrain = () => this.resume();
+    const onEnd = () => { if (!options || options.end !== false) dest.end(); };
+    const onError = (e) => dest.emit("error", e);
+    this.on("data", onData);
+    dest.on("drain", onDrain);
+    this.on("end", onEnd);
+    this.on("error", onError);
+    (this._pipes || (this._pipes = [])).push({ dest, onData, onDrain, onEnd, onError });
     this.resume();
     return dest;
+  };
+  // Node's readable.unpipe([dest]). finalhandler calls it before draining a
+  // request it is about to answer, so it has to exist even on a stream that
+  // was never piped anywhere.
+  Readable.prototype.unpipe = function (dest) {
+    const pipes = this._pipes;
+    if (!pipes) return this;
+    const keep = [];
+    for (const p of pipes) {
+      if (dest !== undefined && p.dest !== dest) { keep.push(p); continue; }
+      this.off("data", p.onData);
+      this.off("end", p.onEnd);
+      this.off("error", p.onError);
+      p.dest.off("drain", p.onDrain);
+      p.dest.emit("unpipe", this);
+    }
+    this._pipes = keep;
+    return this;
   };
   // `on('data')` is what switches a stream into flowing mode in Node.
   const readableOn = Readable.prototype.on;
@@ -888,9 +984,18 @@
     for (const k of Object.keys(this.headers)) this.rawHeaders.push(k, this.headers[k]);
     // on-finished reads socket.readable and `complete` to decide whether a
     // request is spent; body-parser skips parsing when it says yes, so both
-    // have to describe a request whose body has not been read yet.
-    this.socket = { remoteAddress: "127.0.0.1", encrypted: false,
-                    readable: true, writable: true, destroyed: false };
+    // have to describe a request whose body has not been read yet. The socket
+    // is a real emitter because on-finished subscribes to its 'error' and
+    // 'close', and a plain object had no on() for it to call.
+    this.socket = Object.assign(new EE(), {
+      remoteAddress: "127.0.0.1", remotePort: 0, localAddress: "127.0.0.1",
+      encrypted: false, readable: true, writable: true, destroyed: false,
+      setTimeout() { return this; }, setNoDelay() { return this; },
+      setKeepAlive() { return this; },
+      destroy() { this.destroyed = true; this.readable = this.writable = false;
+                  this.emit("close"); return this; },
+      end() { return this.destroy(); },
+    });
     this.connection = this.socket;
     this.complete = false;
     this.once("end", () => { this.complete = true; });

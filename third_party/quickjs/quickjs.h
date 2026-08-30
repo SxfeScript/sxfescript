@@ -1490,6 +1490,11 @@ JS_EXTERN uintptr_t js_std_cmd(int cmd, ...);
 
 /* arcsx: exact UTF-8 byte length of a string, without encoding it; -1 if not
    a string. */
+/* arcsx: true when `val` is the very string object that backs `atom`. A string
+   literal in an argument position is pushed straight from the atom table, so a
+   name like "utf-8" or "hex" can be recognised by one pointer compare instead
+   of hashing it and probing the atom table on every call. */
+JS_EXTERN bool JS_IsAtomString(JSContext *ctx, JSValueConst val, JSAtom atom);
 JS_EXTERN int64_t JS_Utf8ByteLength(JSContext *ctx, JSValueConst val);
 /* arcsx: byte length of a Buffer/ArrayBuffer/SharedArrayBuffer/TypedArray/
    DataView from its internal slot, or -1 if the value is none of those. */

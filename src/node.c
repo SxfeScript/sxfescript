@@ -1139,10 +1139,17 @@ static JSValue js_buffer_from_fast(JSContext *ctx, JSValueConst this_val, int ar
                toLowerCase handling. Compared by atom identity rather than
                JS_ToCString + strcmp, so a literal encoding argument costs two
                pointer compares. */
-            JSAtom a = JS_ValueToAtom(ctx, argv[1]);
-            if (a == JS_ATOM_NULL) return JS_EXCEPTION;
-            utf8 = (a == sxn_atom_utf8_dash || a == sxn_atom_utf8);
-            JS_FreeAtom(ctx, a);
+            /* A literal encoding argument arrives as the atom's own string
+               object, so identity settles it without interning; anything else
+               still converts. */
+            utf8 = JS_IsAtomString(ctx, argv[1], sxn_atom_utf8_dash) ||
+                   JS_IsAtomString(ctx, argv[1], sxn_atom_utf8);
+            if (!utf8) {
+                JSAtom a = JS_ValueToAtom(ctx, argv[1]);
+                if (a == JS_ATOM_NULL) return JS_EXCEPTION;
+                utf8 = (a == sxn_atom_utf8_dash || a == sxn_atom_utf8);
+                JS_FreeAtom(ctx, a);
+            }
         }
         if (utf8) {
             JSValue ab = JS_NewArrayBufferFromString(ctx, argv[0]);
@@ -1183,6 +1190,16 @@ static JSValue js_buffer_to_string(JSContext *ctx, JSValueConst this_val, int ar
                                     int magic, JSValueConst *func_data) {
     (void)magic;
     JSAtom enc;
+    /* Same shortcut as Buffer.from: the literal "hex" or "utf-8" at the call
+       site is the atom's string, so the common encodings never reach the
+       atom table. */
+    if (argc >= 1) {
+        if (JS_IsAtomString(ctx, argv[0], sxn_atom_hex))
+            return JS_Uint8ArrayToHex(ctx, this_val);
+        if (JS_IsAtomString(ctx, argv[0], sxn_atom_utf8_dash) ||
+            JS_IsAtomString(ctx, argv[0], sxn_atom_utf8))
+            return JS_Call(ctx, func_data[0], JS_UNDEFINED, 1, &this_val);
+    }
     if (argc < 1 || JS_IsUndefined(argv[0])) {
         enc = JS_DupAtom(ctx, sxn_atom_utf8_dash);
     } else if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_STRING) {
@@ -1675,8 +1692,8 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
        import/export of its own -- it only assigns onto globalThis, which
        module vs. global evaluation doesn't affect -- so this is a pure
        bytecode-shape win with no behavior change. */
-    JSValue result = JS_Eval(ctx, sxn_node_compat_js, strlen(sxn_node_compat_js), "<sxn:node_compat>",
-                              JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    JSValue result = JS_ReadObject(ctx, sxn_node_compat_bc, sxn_node_compat_bc_size,
+                                   JS_READ_OBJ_BYTECODE);
     if (JS_IsException(result)) { JS_FreeValue(ctx, result); return -1; }
     if (js_module_set_import_meta(ctx, result, true, true) < 0) { JS_FreeValue(ctx, result); return -1; }
     result = JS_EvalFunction(ctx, result);

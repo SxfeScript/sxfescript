@@ -665,6 +665,13 @@ struct JSContext {
     int emit_events_idx, emit_listener_idx;
     const uint32_t *emit_gen_ptr;
     uint32_t emit_gen;
+    /* The listener's captured-add cell, resolved once at arm time. The
+       listener object is held by emit_listener for as long as the fusion is
+       armed, so its bytecode and closure array cannot move or be reused, and
+       walking to the cell on every call only lengthened a chain of dependent
+       loads that was already what the call cost. The cell's `pvalue` is still
+       read fresh, because it moves when the enclosing frame closes. */
+    JSVarRef *emit_add_ref;
 
     bool buf_len_fusion_on;
     bool enc_len_fusion_on;         /* the same, for TextEncoder#encode */
@@ -4082,13 +4089,22 @@ static const char *JS_AtomGetStr(JSContext *ctx, char *buf, int buf_size, JSAtom
     return JS_AtomGetStrRT(ctx->rt, buf, buf_size, atom);
 }
 
-static JSValue __JS_AtomToValue(JSContext *ctx, JSAtom atom, bool force_string)
+/* arcsx: the tagged-integer case needs a 64-byte digit buffer, and leaving it
+   in the caller made every atom-to-string conversion set up and tear down a
+   frame for it -- including OP_push_atom_value, which is how a string literal
+   argument reaches a call and so runs on hot loops. Out of line, the common
+   case is a load, a tag check and a refcount. */
+static no_inline JSValue js_atom_int_to_value(JSContext *ctx, JSAtom atom)
 {
     char buf[ATOM_GET_STR_BUF_SIZE];
+    size_t len = u32toa(buf, __JS_AtomToUInt32(atom));
+    return js_new_string8_len(ctx, buf, len);
+}
 
+static JSValue __JS_AtomToValue(JSContext *ctx, JSAtom atom, bool force_string)
+{
     if (__JS_AtomIsTaggedInt(atom)) {
-        size_t len = u32toa(buf, __JS_AtomToUInt32(atom));
-        return js_new_string8_len(ctx, buf, len);
+        return js_atom_int_to_value(ctx, atom);
     } else {
         JSRuntime *rt = ctx->rt;
         JSAtomStruct *p;
@@ -5080,6 +5096,8 @@ void JS_EnableBufferLengthFusion(JSContext *ctx, JSValueConst from_fn,
    shape resolves to its own listener and a direct write to _events[type] is
    caught even though it bumps no counter. gen_ptr is the host's
    listener-mutation counter, read on every fused call. */
+static void JS_TryFastCapturedAddClassify(JSObject *p);
+
 void JS_EnableEmitFusion(JSContext *ctx, JSValueConst emit_fn,
                          JSValueConst emitter, JSValueConst event_str,
                          JSValueConst listener, JSAtom events_atom,
@@ -5125,6 +5143,21 @@ void JS_EnableEmitFusion(JSContext *ctx, JSValueConst emit_fn,
     ctx->emit_listener = js_dup(listener);
     ctx->emit_gen_ptr = gen_ptr;
     ctx->emit_gen = *gen_ptr;
+    ctx->emit_add_ref = NULL;
+    {
+        JSObject *lp = JS_VALUE_GET_OBJ(listener);
+        JSFunctionBytecode *lb;
+        if (lp->class_id == JS_CLASS_BYTECODE_FUNCTION &&
+            (lb = lp->u.func.function_bytecode) != NULL &&
+            lp->u.func.var_refs) {
+            /* Classify now if it has not run yet, so the first fused call is
+               already on the short path rather than the walk. */
+            if (lb->fast_captured_add == 0)
+                JS_TryFastCapturedAddClassify(lp);
+            if (lb->fast_captured_add == 1)
+                ctx->emit_add_ref = lp->u.func.var_refs[lb->fast_captured_add_ref];
+        }
+    }
     ctx->emit_fusion_on = true;
 }
 
@@ -5141,6 +5174,7 @@ void JS_DisableEmitFusion(JSContext *ctx)
     ctx->emit_ee_shape = ctx->emit_events_shape = NULL;
     ctx->emit_fn = ctx->emit_event_str = ctx->emit_listener = JS_UNDEFINED;
     ctx->emit_emitter = ctx->emit_events = JS_UNDEFINED;
+    ctx->emit_add_ref = NULL;
     ctx->emit_gen_ptr = NULL;
 }
 
@@ -5215,6 +5249,16 @@ int64_t JS_BinaryDataByteLength(JSContext *ctx, JSValueConst obj)
         return (int64_t)p->u.typed_array->length;
     }
     return -1;
+}
+
+bool JS_IsAtomString(JSContext *ctx, JSValueConst val, JSAtom atom)
+{
+    JSRuntime *rt = ctx->rt;
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_STRING)
+        return false;
+    if (__JS_AtomIsTaggedInt(atom) || atom >= rt->atom_size)
+        return false;
+    return JS_VALUE_GET_PTR(val) == (void *)rt->atom_array[atom];
 }
 
 /* arcsx: exact UTF-8 byte length of a string value, without encoding it.
@@ -5553,28 +5597,57 @@ fail:
    ablations; see SXN_ABLATE_FUSION below. */
 static size_t js_string_utf8_exact(JSString *str)
 {
-    int len = str->len, pos;
+    int len = str->len, pos = 0;
     size_t n = 0;
+    /* Real text is mostly ASCII, and an ASCII unit is one byte in either
+       representation, so both loops skip eight units at a time whenever the
+       high bits are clear and fall back to per-character work only around the
+       characters that are not. */
     if (!str->is_wide_char) {
         const uint8_t *src = str8(str);
-        for (pos = 0; pos < len; pos++)
-            n += 1 + (size_t)(src[pos] >> 7);
-        return n;
-    }
-    for (pos = 0; pos < len; pos++) {
-        uint32_t c = str16(str)[pos];
-        if (c < 0x80) {
-            n += 1;
-        } else if (c < 0x800) {
-            n += 2;
-        } else if (c >= 0xd800 && c <= 0xdbff && pos + 1 < len &&
-                   str16(str)[pos + 1] >= 0xdc00 && str16(str)[pos + 1] <= 0xdfff) {
-            n += 4; pos++;              /* surrogate pair */
-        } else {
-            n += 3;                     /* BMP, or unpaired surrogate -> U+FFFD */
+        for (;;) {
+            while (pos + 8 <= len) {
+                uint64_t w;
+                memcpy(&w, src + pos, 8);
+                if (w & UINT64_C(0x8080808080808080))
+                    break;
+                n += 8; pos += 8;
+            }
+            if (pos >= len)
+                return n;
+            n += 1 + (size_t)(src[pos] >> 7);   /* Latin-1 above 0x7f is two */
+            pos++;
+            if (pos >= len)
+                return n;
         }
     }
-    return n;
+    {
+        const uint16_t *src = str16(str);
+        for (;;) {
+            while (pos + 8 <= len) {
+                uint64_t a, b;
+                memcpy(&a, src + pos, 8);
+                memcpy(&b, src + pos + 4, 8);
+                if ((a | b) & UINT64_C(0xff80ff80ff80ff80))
+                    break;
+                n += 8; pos += 8;
+            }
+            if (pos >= len)
+                return n;
+            uint32_t c = src[pos];
+            if (c < 0x80) {
+                n += 1;
+            } else if (c < 0x800) {
+                n += 2;
+            } else if (c >= 0xd800 && c <= 0xdbff && pos + 1 < len &&
+                       (src[pos + 1] & 0xfc00) == 0xdc00) {
+                n += 4; pos++;          /* surrogate pair */
+            } else {
+                n += 3;                 /* BMP, or unpaired surrogate -> U+FFFD */
+            }
+            pos++;
+        }
+    }
 }
 
 static size_t js_string_utf8_bound(JSString *str, bool *exact)
@@ -7432,6 +7505,30 @@ static JSFunctionBytecode *JS_GetFunctionBytecode(JSValueConst val)
     return p->u.func.function_bytecode;
 }
 
+/* arcsx: the accumulate itself, shared by JS_TryFastCapturedAddCall and by the
+   fused emit opcode so neither has its own copy. An accumulator crosses out of
+   int32 range early on any real counting loop -- `count += i` over 500k
+   iterations leaves int after about 65k -- so the float cases have to be as
+   direct as the int one, not a fallback. Returns false when either side is not
+   a number and the real call is required. */
+static inline bool js_fast_captured_add(JSValue *pv, JSValueConst arg)
+{
+    if (likely(JS_VALUE_IS_BOTH_INT(*pv, arg))) {
+        int64_t sum = (int64_t)JS_VALUE_GET_INT(*pv) + JS_VALUE_GET_INT(arg);
+        *pv = (sum < INT32_MIN || sum > INT32_MAX) ?
+            js_float64((double)sum) : js_int32(sum);
+        return true;
+    }
+    int at = JS_VALUE_GET_TAG(arg), vt = JS_VALUE_GET_TAG(*pv);
+    if (!(at == JS_TAG_INT || JS_TAG_IS_FLOAT64(at)) ||
+        !(vt == JS_TAG_INT || JS_TAG_IS_FLOAT64(vt)))
+        return false;
+    double left  = vt == JS_TAG_INT ? (double)JS_VALUE_GET_INT(*pv) : JS_VALUE_GET_FLOAT64(*pv);
+    double right = at == JS_TAG_INT ? (double)JS_VALUE_GET_INT(arg) : JS_VALUE_GET_FLOAT64(arg);
+    *pv = js_float64(left + right);
+    return true;
+}
+
 /* A small tierless inline-cache target for native callback dispatch. The
    compiler's captured-add fusion produces exactly:
 
@@ -7442,30 +7539,20 @@ static JSFunctionBytecode *JS_GetFunctionBytecode(JSValueConst val)
    `this` nor `arguments`, calls no user code, and returns undefined. Native
    users such as EventEmitter can therefore perform it directly; every other
    shape or value type falls back to JS_Call. */
-int JS_TryFastCapturedAddCall(JSContext *ctx, JSValueConst func,
-                              JSValueConst arg)
+/* Decide once whether this function body is the captured-add shape, recording
+   the verdict on the bytecode. Split out so that arming a fusion can classify
+   ahead of the first call. */
+static void JS_TryFastCapturedAddClassify(JSObject *p)
 {
-    JSObject *p;
     JSFunctionBytecode *b;
-    JSVarRef **refs;
     const uint8_t *pc, *end;
     int encoded, idx;
-    JSValue *pv;
 
-    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT)
-        return 0;
-    p = JS_VALUE_GET_OBJ(func);
-    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
-        return 0;
     b = p->u.func.function_bytecode;
+    if (b->fast_captured_add != 0)
+        return;
     if (b->arg_count != 1 || b->var_count > 255 || !p->u.func.var_refs)
-        return 0;
-    if (b->fast_captured_add == 2)
-        return 0;
-    if (b->fast_captured_add == 1) {
-        idx = b->fast_captured_add_ref;
-        goto captured_add;
-    }
+        goto not_captured_add;
     pc = b->byte_code_buf;
     end = pc + b->byte_code_len;
 #define SKIP_FAST_ADD_SOURCE_LOCS() \
@@ -7491,34 +7578,33 @@ int JS_TryFastCapturedAddCall(JSContext *ctx, JSValueConst func,
 #undef SKIP_FAST_ADD_SOURCE_LOCS
     b->fast_captured_add = 1;
     b->fast_captured_add_ref = idx;
-
-captured_add:
-    refs = p->u.func.var_refs;
-    pv = refs[idx]->pvalue;
-    if (likely(JS_VALUE_IS_BOTH_INT(*pv, arg))) {
-        int64_t sum = (int64_t)JS_VALUE_GET_INT(*pv) + JS_VALUE_GET_INT(arg);
-        *pv = (sum < INT32_MIN || sum > INT32_MAX) ?
-            js_float64((double)sum) : js_int32(sum);
-        return 1;
-    }
-    if (JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(*pv)) &&
-        (JS_VALUE_GET_TAG(arg) == JS_TAG_INT || JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(arg)))) {
-        double right = JS_VALUE_GET_TAG(arg) == JS_TAG_INT ?
-            (double)JS_VALUE_GET_INT(arg) : JS_VALUE_GET_FLOAT64(arg);
-        *pv = js_float64(JS_VALUE_GET_FLOAT64(*pv) + right);
-        return 1;
-    }
-    if (JS_VALUE_GET_TAG(*pv) == JS_TAG_INT && JS_TAG_IS_FLOAT64(JS_VALUE_GET_TAG(arg))) {
-        *pv = js_float64((double)JS_VALUE_GET_INT(*pv) + JS_VALUE_GET_FLOAT64(arg));
-        return 1;
-    }
-    return 0;
-
+    return;
 not_captured_add:
-#undef SKIP_FAST_ADD_SOURCE_LOCS
     b->fast_captured_add = 2;
-    return 0;
 }
+
+int JS_TryFastCapturedAddCall(JSContext *ctx, JSValueConst func,
+                              JSValueConst arg)
+{
+    JSObject *p;
+    JSFunctionBytecode *b;
+
+    if (JS_VALUE_GET_TAG(func) != JS_TAG_OBJECT)
+        return 0;
+    p = JS_VALUE_GET_OBJ(func);
+    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+        return 0;
+    b = p->u.func.function_bytecode;
+    if (!p->u.func.var_refs)
+        return 0;
+    if (b->fast_captured_add == 0)
+        JS_TryFastCapturedAddClassify(p);
+    if (b->fast_captured_add != 1)
+        return 0;
+    return js_fast_captured_add(p->u.func.var_refs[b->fast_captured_add_ref]->pvalue,
+                                arg) ? 1 : 0;
+}
+
 
 static void js_method_set_home_object(JSContext *ctx, JSValue func_obj,
                                       JSValue home_obj)
@@ -19866,61 +19952,41 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                    hold, the answer comes from the string without building the
                    bytes, the ArrayBuffer or the Buffer. */
                 if (unlikely(fused_emit) && ctx->emit_fusion_on &&
-                    call_argc == 2 &&
-                    *ctx->emit_gen_ptr == ctx->emit_gen &&
+                    call_argc == 2 && ctx->emit_add_ref &&
+                    /* Every address below is reached from a pointer the
+                       context already holds, not by chasing the receiver
+                       through _events and on to the listener. The checks are
+                       the same ones -- same emitter, same layout, same
+                       listener in the same slot -- but the loads no longer
+                       wait on each other, and waiting on each other was most
+                       of what the call cost. */
+                    JS_VALUE_GET_PTR(call_argv[-2]) == JS_VALUE_GET_PTR(ctx->emit_emitter) &&
                     /* Pointer identity, not SameValue: the event name is a
                        literal backed by an atom, so the same string object
                        arrives every time. SameValue on two strings compares
                        their contents, which costs more than the whole fused
                        path. A different pointer simply falls back. */
-                    JS_VALUE_GET_PTR(call_argv[-1]) == JS_VALUE_GET_PTR(ctx->emit_fn) &&
-                    JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_STRING &&
                     JS_VALUE_GET_PTR(call_argv[0]) == JS_VALUE_GET_PTR(ctx->emit_event_str) &&
-                    JS_VALUE_GET_TAG(call_argv[-2]) == JS_TAG_OBJECT) {
-                    JSObject *ee = JS_VALUE_GET_OBJ(call_argv[-2]);
-                    /* Same emitter, same layout: only then are the recorded
-                       slot indices meaningful. */
-                    if (JS_VALUE_GET_PTR(call_argv[-2]) == JS_VALUE_GET_PTR(ctx->emit_emitter) &&
-                        ee->shape == ctx->emit_ee_shape) {
-                        JSValue evs = ee->prop[ctx->emit_events_idx].u.value;
-                        if (JS_VALUE_GET_TAG(evs) == JS_TAG_OBJECT &&
-                            JS_VALUE_GET_OBJ(evs)->shape == ctx->emit_events_shape) {
-                            JSValue lst = JS_VALUE_GET_OBJ(evs)->prop[ctx->emit_listener_idx].u.value;
-                            /* The slot is compared, not trusted: a direct
-                               `ee._events.x = f` leaves the generation alone
-                               but not this. */
-                            if (JS_VALUE_GET_PTR(lst) == JS_VALUE_GET_PTR(ctx->emit_listener) &&
-                                JS_VALUE_GET_TAG(lst) == JS_TAG_OBJECT) {
-                                JSObject *lp = JS_VALUE_GET_OBJ(lst);
-                                JSFunctionBytecode *lb = lp->u.func.function_bytecode;
-                                int handled = 0;
-                                /* The listener was classified as a captured
-                                   numeric add the first time it ran, so the
-                                   int case is inlined here rather than paying
-                                   a call that would re-derive it. Anything
-                                   else defers to the shared implementation. */
-                                if (lp->class_id == JS_CLASS_BYTECODE_FUNCTION &&
-                                    lb->fast_captured_add == 1) {
-                                    JSValue *pv = lp->u.func.var_refs[lb->fast_captured_add_ref]->pvalue;
-                                    if (likely(JS_VALUE_IS_BOTH_INT(*pv, call_argv[1]))) {
-                                        int64_t sum = (int64_t)JS_VALUE_GET_INT(*pv) +
-                                                      JS_VALUE_GET_INT(call_argv[1]);
-                                        *pv = (sum < INT32_MIN || sum > INT32_MAX) ?
-                                            js_float64((double)sum) : js_int32(sum);
-                                        handled = 1;
-                                    }
-                                }
-                                if (!handled)
-                                    handled = JS_TryFastCapturedAddCall(ctx, lst, call_argv[1]) == 1;
-                                if (handled) {
-                                    for (i = -2; i < call_argc; i++)
-                                        JS_FreeValue(ctx, call_argv[i]);
-                                    sp -= call_argc + 2;
-                                    *sp++ = JS_TRUE;
-                                    BREAK;
-                                }
-                            }
-                        }
+                    JS_VALUE_GET_TAG(call_argv[0]) == JS_TAG_STRING &&
+                    JS_VALUE_GET_PTR(call_argv[-1]) == JS_VALUE_GET_PTR(ctx->emit_fn) &&
+                    *ctx->emit_gen_ptr == ctx->emit_gen) {
+                    JSObject *ee = JS_VALUE_GET_OBJ(ctx->emit_emitter);
+                    JSObject *evs = JS_VALUE_GET_OBJ(ctx->emit_events);
+                    /* Same layout on both objects, and both slots still hold
+                       what they held when the fusion was armed: a direct
+                       `ee._events = {}` or `ee._events.x = f` bumps no counter
+                       but fails one of these. */
+                    if (ee->shape == ctx->emit_ee_shape &&
+                        evs->shape == ctx->emit_events_shape &&
+                        JS_VALUE_GET_PTR(ee->prop[ctx->emit_events_idx].u.value) == (void *)evs &&
+                        JS_VALUE_GET_PTR(evs->prop[ctx->emit_listener_idx].u.value) ==
+                            JS_VALUE_GET_PTR(ctx->emit_listener) &&
+                        js_fast_captured_add(ctx->emit_add_ref->pvalue, call_argv[1])) {
+                        for (i = -2; i < call_argc; i++)
+                            JS_FreeValue(ctx, call_argv[i]);
+                        sp -= call_argc + 2;
+                        *sp++ = JS_TRUE;
+                        BREAK;
                     }
                 }
                 if (unlikely(fused_len)) {

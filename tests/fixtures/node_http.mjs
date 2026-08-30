@@ -6,7 +6,23 @@ const check = (n, got, want) => { const ok = JSON.stringify(got) === JSON.string
 
 const server = http.createServer((req, res) => {
   const url = req.url;
-  if (url === "/late-body") {
+  if (url === "/plumbing") {
+    // The shapes finalhandler and on-finished reach for when they answer a
+    // request nobody read: unpipe on a stream that was never piped, and a
+    // socket they can subscribe to.
+    const seen = {
+      unpipe: typeof req.unpipe === "function",
+      socketOn: typeof req.socket.on === "function",
+      socketWritable: req.socket.writable === true,
+    };
+    req.unpipe();
+    let heard = false;
+    req.socket.on("sxn-probe", () => { heard = true; });
+    req.socket.emit("sxn-probe");
+    req.resume();
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ ...seen, heard }));
+  } else if (url === "/late-body") {
     // on-finished and body-parser both decide from these, and a body pushed
     // before the consumer subscribes would arrive as an empty string.
     const seen = { complete: req.complete, sockReadable: !!req.socket.readable };
@@ -73,6 +89,10 @@ check("404", [nf.status, await nf.text()], [404, "not found"]);
 const lb = await (await fetch(base + "/late-body", { method: "POST", body: "deferred" })).json();
 check("body survives a late listener", lb,
       { complete: false, sockReadable: true, body: "deferred", doneAfter: true });
+
+const pl = await (await fetch(base + "/plumbing")).json();
+check("request plumbing", pl,
+      { unpipe: true, socketOn: true, socketWritable: true, heard: true });
 
 check("STATUS_CODES", http.STATUS_CODES[404], "Not Found");
 check("METHODS has POST", http.METHODS.includes("POST"), true);

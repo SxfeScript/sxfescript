@@ -3,6 +3,9 @@
    lives here in JS; anything needing tight C integration (the streaming
    fetch body, random bytes, digests, the monotonic clock) is a thin native
    primitive that this file wraps in a spec-shaped class. */
+/* The build compiles this file with qjsc rather than JS_Eval, and qjsc has
+   no flag for strict mode, so the directive has to be in the source. */
+"use strict";
 (function () {
   function domError(name, message) {
     var e = new Error(message);

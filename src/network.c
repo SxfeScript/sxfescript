@@ -1894,8 +1894,13 @@ int sxn_install_network(JSContext *ctx) {
     JS_SetPropertyStr(ctx, global, "__sxnClearTimer", JS_NewCFunction(ctx, sxn_clear_timer, "__sxnClearTimer", 1));
     JS_FreeValue(ctx, global);
 
-    /* Strict mode: measurably faster function dispatch in QuickJS. */
-    JSValue bootstrap = JS_Eval(ctx, sxn_bootstrap_js, strlen(sxn_bootstrap_js), "<sxn:bootstrap>", JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_STRICT);
+    /* Compiled by qjsc during the build, so startup reads a ready function
+       instead of parsing the file again on every launch. The source carries
+       its own "use strict" because that used to come from an eval flag. */
+    JSValue bootstrap = JS_ReadObject(ctx, sxn_bootstrap_bc, sxn_bootstrap_bc_size,
+                                      JS_READ_OBJ_BYTECODE);
+    if (JS_IsException(bootstrap)) { JS_FreeValue(ctx, bootstrap); return -1; }
+    bootstrap = JS_EvalFunction(ctx, bootstrap);
     if (JS_IsException(bootstrap)) { JS_FreeValue(ctx, bootstrap); return -1; }
     JS_FreeValue(ctx, bootstrap);
 

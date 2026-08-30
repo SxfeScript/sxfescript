@@ -46,7 +46,8 @@ mixin.on("ping", (v) => { heard = v; });
 mixin.emit("ping", 7);
 check("mixin without constructor", heard, 7);
 check("EventEmitter.EventEmitter", EventEmitter.EventEmitter === EventEmitter, true);
-check("EventEmitter.default", EventEmitter.default === EventEmitter, true);
+// Node defines no `.default` on the class; the ESM default export is the module's.
+check("no EventEmitter.default", EventEmitter.default, undefined);
 
 console.log(bad === 0 ? "ALL PASS" : "FAILURES: " + bad);
 process.exit(bad === 0 ? 0 : 1);

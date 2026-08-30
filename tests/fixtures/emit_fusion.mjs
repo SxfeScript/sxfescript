@@ -1,5 +1,39 @@
 import { EventEmitter } from 'node:events';
-const L=[];const p=(n,v)=>L.push(n+"="+JSON.stringify(v));
+// Expected values are Node's own output for this file, captured verbatim.
+const WANT = {
+"fused sum": "[10,true,20]",
+"no listener": "false",
+"int overflow": "[2147485000,true]",
+"float acc": "1.5",
+"float arg": "1.5",
+"nan": "null",
+"string arg": "\"05\"",
+"no arg": "null",
+"extra args": "1",
+"two listeners": "[\"a1\",\"b1\"]",
+"once": "1",
+"listener this": "true",
+"remove during emit": "[\"f1\",\"f2\",\"f1\"]",
+"throws": "\"RangeError:boom\"",
+"unhandled error": "\"TypeError\"",
+"off/on": "2",
+"direct mutation": "[1,1]",
+"events replaced": "[1,1]",
+"events reshaped": "2",
+"slot deleted": "[false,1]",
+"emit shadowed": "[1,1]",
+"two emitters": "[2,10]",
+"two events": "[1,10]",
+"removeAll": "[false,0]",
+"subclass": "7",
+"computed name": "7",
+"count": "[1,1]"
+};
+let bad = 0;
+const p = (n, v) => {
+  const got = JSON.stringify(v);
+  if (got !== WANT[n]) { bad++; console.log("FAIL " + n + " got=" + got + " want=" + WANT[n]); }
+};
 // the fused shape
 { const e=new EventEmitter(); let c=0; e.on("x",v=>{c+=v;});
   for(let i=0;i<5;i++) e.emit("x",i); p("fused sum",[c, e.emit("x",10), c]); }
@@ -38,6 +72,19 @@ const L=[];const p=(n,v)=>L.push(n+"="+JSON.stringify(v));
 // direct _events mutation must be seen
 { const e=new EventEmitter(); let c=0,d=0; e.on("x",v=>{c+=v;});
   e.emit("x",1); e._events.x = v=>{d+=v;}; e.emit("x",1); p("direct mutation",[c,d]); }
+// replacing _events wholesale
+{ const e=new EventEmitter(); let c=0,d=0; e.on("x",v=>{c+=v;});
+  e.emit("x",1); e._events = { x: v=>{d+=v;} }; e.emit("x",1); p("events replaced",[c,d]); }
+// adding a key to _events reshapes it
+{ const e=new EventEmitter(); let c=0; e.on("x",v=>{c+=v;});
+  e.emit("x",1); e._events.other = ()=>{}; e.emit("x",1); p("events reshaped",c); }
+// deleting the listener slot
+{ const e=new EventEmitter(); let c=0; e.on("x",v=>{c+=v;});
+  e.emit("x",1); delete e._events.x; p("slot deleted",[e.emit("x",1), c]); }
+// an own emit shadows the prototype's
+{ const e=new EventEmitter(); let c=0,n=0; e.on("x",v=>{c+=v;});
+  e.emit("x",1); e.emit = function(){ n++; return true; }; e.emit("x",1);
+  p("emit shadowed",[c,n]); }
 // a second emitter of the same shape resolves to its own listener
 { const e1=new EventEmitter(), e2=new EventEmitter(); let a=0,b=0;
   e1.on("x",v=>{a+=v;}); e2.on("x",v=>{b+=v;});
@@ -56,4 +103,5 @@ const L=[];const p=(n,v)=>L.push(n+"="+JSON.stringify(v));
   e.emit("x".concat(""),4); p("computed name",c); }
 // listenerCount / listeners still right
 { const e=new EventEmitter(); const f=()=>{}; e.on("x",f); p("count",[e.listenerCount("x"), e.listeners("x").length]); }
-console.log(L.join("\n"));
+console.log(bad === 0 ? "ALL PASS" : "FAILURES: " + bad);
+process.exit(bad === 0 ? 0 : 1);
