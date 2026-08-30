@@ -3,6 +3,7 @@
 #include <uv.h>
 #include "sxfe.h"
 #include "sxn_node_compat.h"
+#include <zlib.h>
 
 #include <errno.h>
 #include <signal.h>
@@ -209,8 +210,22 @@ static JSAtom sxn_atom_error = JS_ATOM_NULL;
 static JSOwnDataPropertyCache sxn_ee_events_cache;
 
 static JSValue sxn_ee_events(JSContext *ctx, JSValueConst this_val) {
-    return JS_GetOwnDataPropertyCached(ctx, this_val, sxn_atom_events,
-                                       &sxn_ee_events_cache);
+    JSValue events = JS_GetOwnDataPropertyCached(ctx, this_val, sxn_atom_events,
+                                                 &sxn_ee_events_cache);
+    /* Create the store on demand. Node does the same, and the mixin pattern
+       depends on it: Express copies EventEmitter.prototype onto a bare
+       function, so the constructor never runs and there is no _events until
+       the first on()/emit(). */
+    if (JS_IsUndefined(events) || JS_IsNull(events)) {
+        JS_FreeValue(ctx, events);
+        events = JS_NewObjectProto(ctx, JS_NULL);
+        if (JS_IsException(events)) return events;
+        if (JS_SetProperty(ctx, this_val, sxn_atom_events, JS_DupValue(ctx, events)) < 0) {
+            JS_FreeValue(ctx, events);
+            return JS_EXCEPTION;
+        }
+    }
+    return events;
 }
 
 /* emit resolves the list before re-entering JS, while `this_val` still roots
@@ -871,6 +886,81 @@ static JSValue js_path_posix_relative(JSContext *ctx, JSValueConst this_val, int
    JS: they already bottom out in native primitives per call (__sxnUtf8*,
    Uint8Array#toHex/fromHex/toBase64/fromBase64), so there's no comparable
    win left to extract without the same ArrayBuffer-internals risk. */
+/* arcsx: node:zlib's one-shot compress and decompress. windowBits selects the
+   container: 15 is zlib, 15+16 is gzip, and negative is raw with no header,
+   which is exactly how the three pairs of Node functions differ. Streaming
+   Gzip/Gunzip objects are built on these in node_compat.js, one call per
+   chunk boundary being unnecessary because the whole payload is in memory. */
+static JSValue sxn_zlib_run(JSContext *ctx, JSValueConst input,
+                            int window_bits, int level, bool compress) {
+    size_t in_len = 0;
+    uint8_t *in = JS_GetUint8Array(ctx, &in_len, input);
+    if (!in) {
+        JSValue ab = JS_GetTypedArrayBuffer(ctx, input, NULL, NULL, NULL);
+        if (JS_IsException(ab)) return JS_ThrowTypeError(ctx, "zlib expects bytes");
+        JS_FreeValue(ctx, ab);
+        return JS_ThrowTypeError(ctx, "zlib expects bytes");
+    }
+
+    z_stream zs;
+    memset(&zs, 0, sizeof(zs));
+    int rc = compress
+        ? deflateInit2(&zs, level, Z_DEFLATED, window_bits, 8, Z_DEFAULT_STRATEGY)
+        : inflateInit2(&zs, window_bits);
+    if (rc != Z_OK) return JS_ThrowInternalError(ctx, "zlib init failed: %d", rc);
+
+    size_t cap = in_len < 1024 ? 1024 : in_len * 2;
+    uint8_t *out = js_malloc(ctx, cap);
+    if (!out) { compress ? deflateEnd(&zs) : inflateEnd(&zs); return JS_EXCEPTION; }
+
+    zs.next_in = in;
+    zs.avail_in = (uInt)in_len;
+    size_t produced = 0;
+    for (;;) {
+        if (produced == cap) {
+            size_t ncap = cap * 2;
+            uint8_t *grown = js_realloc(ctx, out, ncap);
+            if (!grown) { js_free(ctx, out); compress ? deflateEnd(&zs) : inflateEnd(&zs); return JS_EXCEPTION; }
+            out = grown; cap = ncap;
+        }
+        zs.next_out = out + produced;
+        zs.avail_out = (uInt)(cap - produced);
+        rc = compress ? deflate(&zs, Z_FINISH) : inflate(&zs, Z_FINISH);
+        produced = cap - zs.avail_out;
+        if (rc == Z_STREAM_END) break;
+        if (rc == Z_OK || rc == Z_BUF_ERROR) {
+            if (zs.avail_out == 0) continue;           /* needs more room */
+            if (!compress && rc == Z_BUF_ERROR) break; /* truncated input */
+            continue;
+        }
+        js_free(ctx, out);
+        compress ? deflateEnd(&zs) : inflateEnd(&zs);
+        return JS_ThrowInternalError(ctx, "zlib %s failed: %d",
+                                     compress ? "deflate" : "inflate", rc);
+    }
+    compress ? deflateEnd(&zs) : inflateEnd(&zs);
+    JSValue result = JS_NewUint8ArrayCopy(ctx, out, produced);
+    js_free(ctx, out);
+    return result;
+}
+
+static JSValue js_zlib_deflate(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    int32_t bits = 15, level = Z_DEFAULT_COMPRESSION;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "zlib needs input");
+    if (argc > 1) JS_ToInt32(ctx, &bits, argv[1]);
+    if (argc > 2 && !JS_IsUndefined(argv[2])) JS_ToInt32(ctx, &level, argv[2]);
+    return sxn_zlib_run(ctx, argv[0], bits, level, true);
+}
+
+static JSValue js_zlib_inflate(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    int32_t bits = 15;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "zlib needs input");
+    if (argc > 1) JS_ToInt32(ctx, &bits, argv[1]);
+    return sxn_zlib_run(ctx, argv[0], bits, 0, false);
+}
+
 static JSValue js_sxn_platform(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val; (void)argc; (void)argv;
 #if defined(__APPLE__)
@@ -1367,6 +1457,23 @@ static const char *node_querystring_names[] = { "parse", "stringify", "escape", 
 static const char *node_url_names[] = {
     "URL", "URLSearchParams", "fileURLToPath", "pathToFileURL", "format", "parse",
 };
+static const char *node_net_names[] = {
+    "isIP", "isIPv4", "isIPv6", "Socket", "Server",
+    "createConnection", "connect", "createServer",
+};
+static const char *node_crypto_names[] = {
+    "createHash", "createHmac", "randomBytes", "randomUUID", "randomFillSync",
+    "getRandomValues", "randomInt", "timingSafeEqual", "getHashes",
+    "constants", "webcrypto", "subtle", "Hash", "Hmac",
+};
+static const char *node_zlib_names[] = {
+    "constants", "gzip", "gunzip", "deflate", "inflate", "deflateRaw",
+    "inflateRaw", "unzip",
+    "gzipSync", "gunzipSync", "deflateSync", "inflateSync", "deflateRawSync",
+    "inflateRawSync", "unzipSync",
+    "createGzip", "createGunzip", "createDeflate", "createInflate",
+    "createDeflateRaw", "createInflateRaw", "createUnzip",
+};
 static const char *node_tty_names[] = { "isatty", "ReadStream", "WriteStream" };
 static const char *node_string_decoder_names[] = { "StringDecoder" };
 static const char *node_timers_names[] = {
@@ -1422,6 +1529,9 @@ NODE_SIMPLE_MODULE(url, "__sxnUrl", node_url_names)
 NODE_SIMPLE_MODULE(assert, "__sxnAssert", node_assert_names)
 NODE_SIMPLE_MODULE(stream, "__sxnStream", node_stream_names)
 NODE_SIMPLE_MODULE(http, "__sxnHttp", node_http_names)
+NODE_SIMPLE_MODULE(net, "__sxnNet", node_net_names)
+NODE_SIMPLE_MODULE(crypto, "__sxnCrypto", node_crypto_names)
+NODE_SIMPLE_MODULE(zlib, "__sxnZlib", node_zlib_names)
 NODE_SIMPLE_MODULE(tty, "__sxnTty", node_tty_names)
 NODE_SIMPLE_MODULE(string_decoder, "__sxnStringDecoder", node_string_decoder_names)
 NODE_SIMPLE_MODULE(timers, "__sxnTimers", node_timers_names)
@@ -1531,6 +1641,8 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
     JS_SetPropertyStr(ctx, global, "__sxnCwd", JS_NewCFunction(ctx, js_sxn_cwd, "__sxnCwd", 0));
     /* Node names the OS and CPU; packages branch on them. Derived from the
        compiler's own target macros rather than a runtime uname call. */
+    JS_SetPropertyStr(ctx, global, "__sxnZlibDeflate", JS_NewCFunction(ctx, js_zlib_deflate, "__sxnZlibDeflate", 3));
+    JS_SetPropertyStr(ctx, global, "__sxnZlibInflate", JS_NewCFunction(ctx, js_zlib_inflate, "__sxnZlibInflate", 2));
     JS_SetPropertyStr(ctx, global, "__sxnPlatform", JS_NewCFunction(ctx, js_sxn_platform, "__sxnPlatform", 0));
     JS_SetPropertyStr(ctx, global, "__sxnArch", JS_NewCFunction(ctx, js_sxn_arch, "__sxnArch", 0));
     JS_SetPropertyStr(ctx, global, "__sxnEnvObject", sxn_new_env_object(ctx));
@@ -1586,6 +1698,9 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
     if (!sxn_init_module_node_assert(ctx, "node:assert/strict")) return -1;
     if (!sxn_init_module_node_stream(ctx, "node:stream")) return -1;
     if (!sxn_init_module_node_http(ctx, "node:http")) return -1;
+    if (!sxn_init_module_node_net(ctx, "node:net")) return -1;
+    if (!sxn_init_module_node_crypto(ctx, "node:crypto")) return -1;
+    if (!sxn_init_module_node_zlib(ctx, "node:zlib")) return -1;
     if (!sxn_init_module_node_tty(ctx, "node:tty")) return -1;
     if (!sxn_init_module_node_string_decoder(ctx, "node:string_decoder")) return -1;
     if (!sxn_init_module_node_timers(ctx, "node:timers")) return -1;

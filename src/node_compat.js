@@ -70,6 +70,12 @@
       [Symbol.asyncIterator]() { return this; },
     };
   };
+  // Node's events module is the class with a self-reference on it, so both
+  // `require('events')` and `require('events').EventEmitter` give the class.
+  EventEmitter.EventEmitter = EventEmitter;
+  EventEmitter.default = EventEmitter;
+  EventEmitter.captureRejectionSymbol = Symbol.for("nodejs.rejection");
+  EventEmitter.defaultMaxListeners = 10;
   globalThis.__sxnEventEmitter = EventEmitter;
   delete globalThis.__sxnEeOn;
   delete globalThis.__sxnEeOff;
@@ -167,6 +173,17 @@
     // Node serializes a Buffer as { type: "Buffer", data: [...] }, and code
     // round-trips through that shape.
     toJSON() { return { type: "Buffer", data: Array.from(this) }; }
+
+    // Node orders by unsigned byte value, then by length, and equals is just
+    // compare === 0. Anything holding bytes is accepted, as Node does.
+    compare(other) {
+      var n = Math.min(this.length, other.length);
+      for (var i = 0; i < n; i++) {
+        if (this[i] !== other[i]) return this[i] < other[i] ? -1 : 1;
+      }
+      return this.length === other.length ? 0 : (this.length < other.length ? -1 : 1);
+    }
+    equals(other) { return this.length === other.length && this.compare(other) === 0; }
 
     static concat(list, totalLength) {
       if (totalLength === undefined) {
@@ -822,16 +839,22 @@
     return last;
   }
 
-  const streamModule = {
-    Readable, Writable, Duplex, Transform, PassThrough,
+  // Node's node:stream *is* the Stream constructor, with the classes hung off
+  // it -- `util.inherits(MyStream, require('stream'))` is a common idiom and
+  // needs a function with a prototype, not a plain namespace object.
+  function Stream(options) { EE.call(this); void options; }
+  inheritEE(Stream);
+  Stream.prototype.pipe = Readable.prototype.pipe;
+
+  const streamModule = Object.assign(Stream, {
+    Readable, Writable, Duplex, Transform, PassThrough, Stream,
     pipeline, finished,
     promises: {
       pipeline: (...a) => new Promise((res, rej) =>
         pipeline(...a, (e) => (e ? rej(e) : res(undefined)))),
       finished: (s) => new Promise((res, rej) => finished(s, (e) => (e ? rej(e) : res(undefined)))),
     },
-  };
-  streamModule.Stream = Readable;
+  });
   globalThis.__sxnStream = streamModule;
   globalThis.__sxnStreamPromises = streamModule.promises;
 
@@ -863,15 +886,26 @@
     this.httpVersion = "1.1";
     this.rawHeaders = [];
     for (const k of Object.keys(this.headers)) this.rawHeaders.push(k, this.headers[k]);
-    this.socket = { remoteAddress: "127.0.0.1", encrypted: false };
+    // on-finished reads socket.readable and `complete` to decide whether a
+    // request is spent; body-parser skips parsing when it says yes, so both
+    // have to describe a request whose body has not been read yet.
+    this.socket = { remoteAddress: "127.0.0.1", encrypted: false,
+                    readable: true, writable: true, destroyed: false };
     this.connection = this.socket;
-    this.complete = true;
-    // The body has already been read off the wire, so it arrives as one chunk.
+    this.complete = false;
+    this.once("end", () => { this.complete = true; });
+    // The body is already off the wire, but it must not be pushed before the
+    // consumer attaches: body-parser adds its 'data' listener after the
+    // handler returns, and an eagerly-ended stream would hand it nothing.
+    // Pushing from _read defers until something actually reads.
+    let sent = false;
     const body = raw.body;
-    queueMicrotask(() => {
-      if (body) this.push(body);
+    this._read = () => {
+      if (sent) return;
+      sent = true;
+      if (body !== undefined && body !== null && body !== "") this.push(body);
       this.push(null);
-    });
+    };
   }
   IncomingMessage.prototype = Object.create(Readable.prototype);
   IncomingMessage.prototype.constructor = IncomingMessage;
@@ -1020,6 +1054,263 @@
   globalThis.__sxnHttp = http;
 
 
+
+
+
+  // ---------------- node:net ----------------
+  // Address validation is what frameworks import this for -- Express uses
+  // net.isIP when parsing X-Forwarded-For. Real sockets are not implemented,
+  // and say so rather than pretending to connect.
+  function isIPv4(s) {
+    if (typeof s !== "string") return false;
+    const parts = s.split(".");
+    if (parts.length !== 4) return false;
+    return parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255 &&
+                              (p === "0" || p[0] !== "0"));
+  }
+  function isIPv6(s) {
+    if (typeof s !== "string" || s.indexOf(":") < 0) return false;
+    // A zone index (fe80::1%eth0) names an interface, not part of the
+    // address; Node accepts it and so does this.
+    const pct = s.indexOf("%");
+    if (pct >= 0) s = s.slice(0, pct);
+    // At most one "::", and every group is 1-4 hex digits. A trailing IPv4
+    // form is allowed, as in ::ffff:127.0.0.1.
+    const dbl = s.split("::");
+    if (dbl.length > 2) return false;
+    let tail = s;
+    let v4extra = 0;
+    const lastColon = s.lastIndexOf(":");
+    const maybeV4 = s.slice(lastColon + 1);
+    if (maybeV4.indexOf(".") >= 0) {
+      if (!isIPv4(maybeV4)) return false;
+      tail = s.slice(0, lastColon);
+      v4extra = 2;                       // an embedded IPv4 fills two groups
+    }
+    const groups = tail.split(":").filter((g, i, a) => !(g === "" && i > 0 && i < a.length - 1) || true);
+    let count = 0;
+    for (const g of tail.split(":")) {
+      if (g === "") continue;
+      if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return false;
+      count++;
+    }
+    void groups;
+    const total = count + v4extra;
+    return dbl.length === 2 ? total <= 8 : total === 8;
+  }
+  const net = {
+    isIP: (s) => (isIPv4(s) ? 4 : isIPv6(s) ? 6 : 0),
+    isIPv4, isIPv6,
+    Socket: function Socket() { throw new Error("net.Socket is not implemented"); },
+    Server: function Server() { throw new Error("net.Server is not implemented; use node:http"); },
+    createConnection() { throw new Error("net.createConnection is not implemented"); },
+    connect() { throw new Error("net.connect is not implemented"); },
+    createServer() { throw new Error("net.createServer is not implemented; use node:http"); },
+  };
+  globalThis.__sxnNet = net;
+
+  // ---------------- node:crypto ----------------
+  // The synchronous surface packages reach for: hashes, HMAC, random bytes
+  // and a constant-time compare. Digests come from the same OpenSSL binding
+  // WebCrypto uses; HMAC is the standard construction over it, which needs no
+  // second binding and is exactly what the RFC specifies.
+  const HASH_BLOCK = { md5: 64, sha1: 64, sha224: 64, sha256: 64, sha384: 128, sha512: 128 };
+  const cryptoToBytes = (d, enc) => {
+    if (typeof d === "string") {
+      if (enc === "hex") {
+        const out = new Uint8Array(d.length >> 1);
+        for (let i = 0; i < out.length; i++) out[i] = parseInt(d.substr(i * 2, 2), 16);
+        return out;
+      }
+      if (enc === "base64") return Uint8Array.from(atob(d), (c) => c.charCodeAt(0));
+      return new TextEncoder().encode(d);
+    }
+    if (d instanceof ArrayBuffer) return new Uint8Array(d);
+    if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
+    throw new TypeError("expected a string, Buffer or TypedArray");
+  };
+  const encodeDigest = (bytes, encoding) => {
+    if (!encoding || encoding === "buffer")
+      return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (encoding === "hex")
+      return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    if (encoding === "base64")
+      return btoa(String.fromCharCode(...bytes));
+    throw new TypeError("unsupported digest encoding: " + encoding);
+  };
+  const concatBytes = (parts) => {
+    let total = 0; for (const p of parts) total += p.length;
+    const out = new Uint8Array(total);
+    let at = 0; for (const p of parts) { out.set(p, at); at += p.length; }
+    return out;
+  };
+
+  function Hash(algorithm) {
+    this._algo = String(algorithm).toLowerCase();
+    this._parts = [];
+  }
+  Hash.prototype.update = function (data, enc) {
+    this._parts.push(cryptoToBytes(data, enc));
+    return this;
+  };
+  Hash.prototype.digest = function (encoding) {
+    return encodeDigest(__sxnDigest(this._algo, concatBytes(this._parts)), encoding);
+  };
+  Hash.prototype.copy = function () {
+    const h = new Hash(this._algo);
+    h._parts = this._parts.slice();
+    return h;
+  };
+
+  function Hmac(algorithm, key) {
+    const algo = String(algorithm).toLowerCase();
+    const block = HASH_BLOCK[algo.replace(/-/g, "")] || 64;
+    let k = cryptoToBytes(key);
+    if (k.length > block) k = __sxnDigest(algo, k);
+    const padded = new Uint8Array(block);
+    padded.set(k);
+    const ipad = new Uint8Array(block), opad = new Uint8Array(block);
+    for (let i = 0; i < block; i++) { ipad[i] = padded[i] ^ 0x36; opad[i] = padded[i] ^ 0x5c; }
+    this._algo = algo;
+    this._opad = opad;
+    this._parts = [ipad];
+  }
+  Hmac.prototype.update = function (data, enc) {
+    this._parts.push(cryptoToBytes(data, enc));
+    return this;
+  };
+  Hmac.prototype.digest = function (encoding) {
+    const inner = __sxnDigest(this._algo, concatBytes(this._parts));
+    return encodeDigest(__sxnDigest(this._algo, concatBytes([this._opad, inner])), encoding);
+  };
+
+  const nodeCrypto = {
+    createHash: (algorithm) => new Hash(algorithm),
+    createHmac: (algorithm, key) => new Hmac(algorithm, key),
+    randomBytes(size, cb) {
+      const b = Buffer.from(__sxnRandomBytes(size));
+      if (cb) { queueMicrotask(() => cb(null, b)); return undefined; }
+      return b;
+    },
+    randomUUID: () => globalThis.crypto.randomUUID(),
+    randomFillSync(buf) { globalThis.crypto.getRandomValues(buf); return buf; },
+    getRandomValues: (a) => globalThis.crypto.getRandomValues(a),
+    randomInt(min, max) {
+      if (max === undefined) { max = min; min = 0; }
+      const range = max - min;
+      const b = __sxnRandomBytes(6);
+      let v = 0; for (const x of b) v = v * 256 + x;
+      return min + (v % range);
+    },
+    // Compares in time independent of where the first difference is.
+    timingSafeEqual(a, b) {
+      const x = cryptoToBytes(a), y = cryptoToBytes(b);
+      if (x.length !== y.length) throw new RangeError("input length mismatch");
+      let diff = 0;
+      for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+      return diff === 0;
+    },
+    getHashes: () => ["md5", "sha1", "sha224", "sha256", "sha384", "sha512"],
+    constants: {},
+    webcrypto: globalThis.crypto,
+    subtle: globalThis.crypto && globalThis.crypto.subtle,
+    Hash, Hmac,
+  };
+  globalThis.__sxnCrypto = nodeCrypto;
+
+  // ---------------- node:zlib ----------------
+  // gzip, deflate and their raw form, sync and callback and promise, plus the
+  // Transform streams. The three pairs differ only in the container zlib puts
+  // around the same deflate data, which windowBits selects: 15 zlib, 31 gzip,
+  // -15 raw.
+  const Z = { ZLIB: 15, GZIP: 31, RAW: -15 };
+  const toBytes = (input) => {
+    if (typeof input === "string") return new TextEncoder().encode(input);
+    if (input instanceof ArrayBuffer) return new Uint8Array(input);
+    if (ArrayBuffer.isView(input))
+      return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+    throw new TypeError("zlib input must be a string, Buffer, TypedArray or ArrayBuffer");
+  };
+  const asBuffer = (u8) => Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength);
+
+  function makeSync(bits, compress) {
+    return function (input, options) {
+      const level = options && options.level !== undefined ? options.level : undefined;
+      const out = compress
+        ? __sxnZlibDeflate(toBytes(input), bits, level)
+        : __sxnZlibInflate(toBytes(input), bits);
+      return asBuffer(out);
+    };
+  }
+  // The callback form is Node's (err, result); errors arrive as a rejection
+  // rather than a throw, so a bad payload does not take the process down.
+  function makeAsync(syncFn) {
+    return function (input, options, cb) {
+      if (typeof options === "function") { cb = options; options = undefined; }
+      queueMicrotask(() => {
+        try { cb(null, syncFn(input, options)); }
+        catch (e) { cb(e); }
+      });
+    };
+  }
+
+  const zlib = {
+    constants: {
+      Z_NO_COMPRESSION: 0, Z_BEST_SPEED: 1, Z_BEST_COMPRESSION: 9,
+      Z_DEFAULT_COMPRESSION: -1, Z_NO_FLUSH: 0, Z_FINISH: 4,
+      Z_OK: 0, Z_STREAM_END: 1,
+    },
+    gzipSync: makeSync(Z.GZIP, true),
+    gunzipSync: makeSync(Z.GZIP, false),
+    deflateSync: makeSync(Z.ZLIB, true),
+    inflateSync: makeSync(Z.ZLIB, false),
+    deflateRawSync: makeSync(Z.RAW, true),
+    inflateRawSync: makeSync(Z.RAW, false),
+    unzipSync: function (input, options) {
+      // unzip accepts either container, so try gzip and fall back to zlib.
+      try { return zlib.gunzipSync(input, options); }
+      catch { return zlib.inflateSync(input, options); }
+    },
+  };
+  zlib.gzip = makeAsync(zlib.gzipSync);
+  zlib.gunzip = makeAsync(zlib.gunzipSync);
+  zlib.deflate = makeAsync(zlib.deflateSync);
+  zlib.inflate = makeAsync(zlib.inflateSync);
+  zlib.deflateRaw = makeAsync(zlib.deflateRawSync);
+  zlib.inflateRaw = makeAsync(zlib.inflateRawSync);
+  zlib.unzip = makeAsync(zlib.unzipSync);
+
+  // Streaming: buffer the chunks and convert on flush. zlib's own streaming
+  // state is not exposed here, and a whole-payload conversion is equivalent
+  // for anything that ends its stream, which is every consumer of these.
+  function makeZlibTransform(syncFn) {
+    return function (options) {
+      const parts = [];
+      const t = new Transform(Object.assign({}, options, {
+        transform(chunk, enc, cb) { parts.push(toBytes(chunk)); cb(); },
+        flush(cb) {
+          try {
+            let total = 0; for (const p of parts) total += p.length;
+            const joined = new Uint8Array(total);
+            let at = 0; for (const p of parts) { joined.set(p, at); at += p.length; }
+            cb(null, syncFn(joined, options));
+          } catch (e) { cb(e); }
+        },
+      }));
+      return t;
+    };
+  }
+  zlib.createGzip = makeZlibTransform(zlib.gzipSync);
+  zlib.createGunzip = makeZlibTransform(zlib.gunzipSync);
+  zlib.createDeflate = makeZlibTransform(zlib.deflateSync);
+  zlib.createInflate = makeZlibTransform(zlib.inflateSync);
+  zlib.createDeflateRaw = makeZlibTransform(zlib.deflateRawSync);
+  zlib.createInflateRaw = makeZlibTransform(zlib.inflateRawSync);
+  zlib.createUnzip = makeZlibTransform(zlib.unzipSync);
+  // Node has no zlib.promises namespace -- the callback forms are promisified
+  // with util.promisify, so adding one here would be an invention.
+  globalThis.__sxnZlib = zlib;
+
   // ---------------- small node builtins ----------------
   // Enough of each for the packages that reach for them in passing: `debug`
   // wants tty.isatty, body-parser wants string_decoder, and so on.
@@ -1108,6 +1399,9 @@
       "timers/promises": globalThis.__sxnTimers && globalThis.__sxnTimers.promises,
       perf_hooks: globalThis.__sxnPerfHooks,
       module: globalThis.__sxnModule,
+      zlib: globalThis.__sxnZlib,
+      crypto: globalThis.__sxnCrypto,
+      net: globalThis.__sxnNet,
     };
     const m = table[name];
     if (m === undefined) {

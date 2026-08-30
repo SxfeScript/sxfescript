@@ -35976,7 +35976,15 @@ static inline void capture_var(JSFunctionDef *s, JSVarDef *vd)
      (is_child_scope), i.e. it is actually on this chain.
    Anything else -- duplicates, misses, pseudo-vars, stale index after
    var_count moved -- falls back to the walk unchanged. */
-#define JS_RESOLVE_HTAB_DUP (UINT32_MAX - 1)
+/* A slot holds an index into fd->vars, with the top bit set once a second
+   declaration of the same name has been seen. Keeping the index (rather
+   than replacing it with a sentinel) is what lets a later probe compare
+   names again: overwriting it left the slot pointing nowhere, and the
+   next collision read fd->vars past its end. var_count is an int, so
+   the top bit is always free. */
+#define JS_RESOLVE_HTAB_EMPTY UINT32_MAX
+#define JS_RESOLVE_HTAB_DUP   0x80000000u
+#define JS_RESOLVE_HTAB_IDX(v) ((v) & ~JS_RESOLVE_HTAB_DUP)
 
 static void js_build_resolve_htab(JSContext *ctx, JSFunctionDef *fd)
 {
@@ -35999,8 +36007,11 @@ static void js_build_resolve_htab(JSContext *ctx, JSFunctionDef *fd)
         j = 1;
         for (;;) {
             uint32_t *q = &fd->resolve_htab[h & m];
-            if (*q == UINT32_MAX) { *q = i; break; }
-            if (fd->vars[*q].var_name == name) { *q = JS_RESOLVE_HTAB_DUP; break; }
+            if (*q == JS_RESOLVE_HTAB_EMPTY) { *q = i; break; }
+            if (fd->vars[JS_RESOLVE_HTAB_IDX(*q)].var_name == name) {
+                *q |= JS_RESOLVE_HTAB_DUP;
+                break;
+            }
             h += j; j += 1; /* quadratic probing */
         }
     }
@@ -36017,12 +36028,13 @@ static int js_resolve_htab_lookup(JSFunctionDef *fd, JSAtom name)
     j = 1;
     for (;;) {
         uint32_t v = fd->resolve_htab[h & m];
-        if (v == UINT32_MAX)
+        if (v == JS_RESOLVE_HTAB_EMPTY)
             return -1; /* definitively absent */
-        if (v != JS_RESOLVE_HTAB_DUP && fd->vars[v].var_name == name)
+        if (fd->vars[JS_RESOLVE_HTAB_IDX(v)].var_name == name) {
+            if (v & JS_RESOLVE_HTAB_DUP)
+                return -2; /* declared more than once: caller must walk */
             return (int)v;
-        if (v == JS_RESOLVE_HTAB_DUP)
-            return -2; /* declared more than once: caller must walk */
+        }
         h += j; j += 1;
     }
 }

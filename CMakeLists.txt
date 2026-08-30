@@ -255,6 +255,8 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # stack-inspecting packages need, and process stdio.
   add_test(NAME sxn-node-misc COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_misc.mjs)
   add_test(NAME sxn-node-http COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_http.mjs)
+  add_test(NAME sxn-node-zlib COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_zlib.mjs)
+  add_test(NAME sxn-node-crypto-net COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_crypto_net.mjs)
   set_tests_properties(sxn-node-http PROPERTIES TIMEOUT 40 FAIL_REGULAR_EXPRESSION "FAIL")
   add_test(NAME sxn-web-streams COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/web_streams.mjs)
   # Crypto/SubtleCrypto brands, and MessageChannel's two ports.

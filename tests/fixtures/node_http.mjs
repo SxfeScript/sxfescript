@@ -6,7 +6,19 @@ const check = (n, got, want) => { const ok = JSON.stringify(got) === JSON.string
 
 const server = http.createServer((req, res) => {
   const url = req.url;
-  if (url === "/json") {
+  if (url === "/late-body") {
+    // on-finished and body-parser both decide from these, and a body pushed
+    // before the consumer subscribes would arrive as an empty string.
+    const seen = { complete: req.complete, sockReadable: !!req.socket.readable };
+    setTimeout(() => {
+      let body = "";
+      req.on("data", (c) => { body += c; });
+      req.on("end", () => {
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ ...seen, body, doneAfter: req.complete }));
+      });
+    }, 0);
+  } else if (url === "/json") {
     res.writeHead(201, { "content-type": "application/json", "x-a": "1" });
     res.end(JSON.stringify({ method: req.method, ua: !!req.headers["user-agent"] }));
   } else if (url === "/chunks") {
@@ -57,6 +69,10 @@ check("async response", await late.text(), "after a tick");
 
 const nf = await fetch(base + "/nope");
 check("404", [nf.status, await nf.text()], [404, "not found"]);
+
+const lb = await (await fetch(base + "/late-body", { method: "POST", body: "deferred" })).json();
+check("body survives a late listener", lb,
+      { complete: false, sockReadable: true, body: "deferred", doneAfter: true });
 
 check("STATUS_CODES", http.STATUS_CODES[404], "Not Found");
 check("METHODS has POST", http.METHODS.includes("POST"), true);
