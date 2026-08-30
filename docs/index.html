@@ -70,12 +70,12 @@
   ::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: padding-box; }
   body {
     margin: 0; color: var(--ink); overflow-x: hidden;
-    /* A soft glow of the accent (and a faint warm counterpoint) behind the
-       hero, fading to the flat page color by the time content scrolls past
-       it -- an ambient backdrop rather than a tiled or scrolling gradient. */
+    /* A soft warm glow behind the hero, contrasting with the teal used for
+       text and accents rather than repeating it, fading to the flat page
+       color by the time content scrolls past it. */
     background:
-      radial-gradient(1100px 620px at 15% -12%, color-mix(in srgb, var(--accent) 22%, transparent), transparent 60%),
-      radial-gradient(900px 520px at 105% -6%, color-mix(in srgb, var(--unsafe) 14%, transparent), transparent 55%),
+      radial-gradient(1100px 620px at 15% -12%, color-mix(in srgb, var(--unsafe) 20%, transparent), transparent 60%),
+      radial-gradient(900px 520px at 105% -6%, color-mix(in srgb, var(--unsafe) 10%, transparent), transparent 55%),
       var(--paper);
     background-repeat: no-repeat;
     background-attachment: fixed;
