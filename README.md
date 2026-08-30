@@ -89,7 +89,7 @@ throughput rows are the harness's own 1,000-run medians:
 | Sustained throughput: Buffer ops | **21.5 ms** | 24.1 ms | 27.2 ms | sxn |
 | Sustained throughput: TextEncoder | 14.1 ms | 39.4 ms | **6.2 ms** | Bun |
 | Sustained throughput: EventEmitter | 9.1 ms | **5.1 ms** | 9.2 ms | Node |
-| Pause consistency: total time | 277.2 ms | **246.5 ms** | 284.7 ms | Node |
+| Pause consistency: total time | **131.2 ms** | 245.1 ms | 276.3 ms | sxn |
 | Pause consistency: worst single pause | **0.04 ms** | 0.20 ms | 2.77 ms | sxn |
 | Parse 32k-line generated file | **16 ms** | 53 ms | 24 ms | sxn |
 
@@ -125,7 +125,8 @@ win outright.
 
 sxn wins the categories dominated by process startup and one-shot work,
 where there is no JIT to warm up. On Buffer throughput it is now ahead of
-both JIT runtimes, and it has by far the tightest worst-case pause. It beats
+both JIT runtimes, and it takes both pause rows -- the tightest worst case by
+5x, and now the total as well, after the fusion described below. It beats
 Node on TextEncoder but not Bun. On EventEmitter it ties Bun -- both
 runtimes trade the lead run to run -- and both trail Node by roughly 2x;
 that gap is the listener's own bytecode running on every emit, which nothing
@@ -230,6 +231,23 @@ Together those took the pause row's own expression,
 `Buffer.from("payload " + i, "utf-8").length`, from 114.7 ns against Node's
 94.3 to 105.0 against 103.8, and the row's total from 511 ms to 277 against
 Node's 246.
+
+That row is then won outright by the one bytecode fusion in the engine. A
+two-argument method call whose result feeds only a `.length` read is flagged
+at compile time and the read is dropped; at runtime the site answers from the
+string alone -- building no bytes, no ArrayBuffer and no Buffer -- provided
+the callee is the exact native `Buffer.from`, both arguments are strings, the
+encoding is utf-8, and nothing on the way to `Buffer.prototype.length` has
+moved. Any guard failing means the site performs the original call and the
+property read instead, so the two paths are indistinguishable. Pause total
+277 -> 131 ms. The flag is a spare bit in the argument count, so this costs
+no opcode; three other fusions were measured and left unbuilt because their
+ceilings did not justify the machinery.
+
+The general form of what that fusion computes is `Buffer.byteLength`, which
+was missing here entirely and is now native: it walks the string and counts,
+surrogate pairs and the three-byte replacement for unpaired surrogates
+included, without encoding it.
 
 Cumulatively: Buffer 102->21.5 ms, TextEncoder 76->14.1 ms, EventEmitter
 37->9.1 ms, with zero GC cycles during the loops throughout. These are
