@@ -2,7 +2,15 @@ cmake_minimum_required(VERSION 3.20)
 project(sxn VERSION 0.0.1 LANGUAGES C)
 find_package(OpenSSL REQUIRED)
 find_package(CURL REQUIRED)
-find_package(libuv CONFIG REQUIRED)
+# libuv ships a CMake config package from Homebrew and vcpkg, but Ubuntu's
+# libuv1-dev provides only pkg-config, so fall back to that rather than
+# requiring the config package everywhere.
+find_package(libuv CONFIG QUIET)
+if(NOT TARGET libuv::uv_a)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(LIBUV REQUIRED IMPORTED_TARGET libuv)
+  add_library(libuv::uv_a ALIAS PkgConfig::LIBUV)
+endif()
 # New link for Task 5: gzip-decompressing npm tarballs needs zlib's inflate;
 # OpenSSL (already linked) has no gzip support. zlib ships with the OS on
 # macOS/Linux, so this is a find, not a vendor.
@@ -11,6 +19,14 @@ find_package(ZLIB REQUIRED)
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
+
+# Strict -std=c17 hides POSIX declarations on glibc, so a Linux build fails on
+# pthread_rwlock_t (via libuv's headers) and PATH_MAX (via limits.h). Ask for
+# them explicitly rather than switching to gnu17, so the code itself stays
+# standard C. Apple's headers expose both regardless.
+if(UNIX AND NOT APPLE)
+  add_compile_definitions(_GNU_SOURCE)
+endif()
 
 option(SXN_ENABLE_POISON "Poison moved and released arena storage" ON)
 option(SXN_BUILD_TESTS "Build SXN tests" ON)
