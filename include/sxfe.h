@@ -11,6 +11,24 @@ extern "C" {
 
 #define SXFE_VERSION "0.0.1"
 
+/* Length of the absolute-path root at p: 0 if relative, 1 for POSIX's
+   leading '/', or 3 for a Windows drive letter (`C:/` or `C:\`). Used by
+   the CLI/module-resolution code in main.c, which has to recognize an
+   absolute path handed in from argv or an import specifier on every
+   platform - unlike node:path's posix.* implementation (src/node.c),
+   which stays leading-'/'-only on purpose: that is real Node behavior,
+   not a gap. */
+static inline size_t sxn_path_root_len(const char *p) {
+    if (p[0] == '/') return 1;
+#ifdef _WIN32
+    if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) &&
+        p[1] == ':' && (p[2] == '/' || p[2] == '\\'))
+        return 3;
+#endif
+    return 0;
+}
+static inline bool sxn_path_is_absolute(const char *p) { return sxn_path_root_len(p) != 0; }
+
 typedef enum SxfeDiagnosticCode {
     SX0000_OK = 0,
     SX1001_UNSUPPORTED_SYNTAX,

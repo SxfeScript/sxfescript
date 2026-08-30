@@ -88,8 +88,8 @@ static char *sxn_normalize_relative(JSContext *ctx, const char *base_name,
    key each time and a cycle recurses until the stack gives out. */
 static void sxn_norm_path(char *p) {
     char *out = p, *seg = p;
-    int lead_slash = (p[0] == '/');
-    if (lead_slash) { out++; seg++; }
+    size_t root_len = sxn_path_root_len(p);
+    if (root_len) { out += root_len; seg += root_len; }
     char *w = out;
     while (*seg) {
         char *end = strchr(seg, '/');
@@ -115,7 +115,7 @@ static void sxn_norm_path(char *p) {
         seg = end + 1;
     }
     *w = 0;
-    if (lead_slash && p[1] == 0 && w == out) { p[1] = 0; }
+    if (root_len == 1 && p[1] == 0 && w == out) { p[1] = 0; }
 }
 
 static bool sxn_is_file(const char *path) {
@@ -176,7 +176,7 @@ static bool sxn_entry_is_commonjs(JSContext *ctx, const char *filename) {
         return false;
 
     char dir[PATH_MAX];
-    if (filename[0] == '/') snprintf(dir, sizeof(dir), "%s", filename);
+    if (sxn_path_is_absolute(filename)) snprintf(dir, sizeof(dir), "%s", filename);
     else {
         char cwd[PATH_MAX];
         if (!getcwd(cwd, sizeof(cwd))) return true;
@@ -393,7 +393,7 @@ static JSValue sxn_run_sxbc(JSContext *ctx, const char *filename) {
     if (JS_IsException(obj)) { js_std_dump_error(ctx); return JS_EXCEPTION; }
 
     char abs[PATH_MAX], dir[PATH_MAX];
-    if (filename[0] == '/') snprintf(abs, sizeof(abs), "%s", filename);
+    if (sxn_path_is_absolute(filename)) snprintf(abs, sizeof(abs), "%s", filename);
     else {
         char cwd[PATH_MAX];
         if (!getcwd(cwd, sizeof(cwd))) cwd[0] = 0;
@@ -517,9 +517,10 @@ static JSValue sxn_make_require(JSContext *ctx, const char *dir);
    extension, bare names through node_modules. Returns a fresh string. */
 static char *sxn_require_resolve(JSContext *ctx, const char *dir, const char *name) {
     char buf[PATH_MAX];
-    if (name[0] == '.' || name[0] == '/') {
-        if (snprintf(buf, sizeof(buf), name[0] == '/' ? "%s%s" : "%s/%s",
-                     name[0] == '/' ? "" : dir, name) >= (int)sizeof(buf))
+    if (name[0] == '.' || sxn_path_is_absolute(name)) {
+        bool name_abs = sxn_path_is_absolute(name);
+        if (snprintf(buf, sizeof(buf), name_abs ? "%s%s" : "%s/%s",
+                     name_abs ? "" : dir, name) >= (int)sizeof(buf))
             return NULL;
         return sxn_resolve_file(ctx, buf);
     }
@@ -787,7 +788,7 @@ static char *sxn_module_normalize(JSContext *ctx, const char *base_name,
     (void)opaque;
     /* Builtins and relative/absolute paths keep the stock behaviour. */
     if (has_prefix(name, "node:") || has_prefix(name, "qjs:") ||
-        name[0] == '.' || name[0] == '/')
+        name[0] == '.' || sxn_path_is_absolute(name))
         return sxn_normalize_relative(ctx, base_name, name);
 
     /* A bare specifier: "pkg", "@scope/pkg", or either with a subpath. Walk up
@@ -954,7 +955,7 @@ static int execute_file(int argc, char **argv, const char *filename,
             js_free(context, source);
             source = NULL;
             char abs[PATH_MAX];
-            if (filename[0] == '/') snprintf(abs, sizeof(abs), "%s", filename);
+            if (sxn_path_is_absolute(filename)) snprintf(abs, sizeof(abs), "%s", filename);
             else {
                 char cwd[PATH_MAX];
                 if (!getcwd(cwd, sizeof(cwd))) cwd[0] = 0;
