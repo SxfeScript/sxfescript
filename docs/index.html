@@ -154,9 +154,30 @@
   .install-tab:first-child { border-radius: 7px 0 0 7px; }
   .install-tab:last-child { border-radius: 0 7px 7px 0; border-left: none; }
   .install-tab.active { background: var(--ink); color: var(--paper); border-color: var(--ink); }
-  pre.install-cmd { margin: 0 0 10px; padding: 14px 18px; font-size: 14px; display: inline-block; }
+  pre.install-cmd {
+    margin: 0 0 10px; padding: 14px 52px 14px 18px; font-size: 14px;
+    display: inline-flex; align-items: center; gap: 20px; position: relative;
+  }
   pre.install-cmd[hidden] { display: none; }
   pre.install-cmd code { color: var(--safe); }
+  .copy-btn {
+    position: absolute; top: 50%; right: 10px; transform: translateY(-50%);
+    width: 28px; height: 28px; padding: 0; display: flex; align-items: center; justify-content: center;
+    border: 1px solid var(--rule); border-radius: 6px; background: var(--card);
+    color: var(--ink-soft); cursor: pointer; font-size: 0;
+  }
+  .copy-btn:hover { color: var(--ink); border-color: var(--accent); }
+  .copy-btn::before {
+    content: ""; width: 14px; height: 14px;
+    background: currentColor;
+    -webkit-mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>') center / contain no-repeat;
+    mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>') center / contain no-repeat;
+  }
+  .copy-btn.copied { color: var(--safe); border-color: var(--safe); }
+  .copy-btn.copied::before {
+    -webkit-mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>');
+    mask-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>');
+  }
   p.install-note { font-size: 13px; color: var(--ink-soft); margin: 0 0 44px; }
   .btn {
     display: inline-flex; align-items: center; gap: 8px; padding: 11px 20px; border-radius: 8px;
@@ -281,8 +302,8 @@
           <button type="button" class="install-tab active" role="tab" aria-selected="true" data-os="unix">macOS / Linux</button>
           <button type="button" class="install-tab" role="tab" aria-selected="false" data-os="windows">Windows</button>
         </div>
-        <pre class="install-cmd" data-os="unix"><code>curl -fsSL https://sxfescript.github.io/latest/install.sh | bash</code></pre>
-        <pre class="install-cmd" data-os="windows" hidden><code>irm https://sxfescript.github.io/latest/install.ps1 | iex</code></pre>
+        <pre class="install-cmd" data-os="unix"><code>curl -fsSL https://sxfescript.github.io/latest/install.sh | bash</code><button type="button" class="copy-btn" aria-label="Copy install command">Copy</button></pre>
+        <pre class="install-cmd" data-os="windows" hidden><code>irm https://sxfescript.github.io/latest/install.ps1 | iex</code><button type="button" class="copy-btn" aria-label="Copy install command">Copy</button></pre>
         <p class="install-note">arm64 or x64, either way. Every release also has a
           plain <code>.zip</code>/<code>.tar.gz</code> on
           <a href="{{REPO_URL}}/releases">Releases</a>.</p>
@@ -559,6 +580,16 @@
     }
     tabs.forEach(function (t) { t.addEventListener("click", function () { show(t.dataset.os); }); });
     if (/Win/.test(navigator.platform || navigator.userAgent)) show("windows");
+
+    document.querySelectorAll(".copy-btn").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var code = btn.previousElementSibling.textContent;
+        navigator.clipboard.writeText(code).then(function () {
+          btn.classList.add("copied");
+          setTimeout(function () { btn.classList.remove("copied"); }, 1800);
+        });
+      });
+    });
   })();
 </script>
 </body>
