@@ -10,14 +10,14 @@
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Public+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
   :root {
-    --paper: #f6f5f1;
+    --paper: #f2f5f4;
     --card: #ffffff;
-    --card-2: #fbfaf6;
-    --rule: #ddd8ce;
-    --rule-soft: #e9e5db;
-    --ink: #201d16;
-    --ink-mid: #57503f;
-    --ink-soft: #857c68;
+    --card-2: #eaf0ee;
+    --rule: #d5dfdc;
+    --rule-soft: #e3eae8;
+    --ink: #131c1a;
+    --ink-mid: #43524d;
+    --ink-soft: #75857f;
     --safe: #0e6e63;
     --safe-wash: #ddeeea;
     --unsafe: #a5540f;
@@ -26,12 +26,12 @@
     --accent-wash: #ddeeea;
     --stop: #9c3a3a;
     --stop-wash: #f5dede;
-    --shadow: 0 1px 2px rgba(32,29,22,.05), 0 14px 34px -22px rgba(32,29,22,.35);
+    --shadow: 0 1px 2px rgba(16,26,24,.05), 0 14px 34px -22px rgba(16,26,24,.35);
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
-      --paper: #17160f; --card: #201e17; --card-2: #26241b; --rule: #3a3627;
-      --rule-soft: #2c2a1f; --ink: #f1efe4; --ink-mid: #c4bda8; --ink-soft: #8f8770;
+      --paper: #0f1517; --card: #161e20; --card-2: #1a2426; --rule: #2b3a3c;
+      --rule-soft: #202b2d; --ink: #edf4f2; --ink-mid: #b4c4c0; --ink-soft: #7e928c;
       --safe: #5fc9ba; --safe-wash: #1c3430;
       --unsafe: #e5975a; --unsafe-wash: #3a2a17;
       --accent: #5fc9ba; --accent-wash: #1c3430;
@@ -40,8 +40,8 @@
     }
   }
   :root[data-theme="dark"] {
-    --paper: #17160f; --card: #201e17; --card-2: #26241b; --rule: #3a3627;
-    --rule-soft: #2c2a1f; --ink: #f1efe4; --ink-mid: #c4bda8; --ink-soft: #8f8770;
+    --paper: #0f1517; --card: #161e20; --card-2: #1a2426; --rule: #2b3a3c;
+    --rule-soft: #202b2d; --ink: #edf4f2; --ink-mid: #b4c4c0; --ink-soft: #7e928c;
     --safe: #5fc9ba; --safe-wash: #1c3430;
     --unsafe: #e5975a; --unsafe-wash: #3a2a17;
     --accent: #5fc9ba; --accent-wash: #1c3430;
@@ -50,13 +50,39 @@
   }
 
   * { box-sizing: border-box; }
-  html { scroll-behavior: smooth; }
+  html {
+    scroll-behavior: smooth; overflow-x: hidden;
+    scrollbar-color: color-mix(in srgb, var(--accent) 55%, var(--rule)) transparent;
+    scrollbar-width: thin;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    * { transition: none !important; }
+  }
+  /* Firefox reads scrollbar-color above; everything else reads this. Kept
+     thin and low-contrast so it recedes -- a scrollbar is chrome, not content. */
+  ::-webkit-scrollbar { width: 11px; height: 11px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--accent) 45%, var(--rule));
+    border-radius: 999px; border: 3px solid var(--paper); background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: padding-box; }
   body {
-    margin: 0; background: var(--paper); color: var(--ink);
+    margin: 0; color: var(--ink); overflow-x: hidden;
+    /* A soft glow of the accent (and a faint warm counterpoint) behind the
+       hero, fading to the flat page color by the time content scrolls past
+       it -- an ambient backdrop rather than a tiled or scrolling gradient. */
+    background:
+      radial-gradient(1100px 620px at 15% -12%, color-mix(in srgb, var(--accent) 22%, transparent), transparent 60%),
+      radial-gradient(900px 520px at 105% -6%, color-mix(in srgb, var(--unsafe) 14%, transparent), transparent 55%),
+      var(--paper);
+    background-repeat: no-repeat;
+    background-attachment: fixed;
     font-family: "Public Sans", ui-sans-serif, system-ui, sans-serif;
     font-size: 16px; line-height: 1.62; -webkit-font-smoothing: antialiased;
   }
-  .wrap { max-width: 900px; margin: 0 auto; padding: 0 22px; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 22px; }
   a { color: var(--accent); }
   code, pre, .mono {
     font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
@@ -71,7 +97,7 @@
   }
   pre code { background: none; border: 0; padding: 0; font-size: .86em; line-height: 1.6; }
   h1, h2, h3 { font-family: Newsreader, Georgia, serif; text-wrap: balance; letter-spacing: -.01em; }
-  p { max-width: 68ch; }
+  p { max-width: 68ch; text-wrap: pretty; }
   .kw-safe { color: var(--safe); font-weight: 600; }
   .kw-unsafe { color: var(--unsafe); font-weight: 600; }
 
@@ -81,17 +107,23 @@
     backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
     border-bottom: 1px solid var(--rule-soft);
   }
-  nav.top .row { display: flex; align-items: center; gap: 20px; padding: 14px 22px; max-width: 900px; margin: 0 auto; }
+  nav.top .row { display: flex; align-items: center; gap: 20px; padding: 14px 22px; max-width: 1120px; margin: 0 auto; }
   .wordmark {
     font-family: "JetBrains Mono", monospace; font-weight: 600; font-size: 15px;
     color: var(--ink); text-decoration: none; letter-spacing: -.01em;
   }
   .wordmark span { color: var(--safe); }
-  nav.top ul { list-style: none; display: flex; gap: 18px; margin: 0 0 0 auto; padding: 0; flex-wrap: wrap; }
+  nav.top ul { list-style: none; display: flex; gap: 18px; margin: 0 0 0 auto; padding: 0; }
+  /* Below this width the link list can't fit next to the wordmark and GitHub
+     button without wrapping into a second, cramped row -- the page's own
+     scroll order already serves as navigation here, so the links step aside
+     rather than wrap. */
+  @media (max-width: 640px) { nav.top ul { display: none; } }
   nav.top a.navlink {
     color: var(--ink-mid); text-decoration: none; font-size: 14px; font-weight: 500;
+    padding-bottom: 2px; border-bottom: 1px solid transparent; transition: color .15s ease, border-color .15s ease;
   }
-  nav.top a.navlink:hover { color: var(--ink); }
+  nav.top a.navlink:hover { color: var(--ink); border-color: var(--accent); }
   .gh-link {
     display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px;
     border: 1px solid var(--rule); border-radius: 999px; font-size: 13px; font-weight: 600;
@@ -106,7 +138,8 @@
   }
   .kicker::before { content: ""; width: 22px; height: 1px; background: var(--accent); display: inline-block; }
   h1.title {
-    font-size: clamp(38px, 6.2vw, 60px); line-height: 1.03; font-weight: 500; margin: 0 0 22px;
+    font-size: clamp(40px, 5vw, 64px); line-height: 1.02; font-weight: 600; margin: 0 0 22px;
+    letter-spacing: -.02em;
   }
   p.lede { font-size: clamp(17px, 2vw, 19.5px); color: var(--ink-mid); max-width: 58ch; margin: 0 0 30px; }
   .cta-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 44px; }
@@ -117,8 +150,9 @@
   .btn-primary { background: var(--ink); color: var(--paper); }
   .btn-ghost { border-color: var(--rule); color: var(--ink); background: var(--card); }
 
-  .compare-hero { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-  @media (max-width: 700px) { .compare-hero { grid-template-columns: 1fr; } }
+  .hero-grid { display: grid; grid-template-columns: 1.15fr .85fr; gap: 48px; align-items: start; }
+  @media (max-width: 860px) { .hero-grid { grid-template-columns: 1fr; } }
+  .compare-hero { display: grid; grid-template-columns: 1fr; gap: 14px; }
   .compare-hero pre { margin: 0; font-size: 12.6px; }
   .compare-label {
     font-family: "JetBrains Mono", monospace; font-size: 11px; letter-spacing: .08em;
@@ -128,6 +162,12 @@
   /* ---- sections ---- */
   section { padding: 56px 0; border-top: 1px solid var(--rule-soft); }
   section:first-of-type { border-top: none; }
+  section.band {
+    border-top: 1px solid var(--rule-soft); border-bottom: 1px solid var(--rule-soft);
+    background: var(--card-2);
+    margin-left: calc(50% - 50vw); margin-right: calc(50% - 50vw);
+    padding-left: calc(50vw - 50%); padding-right: calc(50vw - 50%);
+  }
   h2.h {
     font-size: clamp(26px, 3.6vw, 32px); font-weight: 600; margin: 0 0 8px;
   }
@@ -138,23 +178,41 @@
 
   .card {
     background: var(--card); border: 1px solid var(--rule); border-radius: 10px;
-    padding: 20px; box-shadow: var(--shadow);
+    padding: 20px; transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
   }
-  .card h3 { margin: 0 0 8px; font-size: 16.5px; font-weight: 600; font-family: "Public Sans", sans-serif; }
+  .card:hover {
+    transform: translateY(-2px); box-shadow: var(--shadow);
+    border-color: color-mix(in srgb, var(--accent) 32%, var(--rule));
+  }
+  .card h3 {
+    margin: 0 0 8px; font-size: 16.5px; font-weight: 600; font-family: "Public Sans", sans-serif;
+    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  }
   .card p { margin: 0; font-size: 14.5px; color: var(--ink-mid); }
+  .badge {
+    font-family: "JetBrains Mono", monospace; font-size: 11px; font-weight: 600; letter-spacing: .02em;
+    color: var(--accent); background: var(--accent-wash); border-radius: 5px; padding: 2px 7px;
+  }
 
   /* comparison table */
-  .scroll { overflow-x: auto; border: 1px solid var(--rule); border-radius: 10px; background: var(--card); box-shadow: var(--shadow); }
+  .scroll { overflow-x: auto; border: 1px solid var(--rule); border-radius: 8px; background: var(--card); }
   table { border-collapse: collapse; width: 100%; min-width: 560px; }
   th, td { text-align: left; padding: 12px 16px; border-bottom: 1px solid var(--rule-soft); vertical-align: top; font-size: 14.5px; }
   thead th {
     font-family: "JetBrains Mono", monospace; font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase;
-    color: var(--ink-soft); font-weight: 500; background: var(--card-2); border-bottom: 1px solid var(--rule);
+    color: var(--ink-soft); font-weight: 500; background: var(--card-2); border-bottom: 2px solid var(--rule);
   }
   tbody tr:last-child td { border-bottom: 0; }
+  tbody tr:hover td { background: var(--card-2); }
   td.yes { color: var(--safe); font-weight: 600; }
   td.no { color: var(--ink-soft); }
+  td.yes::before { content: "\2713  "; }
+  td.no::before { content: "\2014  "; }
   td code { background: none; border: 0; padding: 0; }
+  td.num, th.num {
+    text-align: right; font-family: "JetBrains Mono", monospace; font-variant-numeric: tabular-nums;
+    font-size: 14px; white-space: nowrap;
+  }
 
   ul.check, ul.plain { padding-left: 0; list-style: none; margin: 0; }
   ul.check li, ul.plain li { padding: 5px 0 5px 26px; position: relative; font-size: 15px; color: var(--ink-mid); }
@@ -188,37 +246,41 @@
 
 <div class="wrap">
   <header class="hero" id="top">
-    <p class="kicker">SxfeScript &middot; runs on ArcSX</p>
-    <h1 class="title">Ownership and borrows,<br>on top of ordinary JavaScript.</h1>
-    <p class="lede">
-      SxfeScript is JavaScript with an explicit <span class="kw-safe">safe</span> and
-      <span class="kw-unsafe">unsafe</span> boundary, affine values, and lexical borrows &mdash;
-      parsed natively, with no build step, and run by <strong>ArcSX</strong>, a QuickJS-based
-      runtime built to run the same on a phone as it does on a server.
-    </p>
-    <div class="cta-row">
-      <a class="btn btn-primary" href="{{REPO_URL}}">View the source</a>
-      <a class="btn btn-ghost" href="{{REPO_URL}}/blob/main/spec/LANGUAGE.md">Read the language spec</a>
-      <a class="btn btn-ghost" href="#contributing">Contribute</a>
-    </div>
-
-    <div class="compare-hero">
+    <div class="hero-grid">
       <div>
-        <p class="compare-label">TypeScript &mdash; erased at build time</p>
-        <pre><code>function withdraw(acct: Account, n: number) {
+        <p class="kicker">SxfeScript &middot; runs on ArcSX</p>
+        <h1 class="title">Ownership and borrows, on top of ordinary JavaScript.</h1>
+        <p class="lede">
+          SxfeScript is JavaScript with an explicit <span class="kw-safe">safe</span> and
+          <span class="kw-unsafe">unsafe</span> boundary, affine values, and lexical borrows
+          &mdash; parsed natively, with no build step, and run by <strong>ArcSX</strong>, a
+          QuickJS-based runtime built to run the same on a phone as it does on a server.
+        </p>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="{{REPO_URL}}">View the source</a>
+          <a class="btn btn-ghost" href="{{REPO_URL}}/blob/main/spec/LANGUAGE.md">Read the language spec</a>
+          <a class="btn btn-ghost" href="#contributing">Contribute</a>
+        </div>
+      </div>
+
+      <div class="compare-hero">
+        <div>
+          <p class="compare-label">TypeScript &mdash; erased at build time</p>
+          <pre><code>function withdraw(acct: Account, n: number) {
   // nothing here is true at runtime.
   // acct could be null. n could be NaN.
   // tsc already stopped watching.
   acct.balance -= n;
 }</code></pre>
-      </div>
-      <div>
-        <p class="compare-label">SxfeScript &mdash; checked, then run</p>
-        <pre><code>function withdraw(<span class="kw-unsafe">&mut</span> acct: Account, n: i32) {
+        </div>
+        <div>
+          <p class="compare-label">SxfeScript &mdash; checked, then run</p>
+          <pre><code>function withdraw(<span class="kw-unsafe">&mut</span> acct: Account, n: i32) {
   // acct is a live, exclusive borrow --
   // checked at parse time, not hoped for.
   acct.balance -= n;
 }</code></pre>
+        </div>
       </div>
     </div>
   </header>
@@ -312,7 +374,7 @@
     </p>
   </section>
 
-  <section id="arcsx">
+  <section id="arcsx" class="band">
     <h2 class="h">ArcSX: the runtime underneath</h2>
     <p class="lede-s">
       ArcSX is a QuickJS-ng fork, built as <code>sxn</code>. It runs <code>.sx</code>,
@@ -328,31 +390,31 @@
     </p>
     <div class="scroll">
       <table>
-        <thead><tr><th>What you're waiting on</th><th>sxn</th><th>Node</th><th>Bun</th><th>In plain terms</th></tr></thead>
+        <thead><tr><th>What you're waiting on</th><th class="num">sxn</th><th class="num">Node</th><th class="num">Bun</th><th>In plain terms</th></tr></thead>
         <tbody>
           <tr>
             <td>Starting a new process</td>
-            <td class="yes">8.4 ms</td><td>41.6 ms</td><td>9.2 ms</td>
+            <td class="num yes">8.4 ms</td><td class="num">41.6 ms</td><td class="num">9.2 ms</td>
             <td>About 5x faster than Node to start, and a hair ahead of Bun &mdash; matters for a CLI tool or a serverless cold start</td>
           </tr>
           <tr>
             <td>Processing binary data (<code>Buffer</code>)</td>
-            <td class="yes">19.2 ms</td><td>23.8 ms</td><td>27.6 ms</td>
+            <td class="num yes">19.2 ms</td><td class="num">23.8 ms</td><td class="num">27.6 ms</td>
             <td>Faster than both, at the operation almost every server-side script does constantly</td>
           </tr>
           <tr>
             <td>Encoding text (<code>TextEncoder</code>)</td>
-            <td class="yes">4.7 ms</td><td>38.9 ms</td><td>6.3 ms</td>
+            <td class="num yes">4.7 ms</td><td class="num">38.9 ms</td><td class="num">6.3 ms</td>
             <td>8x faster than Node, ahead of Bun too</td>
           </tr>
           <tr>
             <td>Worst single GC-style pause</td>
-            <td class="yes">0.04 ms</td><td>0.36 ms</td><td>2.59 ms</td>
+            <td class="num yes">0.04 ms</td><td class="num">0.36 ms</td><td class="num">2.59 ms</td>
             <td>No JIT means no warm-up stalls &mdash; the most predictable of the three, which is what a real-time or low-latency workload actually needs</td>
           </tr>
           <tr>
             <td>Firing many event listeners</td>
-            <td>6.6 ms</td><td class="yes">5.1 ms</td><td>9.3 ms</td>
+            <td class="num">6.6 ms</td><td class="num yes">5.1 ms</td><td class="num">9.3 ms</td>
             <td>The one row Node wins, narrowly &mdash; its JIT inlines the hot path in a way an interpreter structurally can't</td>
           </tr>
         </tbody>
@@ -366,13 +428,13 @@
 
     <div class="grid-2">
       <div class="card">
-        <h3>WinterCG surface &mdash; 45 of 55 names</h3>
+        <h3>WinterCG surface <span class="badge">45 / 55</span></h3>
         <p><code>fetch</code>, <code>Sxn.serve</code> (HTTP, SSE, WebSocket upgrade), Web
         Streams, Web Crypto, <code>structuredClone</code>. This half travels wherever the
         engine is embedded &mdash; it's not tied to Node emulation.</p>
       </div>
       <div class="card">
-        <h3>Node compatibility &mdash; 24 of ~37 <code>node:</code> modules</h3>
+        <h3>Node compatibility <span class="badge">24 / ~37</span></h3>
         <p>CommonJS, <code>node:</code> builtins, and <code>.node</code> native addons through
         a from-scratch Node-API implementation &mdash; real enough that <code>next-swc</code>,
         the Rust binary Next.js compiles JSX with, loads and runs under it.</p>
