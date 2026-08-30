@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SxfeScript</title>
 <meta name="description" content="SxfeScript: explicit ownership and real runtime safety on top of ordinary JavaScript, running on ArcSX, a QuickJS-based runtime built to run the same on a phone as it does on a server.">
+<link rel="icon" type="image/png" href="logo.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Public+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -111,7 +112,9 @@
   .wordmark {
     font-family: "JetBrains Mono", monospace; font-weight: 600; font-size: 15px;
     color: var(--ink); text-decoration: none; letter-spacing: -.01em;
+    display: inline-flex; align-items: center; gap: 8px;
   }
+  .wordmark img { width: 22px; height: 22px; border-radius: 6px; }
   .wordmark span { color: var(--safe); }
   nav.top ul { list-style: none; display: flex; gap: 18px; margin: 0 0 0 auto; padding: 0; }
   /* Below this width the link list can't fit next to the wordmark and GitHub
@@ -233,7 +236,7 @@
 
 <nav class="top">
   <div class="row">
-    <a class="wordmark" href="#top">Sxfe<span>Script</span></a>
+    <a class="wordmark" href="#top"><img src="logo.png" alt="" width="22" height="22">Sxfe<span>Script</span></a>
     <ul>
       <li><a class="navlink" href="#what-is">Overview</a></li>
       <li><a class="navlink" href="#vs-typescript">vs TypeScript</a></li>
