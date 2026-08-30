@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SxfeScript</title>
+<meta name="description" content="SxfeScript: explicit ownership and real runtime safety on top of ordinary JavaScript, running on ArcSX — a QuickJS-based runtime built with no JIT, by design, so it runs the same on a phone as it does on a server.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Public+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper: #f6f5f1;
+    --card: #ffffff;
+    --card-2: #fbfaf6;
+    --rule: #ddd8ce;
+    --rule-soft: #e9e5db;
+    --ink: #201d16;
+    --ink-mid: #57503f;
+    --ink-soft: #857c68;
+    --safe: #0e6e63;
+    --safe-wash: #ddeeea;
+    --unsafe: #a5540f;
+    --unsafe-wash: #f5e4d3;
+    --accent: #0e6e63;
+    --accent-wash: #ddeeea;
+    --stop: #9c3a3a;
+    --stop-wash: #f5dede;
+    --shadow: 0 1px 2px rgba(32,29,22,.05), 0 14px 34px -22px rgba(32,29,22,.35);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #17160f; --card: #201e17; --card-2: #26241b; --rule: #3a3627;
+      --rule-soft: #2c2a1f; --ink: #f1efe4; --ink-mid: #c4bda8; --ink-soft: #8f8770;
+      --safe: #5fc9ba; --safe-wash: #1c3430;
+      --unsafe: #e5975a; --unsafe-wash: #3a2a17;
+      --accent: #5fc9ba; --accent-wash: #1c3430;
+      --stop: #e08a8a; --stop-wash: #3a2222;
+      --shadow: 0 1px 2px rgba(0,0,0,.5), 0 14px 34px -22px rgba(0,0,0,.8);
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #17160f; --card: #201e17; --card-2: #26241b; --rule: #3a3627;
+    --rule-soft: #2c2a1f; --ink: #f1efe4; --ink-mid: #c4bda8; --ink-soft: #8f8770;
+    --safe: #5fc9ba; --safe-wash: #1c3430;
+    --unsafe: #e5975a; --unsafe-wash: #3a2a17;
+    --accent: #5fc9ba; --accent-wash: #1c3430;
+    --stop: #e08a8a; --stop-wash: #3a2222;
+    --shadow: 0 1px 2px rgba(0,0,0,.5), 0 14px 34px -22px rgba(0,0,0,.8);
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--paper); color: var(--ink);
+    font-family: "Public Sans", ui-sans-serif, system-ui, sans-serif;
+    font-size: 16px; line-height: 1.62; -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 0 22px; }
+  a { color: var(--accent); }
+  code, pre, .mono {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  }
+  code {
+    font-size: .87em; background: var(--card-2); border: 1px solid var(--rule-soft);
+    border-radius: 4px; padding: .08em .36em;
+  }
+  pre {
+    background: var(--card-2); border: 1px solid var(--rule); border-radius: 10px;
+    padding: 18px 20px; overflow-x: auto; box-shadow: var(--shadow);
+  }
+  pre code { background: none; border: 0; padding: 0; font-size: .86em; line-height: 1.6; }
+  h1, h2, h3 { font-family: Newsreader, Georgia, serif; text-wrap: balance; letter-spacing: -.01em; }
+  p { max-width: 68ch; }
+  .kw-safe { color: var(--safe); font-weight: 600; }
+  .kw-unsafe { color: var(--unsafe); font-weight: 600; }
+
+  /* ---- nav ---- */
+  nav.top {
+    position: sticky; top: 0; z-index: 20; background: color-mix(in srgb, var(--paper) 88%, transparent);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--rule-soft);
+  }
+  nav.top .row { display: flex; align-items: center; gap: 20px; padding: 14px 22px; max-width: 900px; margin: 0 auto; }
+  .wordmark {
+    font-family: "JetBrains Mono", monospace; font-weight: 600; font-size: 15px;
+    color: var(--ink); text-decoration: none; letter-spacing: -.01em;
+  }
+  .wordmark span { color: var(--safe); }
+  nav.top ul { list-style: none; display: flex; gap: 18px; margin: 0 0 0 auto; padding: 0; flex-wrap: wrap; }
+  nav.top a.navlink {
+    color: var(--ink-mid); text-decoration: none; font-size: 14px; font-weight: 500;
+  }
+  nav.top a.navlink:hover { color: var(--ink); }
+  .gh-link {
+    display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px;
+    border: 1px solid var(--rule); border-radius: 999px; font-size: 13px; font-weight: 600;
+    color: var(--ink); text-decoration: none; background: var(--card);
+  }
+
+  /* ---- hero ---- */
+  header.hero { padding: 76px 0 40px; }
+  .kicker {
+    font-family: "JetBrains Mono", monospace; font-size: 11.5px; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--accent); margin: 0 0 18px; display: flex; align-items: center; gap: 10px;
+  }
+  .kicker::before { content: ""; width: 22px; height: 1px; background: var(--accent); display: inline-block; }
+  h1.title {
+    font-size: clamp(38px, 6.2vw, 60px); line-height: 1.03; font-weight: 500; margin: 0 0 22px;
+  }
+  p.lede { font-size: clamp(17px, 2vw, 19.5px); color: var(--ink-mid); max-width: 58ch; margin: 0 0 30px; }
+  .cta-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 44px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px; padding: 11px 20px; border-radius: 8px;
+    font-weight: 600; font-size: 14.5px; text-decoration: none; border: 1px solid transparent;
+  }
+  .btn-primary { background: var(--ink); color: var(--paper); }
+  .btn-ghost { border-color: var(--rule); color: var(--ink); background: var(--card); }
+
+  .compare-hero { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 700px) { .compare-hero { grid-template-columns: 1fr; } }
+  .compare-hero pre { margin: 0; font-size: 12.6px; }
+  .compare-label {
+    font-family: "JetBrains Mono", monospace; font-size: 11px; letter-spacing: .08em;
+    text-transform: uppercase; color: var(--ink-soft); margin: 0 0 8px;
+  }
+
+  /* ---- sections ---- */
+  section { padding: 56px 0; border-top: 1px solid var(--rule-soft); }
+  section:first-of-type { border-top: none; }
+  h2.h {
+    font-size: clamp(26px, 3.6vw, 32px); font-weight: 600; margin: 0 0 8px;
+  }
+  p.lede-s { color: var(--ink-mid); max-width: 62ch; margin: 0 0 32px; }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  @media (max-width: 760px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--card); border: 1px solid var(--rule); border-radius: 10px;
+    padding: 20px; box-shadow: var(--shadow);
+  }
+  .card h3 { margin: 0 0 8px; font-size: 16.5px; font-weight: 600; font-family: "Public Sans", sans-serif; }
+  .card p { margin: 0; font-size: 14.5px; color: var(--ink-mid); }
+
+  /* comparison table */
+  .scroll { overflow-x: auto; border: 1px solid var(--rule); border-radius: 10px; background: var(--card); box-shadow: var(--shadow); }
+  table { border-collapse: collapse; width: 100%; min-width: 560px; }
+  th, td { text-align: left; padding: 12px 16px; border-bottom: 1px solid var(--rule-soft); vertical-align: top; font-size: 14.5px; }
+  thead th {
+    font-family: "JetBrains Mono", monospace; font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase;
+    color: var(--ink-soft); font-weight: 500; background: var(--card-2); border-bottom: 1px solid var(--rule);
+  }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.yes { color: var(--safe); font-weight: 600; }
+  td.no { color: var(--ink-soft); }
+  td code { background: none; border: 0; padding: 0; }
+
+
+  /* pull quote / invariant box */
+  .invariant {
+    background: var(--safe-wash); border: 1px solid color-mix(in srgb, var(--safe) 35%, var(--rule));
+    border-radius: 12px; padding: 26px 28px; margin: 30px 0;
+  }
+  .invariant .tag {
+    font-family: "JetBrains Mono", monospace; font-size: 11px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--safe); font-weight: 700; margin-bottom: 10px; display: block;
+  }
+  .invariant p { margin: 0 0 10px; color: var(--ink); max-width: 66ch; }
+  .invariant p:last-child { margin-bottom: 0; }
+
+  blockquote.pull {
+    font-family: Newsreader, Georgia, serif; font-size: 22px; line-height: 1.45; font-style: italic;
+    color: var(--ink); margin: 20px 0; padding: 0 0 0 20px; border-left: 3px solid var(--accent); max-width: 58ch;
+  }
+
+  ul.check, ul.plain { padding-left: 0; list-style: none; margin: 0; }
+  ul.check li, ul.plain li { padding: 5px 0 5px 26px; position: relative; font-size: 15px; color: var(--ink-mid); }
+  ul.check li::before { content: "\2713"; position: absolute; left: 0; color: var(--safe); font-weight: 700; }
+  ul.plain li::before { content: "\2014"; position: absolute; left: 0; color: var(--ink-soft); }
+
+  footer {
+    padding: 44px 0 60px; border-top: 1px solid var(--rule-soft); margin-top: 20px;
+  }
+  footer .row { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px; }
+  footer p { color: var(--ink-soft); font-size: 13.5px; margin: 0; }
+  footer .links { display: flex; gap: 16px; flex-wrap: wrap; }
+  footer a { color: var(--ink-mid); font-size: 13.5px; text-decoration: none; }
+  footer a:hover { color: var(--ink); }
+</style>
+</head>
+<body>
+
+<nav class="top">
+  <div class="row">
+    <a class="wordmark" href="#top">Sxfe<span>Script</span></a>
+    <ul>
+      <li><a class="navlink" href="#what-is">Overview</a></li>
+      <li><a class="navlink" href="#vs-typescript">vs TypeScript</a></li>
+      <li><a class="navlink" href="#arcsx">ArcSX runtime</a></li>
+      <li><a class="navlink" href="#no-jit">No JIT</a></li>
+      <li><a class="navlink" href="#contributing">Contributing</a></li>
+    </ul>
+    <a class="gh-link" href="{{REPO_URL}}">GitHub</a>
+  </div>
+</nav>
+
+<div class="wrap">
+  <header class="hero" id="top">
+    <p class="kicker">SxfeScript &middot; runs on ArcSX</p>
+    <h1 class="title">Ownership and borrows,<br>on top of ordinary JavaScript.</h1>
+    <p class="lede">
+      SxfeScript is JavaScript with an explicit <span class="kw-safe">safe</span> and
+      <span class="kw-unsafe">unsafe</span> boundary, affine values, and lexical borrows &mdash;
+      parsed natively, with no build step, and run by <strong>ArcSX</strong>, a QuickJS-based
+      runtime with no JIT, on purpose, so it runs the same on a phone as it does on a server.
+    </p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="{{REPO_URL}}">View the source</a>
+      <a class="btn btn-ghost" href="{{REPO_URL}}/blob/main/spec/LANGUAGE.md">Read the language spec</a>
+      <a class="btn btn-ghost" href="#contributing">Contribute</a>
+    </div>
+
+    <div class="compare-hero">
+      <div>
+        <p class="compare-label">TypeScript &mdash; erased at build time</p>
+        <pre><code>function withdraw(acct: Account, n: number) {
+  // nothing here is true at runtime.
+  // acct could be null. n could be NaN.
+  // tsc already stopped watching.
+  acct.balance -= n;
+}</code></pre>
+      </div>
+      <div>
+        <p class="compare-label">SxfeScript &mdash; checked, then run</p>
+        <pre><code>function withdraw(<span class="kw-unsafe">&mut</span> acct: Account, n: i32) {
+  // acct is a live, exclusive borrow --
+  // checked at parse time, not hoped for.
+  acct.balance -= n;
+}</code></pre>
+      </div>
+    </div>
+  </header>
+
+  <section id="what-is">
+    <h2 class="h">What SxfeScript actually adds</h2>
+    <p class="lede-s">
+      Every ordinary JavaScript value keeps its ordinary semantics. SxfeScript layers four
+      things on top, and all four are optional &mdash; a file that uses none of them is a
+      normal <code>.js</code> file that happens to have a <code>.sx</code> extension.
+    </p>
+    <div class="grid-2">
+      <div class="card">
+        <h3>Ownership &amp; borrows</h3>
+        <p><code>let mut</code> creates a mutable owner, <code>let</code> an immutable one.
+        <code>&amp;value</code> borrows it shared; <code>&amp;mut value</code> borrows it
+        exclusively and requires a mutable owner. A borrow can't be returned, stored somewhere
+        longer-lived, or carried across an <code>await</code> &mdash; checked before the code runs,
+        not documented and hoped for.</p>
+      </div>
+      <div class="card">
+        <h3>The <span class="kw-safe">safe</span> / <span class="kw-unsafe">unsafe</span> boundary</h3>
+        <p><code>safe let</code> marks a binding as type-stable: the object shape it points to
+        rejects property addition, deletion, and incompatible writes. Reaching outside that &mdash;
+        a raw pointer, an FFI call &mdash; means writing <code>unsafe</code> and meaning it,
+        the same contract Rust makes explicit.</p>
+      </div>
+      <div class="card">
+        <h3>Erasable TypeScript annotations</h3>
+        <p>Type aliases, interfaces, <code>declare</code>, generics on functions, optional
+        parameters, <code>as</code>/<code>satisfies</code>, union types &mdash; parsed and
+        stripped natively, no <code>tsc</code>, no bundler, no separate compile step.</p>
+      </div>
+      <div class="card">
+        <h3>Fixed-layout structs</h3>
+        <p>A primitive-only interface (<code>i32</code>, <code>f32</code>, <code>f64</code>,
+        <code>bool</code>) defines an affine struct with declared field order and natural
+        alignment &mdash; the same layout on every supported target, for code that has to cross
+        into native memory.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="vs-typescript">
+    <h2 class="h">SxfeScript vs. TypeScript</h2>
+    <p class="lede-s">
+      TypeScript's types exist for the compiler and your editor, and stop existing the moment
+      <code>tsc</code> finishes &mdash; a null you were promised isn't there can still be null.
+      SxfeScript's <span class="kw-safe">safe</span> qualifier is the same idea pushed one layer
+      deeper: the guarantee is checked before the code runs, and object shapes that would
+      violate it are rejected rather than merely un-typed.
+    </p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Question</th><th>TypeScript</th><th>SxfeScript</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>What happens to the types at runtime?</td>
+            <td class="no">Erased entirely &mdash; a type is a compile-time fiction</td>
+            <td class="yes"><code>safe</code> bindings keep a runtime descriptor; incompatible writes are rejected, not silently accepted</td>
+          </tr>
+          <tr>
+            <td>Do you need a build step to run a file?</td>
+            <td class="no"><code>tsc</code>, or a bundler standing in for it</td>
+            <td class="yes">No &mdash; <code>sxn app.ts</code> strips and runs it directly</td>
+          </tr>
+          <tr>
+            <td>Aliasing and mutation</td>
+            <td class="no">Not modeled at all</td>
+            <td class="yes">Explicit: an owner, a shared borrow, or an exclusive borrow &mdash; one at a time, checked</td>
+          </tr>
+          <tr>
+            <td>Calling into native code</td>
+            <td class="no">Whatever your runtime's FFI story is &mdash; TypeScript has no opinion</td>
+            <td class="yes">An explicit <code>unsafe extern</code> boundary; everywhere else stays safe by default</td>
+          </tr>
+          <tr>
+            <td>Can a "safe" line still corrupt memory?</td>
+            <td class="no">Not applicable &mdash; there's no runtime safety claim to keep</td>
+            <td class="yes">Not while it stays <code>safe</code>; <code>unsafe</code> is the one place that trust is spent explicitly</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:18px; color:var(--ink-mid); font-size:14.5px; max-width:66ch;">
+      Read plainly: this isn't "TypeScript, but stricter." It's a different claim. TypeScript
+      documents intent for humans and tooling. SxfeScript's safe subset is a runtime contract &mdash;
+      smaller in scope than TypeScript's type system today (see the honest gap list in
+      <a href="{{REPO_URL}}/blob/main/spec/IMPLEMENTATION.md">spec/IMPLEMENTATION.md</a>), and
+      still growing, but real where it applies rather than a promise the runtime never checks.
+    </p>
+  </section>
+
+  <section id="arcsx">
+    <h2 class="h">ArcSX: the runtime underneath</h2>
+    <p class="lede-s">
+      ArcSX is a QuickJS-ng fork, built as <code>sxn</code>. It runs <code>.sx</code>,
+      <code>.ts</code>, and ordinary <code>.js</code>/<code>.mjs</code>/<code>.cjs</code>
+      directly, with two compatibility layers built on top of the same engine core &mdash;
+      one for the browser-shaped WinterCG web APIs, one for Node.
+    </p>
+
+    <p style="color:var(--ink-mid); font-size:14.5px; max-width:68ch; margin-bottom:12px;">
+      What that's actually good for, measured against Node 25 and Bun 1.2 on the same Apple
+      M4 (full methodology, a second machine, and the interpreter-level work behind these
+      numbers are in the <a href="{{REPO_URL}}/blob/main/README.md">README</a>):
+    </p>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>What you're waiting on</th><th>sxn</th><th>Node</th><th>Bun</th><th>In plain terms</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Starting a new process</td>
+            <td class="yes">8.4 ms</td><td>41.6 ms</td><td>9.2 ms</td>
+            <td>About 5x faster than Node to start, and a hair ahead of Bun &mdash; matters for a CLI tool or a serverless cold start</td>
+          </tr>
+          <tr>
+            <td>Processing binary data (<code>Buffer</code>)</td>
+            <td class="yes">19.2 ms</td><td>23.8 ms</td><td>27.6 ms</td>
+            <td>Faster than both, at the operation almost every server-side script does constantly</td>
+          </tr>
+          <tr>
+            <td>Encoding text (<code>TextEncoder</code>)</td>
+            <td class="yes">4.7 ms</td><td>38.9 ms</td><td>6.3 ms</td>
+            <td>8x faster than Node, ahead of Bun too</td>
+          </tr>
+          <tr>
+            <td>Worst single GC-style pause</td>
+            <td class="yes">0.04 ms</td><td>0.36 ms</td><td>2.59 ms</td>
+            <td>No JIT means no warm-up stalls &mdash; the most predictable of the three, which is what a real-time or low-latency workload actually needs</td>
+          </tr>
+          <tr>
+            <td>Firing many event listeners</td>
+            <td>6.6 ms</td><td class="yes">5.1 ms</td><td>9.3 ms</td>
+            <td>The one row Node wins, narrowly &mdash; its JIT inlines the hot path in a way an interpreter structurally can't</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="color:var(--ink-soft); font-size:13px; margin: 10px 0 30px;">
+      All five rows, every runtime, same machine, same workload, run side by side by
+      <code>benchmarks/wintercg/run.sh</code> in the repo &mdash; nothing here is cherry-picked
+      or estimated.
+    </p>
+
+    <div class="grid-3">
+      <div class="card">
+        <h3>WinterCG surface &mdash; 45 of 55 names</h3>
+        <p><code>fetch</code>, <code>Sxn.serve</code> (HTTP, SSE, WebSocket upgrade), Web
+        Streams, Web Crypto, <code>structuredClone</code>. This half travels wherever the
+        engine is embedded &mdash; it's not tied to Node emulation.</p>
+      </div>
+      <div class="card">
+        <h3>Node compatibility &mdash; 24 of ~37 <code>node:</code> modules</h3>
+        <p>CommonJS, <code>node:</code> builtins, and <code>.node</code> native addons through
+        a from-scratch Node-API implementation &mdash; real enough that <code>next-swc</code>,
+        the Rust binary Next.js compiles JSX with, loads and runs under it.</p>
+      </div>
+      <div class="card">
+        <h3>Calling native code</h3>
+        <p><code>Sxn.ffi</code> calls a C function through libffi. It's an engine capability,
+        not a Node one &mdash; the design reasoning for that split, and what it means for
+        mobile, is in <a href="{{REPO_URL}}/blob/main/spec/NATIVE.md">spec/NATIVE.md</a>.</p>
+      </div>
+    </div>
+
+    <p style="margin-top:26px; color:var(--ink-mid); font-size:14.5px; max-width:66ch;">
+      Every number above is measured, not estimated &mdash; the full benchmark methodology,
+      both test machines' specs, and the interpreter-level optimizations behind them are in
+      the <a href="{{REPO_URL}}/blob/main/README.md">project README</a>.
+    </p>
+  </section>
+
+  <section id="no-jit">
+    <h2 class="h">Why there's no JIT</h2>
+    <p class="lede-s">
+      This is the one design decision on this page that isn't up for debate. Everything else
+      is &mdash; see Contributing below.
+    </p>
+    <div class="invariant">
+      <span class="tag">Fixed invariant</span>
+      <p>
+        iOS does not grant W^X / JIT entitlements to third-party apps. A runtime with a
+        machine-code tier is a runtime that doesn't run on iOS at all &mdash; not slower there,
+        <em>absent</em> there. ArcSX exists to run everywhere a mobile app needs it to, so a
+        JIT is not a missing feature; it's a category of solution that was never on the table.
+      </p>
+      <p>
+        That rules out the single technique that would close ArcSX's remaining gap against a
+        JIT runtime on call-heavy, allocation-heavy loops. It does not rule out performance
+        work &mdash; an arena allocator, polymorphic inline caches, and compile-time call
+        fusions took this runtime from behind Node and Bun on most rows to ahead of both on
+        seven of eight measured categories, all without generating a single byte of machine
+        code at runtime.
+      </p>
+    </div>
+    <blockquote class="pull">
+      Every benchmark row where a JIT runtime pulls ahead is measured against a technique this
+      project structurally cannot adopt &mdash; not a gap waiting for someone to close it.
+    </blockquote>
+  </section>
+
+  <section id="contributing">
+    <h2 class="h">Contributing</h2>
+    <p class="lede-s">
+      This project is young, opinionated in places, and actively looking for people who'll
+      push back on those opinions. If something here reads as "obviously the right call" and
+      you don't think it is, that's exactly the kind of issue worth opening.
+    </p>
+
+    <div class="grid-2">
+      <div class="card">
+        <h3>What's genuinely open</h3>
+        <ul class="check">
+          <li>The shape and scope of <code>safe</code>/<code>unsafe</code></li>
+          <li>Which TypeScript forms get real support next</li>
+          <li>Ownership and borrow-checking rules and their error messages</li>
+          <li><code>node:</code> and WinterCG coverage priorities</li>
+          <li>Naming, ergonomics, anything that reads as a mistake</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>What isn't</h3>
+        <ul class="plain">
+          <li>Adding a JIT, or anything that needs runtime-generated machine code</li>
+        </ul>
+        <p style="margin-top:14px;">
+          Everything above that line is a real conversation. That one line is a constraint the
+          project is built around, not a preference &mdash; see <a href="#no-jit">Why there's no
+          JIT</a>.
+        </p>
+      </div>
+    </div>
+
+    <p style="margin-top:8px;">
+      Ideological disagreement is welcome too &mdash; if you think the ownership model is solving
+      the wrong problem, or that the safe/unsafe split should work differently, open an issue
+      and make the case. The specs in <code>spec/</code> are the actual design surface of this
+      project, not settled history:
+    </p>
+    <ul class="plain" style="margin-bottom: 20px;">
+      <li><a href="{{REPO_URL}}/blob/main/spec/LANGUAGE.md">spec/LANGUAGE.md</a> &mdash; the language contract</li>
+      <li><a href="{{REPO_URL}}/blob/main/spec/ABI.md">spec/ABI.md</a> &mdash; the native/JS boundary</li>
+      <li><a href="{{REPO_URL}}/blob/main/spec/IMPLEMENTATION.md">spec/IMPLEMENTATION.md</a> &mdash; what's real today, and what isn't yet</li>
+      <li><a href="{{REPO_URL}}/blob/main/spec/RUNTIME.md">spec/RUNTIME.md</a> &amp; <a href="{{REPO_URL}}/blob/main/spec/NODE.md">spec/NODE.md</a> &mdash; the two compatibility surfaces</li>
+    </ul>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="{{REPO_URL}}/issues/new">Open an issue</a>
+      <a class="btn btn-ghost" href="{{REPO_URL}}/pulls">See open pull requests</a>
+    </div>
+  </section>
+
+  <footer>
+    <div class="row">
+      <p>SxfeScript / ArcSX &middot; this page is generated from <code>docs/</code> and deployed by GitHub Actions.</p>
+      <div class="links">
+        <a href="{{REPO_URL}}">Source</a>
+        <a href="{{REPO_URL}}/blob/main/README.md">README</a>
+        <a href="{{REPO_URL}}/tree/main/spec">Specs</a>
+        <a href="{{REPO_URL}}/issues">Issues</a>
+      </div>
+    </div>
+  </footer>
+</div>
+
+</body>
+</html>

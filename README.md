@@ -9,6 +9,14 @@ was a direct snapshot of Rayact's customized fork at commit `66f4965`, and has
 since diverged under its own name, **ArcSX** (see
 `third_party/QUICKJS-PROVENANCE.md` for the full lineage).
 
+A pitch-and-explainer site for both -- SxfeScript against TypeScript, what
+ArcSX actually runs, and what's open for debate versus fixed -- lives in
+[`docs/`](docs/index.html) and deploys via
+[`.github/workflows/docs.yml`](.github/workflows/docs.yml) on every push to
+`main` that touches it. **Contributions, including disagreement with the
+current design, are welcome** -- see [`CONTRIBUTING.md`](CONTRIBUTING.md) for
+what's genuinely open and the one constraint that isn't (no JIT, for mobile).
+
 ## Build
 
 Needs OpenSSL, libcurl, libuv, zlib, and libffi on the system (`brew install
@@ -118,7 +126,7 @@ working laptop under load, and the Linux box is slower per core but idle.
 Read each machine's table against itself, never across the two. The Linux
 Node is four major versions behind, and `performance.now` costs far more per
 call on that kernel, which is why its pause totals read in seconds for all
-three runtimes. Same tree, same tests, same 38 fixtures passing on both.
+three runtimes. Same tree, same tests, same 66 fixtures passing on both.
 
 How each row is measured: throughput rows are the harness's own 1,000-run
 medians. The two startup rows are 20 interleaved launches per runtime, quoted
