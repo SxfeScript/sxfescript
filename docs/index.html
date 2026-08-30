@@ -204,6 +204,7 @@
   tbody tr:last-child td { border-bottom: 0; }
   tbody tr:hover td { background: var(--card-2); }
   td.yes { color: var(--safe); font-weight: 600; }
+  td.yes.quiet { color: var(--ink-mid); font-weight: 400; }
   td.no { color: var(--ink-mid); }
   td.yes::before { content: "\2713  "; }
   td.no::before { content: "-  "; }
@@ -359,7 +360,7 @@
           <tr>
             <td>Can a "safe" line still corrupt memory?</td>
             <td class="no">Not applicable. There's no runtime safety claim to keep</td>
-            <td class="yes">Not while it stays <code>safe</code>; <code>unsafe</code> is the one place that trust is spent explicitly</td>
+            <td class="yes quiet">Not while it stays <code>safe</code>; <code>unsafe</code> is the one place that trust is spent explicitly</td>
           </tr>
         </tbody>
       </table>
