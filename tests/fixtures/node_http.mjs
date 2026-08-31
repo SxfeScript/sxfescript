@@ -6,7 +6,15 @@ const check = (n, got, want) => { const ok = JSON.stringify(got) === JSON.string
 
 const server = http.createServer((req, res) => {
   const url = req.url;
-  if (url === "/socket") {
+  if (url === "/read-body") {
+    // The body is pushed on the first read, never before, and 'end' marks
+    // the request complete -- both of which are shared native functions now
+    // rather than closures built per request.
+    let n = 0;
+    const early = req.complete;
+    req.on("data", (c) => { n += c.length; });
+    req.on("end", () => res.end(JSON.stringify({ n, early, complete: req.complete })));
+  } else if (url === "/socket") {
     // The socket a request carries: the fields on-finished and finalhandler
     // read, the setters they chain off, and destroy() emitting 'close'.
     const sock = req.socket;
@@ -116,6 +124,11 @@ check("404", [nf.status, await nf.text()], [404, "not found"]);
 const lb = await (await fetch(base + "/late-body", { method: "POST", body: "deferred" })).json();
 check("body survives a late listener", lb,
       { complete: false, sockReadable: true, body: "deferred", doneAfter: true });
+
+check("read body", await (await fetch(base + "/read-body", { method: "POST", body: "hello body" })).json(),
+      { n: 10, early: false, complete: true });
+check("read empty body", await (await fetch(base + "/read-body")).json(),
+      { n: 0, early: false, complete: true });
 
 check("socket", await (await fetch(base + "/socket")).json(),
       { readable: true, writable: true, destroyed: false, addr: "string",

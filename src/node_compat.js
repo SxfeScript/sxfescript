@@ -929,22 +929,20 @@
     this.socket = __sxnHttpSocket();
     this.connection = this.socket;
     this.complete = false;
-    this.once("end", () => { this.complete = true; });
+    // Native, and shared: this was an arrow function per request.
+    this.once("end", __sxnHttpComplete);
     // The body is already off the wire, but it must not be pushed before the
     // consumer attaches: body-parser adds its 'data' listener after the
     // handler returns, and an eagerly-ended stream would hand it nothing.
     // Pushing from _read defers until something actually reads.
-    let sent = false;
-    const body = raw.body;
-    this._read = () => {
-      if (sent) return;
-      sent = true;
-      if (body !== undefined && body !== null && body !== "") this.push(body);
-      this.push(null);
-    };
+    this._rawBody = raw.body;
+    this._bodySent = false;
   }
   IncomingMessage.prototype = Object.create(Readable.prototype);
   IncomingMessage.prototype.constructor = IncomingMessage;
+  // Native (js_http_read_body in src/node.c), and on the prototype rather
+  // than a closure built per request.
+  IncomingMessage.prototype._read = __sxnHttpReadBody;
 
   function ServerResponse(settle) {
     Writable.call(this, {});

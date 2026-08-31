@@ -177,6 +177,12 @@ another sixth of the layer's cost. The rule is not "objects stay in
 JavaScript": it is that C wins wherever the work is repeated setup and loses
 wherever it is a call back into the engine per step.
 
+The same rule took two more closures out of every request. `IncomingMessage`
+built one to defer pushing the body until something reads, and another to
+mark itself complete on `end`; both are now shared native functions reading
+their state off the request. Building the two closures cost 0.084
+microseconds a request against 0.010 for the two fields that replaced them.
+
 One move was tried and thrown away, which is worth writing down because the
 number is the only thing that settles it. A `Readable`'s constructor sets ten
 own fields; done from C instead, the same ten stores cost 0.40 microseconds

@@ -2916,6 +2916,45 @@ static JSValue js_http_socket(JSContext *ctx, JSValueConst this_val, int argc, J
 }
 
 
+
+/* A request's body is pushed on the first read, not before -- body-parser
+   attaches its 'data' listener after the handler returns. That deferral was
+   a closure built per request over `sent` and `body`; here it is one shared
+   function reading the two fields off the request itself. */
+static JSValue js_http_read_body(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    JSValue sent = JS_GetPropertyStr(ctx, this_val, "_bodySent");
+    bool already = JS_ToBool(ctx, sent);
+    JS_FreeValue(ctx, sent);
+    if (already) return JS_UNDEFINED;
+    JS_SetPropertyStr(ctx, this_val, "_bodySent", JS_TRUE);
+    JSValue body = JS_GetPropertyStr(ctx, this_val, "_rawBody");
+    JSValue push = JS_GetPropertyStr(ctx, this_val, "push");
+    bool empty = JS_IsUndefined(body) || JS_IsNull(body);
+    if (!empty && JS_IsString(body)) {
+        const char *text = JS_ToCString(ctx, body);
+        empty = text && text[0] == '\0';
+        if (text) JS_FreeCString(ctx, text);
+    }
+    if (!empty) {
+        JSValueConst args[1] = { body };
+        JS_FreeValue(ctx, JS_Call(ctx, push, this_val, 1, args));
+    }
+    JS_FreeValue(ctx, body);
+    JSValueConst end[1] = { JS_NULL };
+    JS_FreeValue(ctx, JS_Call(ctx, push, this_val, 1, end));
+    JS_FreeValue(ctx, push);
+    return JS_UNDEFINED;
+}
+
+/* The same for 'end' marking the request complete: one shared listener
+   instead of an arrow function per request. */
+static JSValue js_http_complete(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    JS_SetPropertyStr(ctx, this_val, "complete", JS_TRUE);
+    return JS_UNDEFINED;
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -3396,6 +3435,8 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnHttpReadBody", JS_NewCFunction(ctx, js_http_read_body, "_read", 0));
+    JS_SetPropertyStr(ctx, global, "__sxnHttpComplete", JS_NewCFunction(ctx, js_http_complete, "onEnd", 0));
     JS_SetPropertyStr(ctx, global, "__sxnHttpSocket", JS_NewCFunction(ctx, js_http_socket, "__sxnHttpSocket", 0));
     JS_SetPropertyStr(ctx, global, "__sxnEeOnce", JS_NewCFunction(ctx, js_ee_once, "once", 2));
     JS_SetPropertyStr(ctx, global, "__sxnJoinChunks", JS_NewCFunction(ctx, js_join_chunks, "__sxnJoinChunks", 1));
