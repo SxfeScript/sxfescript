@@ -3374,6 +3374,303 @@ static JSValue js_next_tick(JSContext *ctx, JSValueConst this_val, int argc, JSV
     return JS_UNDEFINED;
 }
 
+
+/* util.inspect. The JavaScript version built an options object per level, a
+   mapped array per container and a joined string per level; this walks the
+   value once into one buffer. What it prints is unchanged, down to the
+   quoting of keys that are not identifiers. */
+typedef struct SxnSeen { JSValueConst value; struct SxnSeen *prev; } SxnSeen;
+
+static void sxn_inspect_value(JSContext *ctx, DynStr *out, JSValueConst v, int depth, int max, SxnSeen *seen);
+
+static void sxn_inspect_str(JSContext *ctx, DynStr *out, JSValueConst v) {
+    size_t len = 0;
+    const char *text = JS_ToCStringLen(ctx, &len, v);
+    if (!text) { JS_FreeValue(ctx, JS_GetException(ctx)); return; }
+    dynstr_add(out, text, len);
+    JS_FreeCString(ctx, text);
+}
+
+/* A string prints as JSON does inside a container, which is also how Node
+   quotes it -- except that Node uses single quotes. */
+static void sxn_inspect_quoted(JSContext *ctx, DynStr *out, JSValueConst v) {
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue json = JS_GetPropertyStr(ctx, global, "JSON");
+    JSValue stringify = JS_GetPropertyStr(ctx, json, "stringify");
+    JSValueConst args[1] = { v };
+    JSValue text = JS_Call(ctx, stringify, json, 1, args);
+    JS_FreeValue(ctx, stringify);
+    JS_FreeValue(ctx, json);
+    JS_FreeValue(ctx, global);
+    if (!JS_IsException(text)) sxn_inspect_str(ctx, out, text);
+    else JS_FreeValue(ctx, JS_GetException(ctx));
+    JS_FreeValue(ctx, text);
+}
+
+static bool sxn_is_identifier(const char *name, size_t len) {
+    if (len == 0) return false;
+    char c = name[0];
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '$')) return false;
+    for (size_t i = 1; i < len; i++) {
+        c = name[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '$'))
+            return false;
+    }
+    return true;
+}
+
+static void sxn_inspect_call(JSContext *ctx, DynStr *out, JSValueConst v, const char *method) {
+    JSValue fn = JS_GetPropertyStr(ctx, v, method);
+    JSValue text = JS_Call(ctx, fn, v, 0, NULL);
+    JS_FreeValue(ctx, fn);
+    if (!JS_IsException(text)) sxn_inspect_str(ctx, out, text);
+    else JS_FreeValue(ctx, JS_GetException(ctx));
+    JS_FreeValue(ctx, text);
+}
+
+static void sxn_inspect_entries(JSContext *ctx, DynStr *out, JSValueConst v, bool is_map,
+                                int depth, int max, SxnSeen *seen) {
+    JSValue fn = JS_GetPropertyStr(ctx, v, is_map ? "entries" : "values");
+    JSValue iterator = JS_Call(ctx, fn, v, 0, NULL);
+    JS_FreeValue(ctx, fn);
+    if (JS_IsException(iterator)) { JS_FreeValue(ctx, JS_GetException(ctx)); return; }
+    JSValue next = JS_GetPropertyStr(ctx, iterator, "next");
+    bool first = true;
+    for (;;) {
+        JSValue step = JS_Call(ctx, next, iterator, 0, NULL);
+        if (JS_IsException(step)) { JS_FreeValue(ctx, JS_GetException(ctx)); break; }
+        JSValue done = JS_GetPropertyStr(ctx, step, "done");
+        bool finished = JS_ToBool(ctx, done);
+        JS_FreeValue(ctx, done);
+        if (finished) { JS_FreeValue(ctx, step); break; }
+        JSValue entry = JS_GetPropertyStr(ctx, step, "value");
+        JS_FreeValue(ctx, step);
+        if (!first) dynstr_add(out, ", ", 2);
+        first = false;
+        if (is_map) {
+            JSValue key = JS_GetPropertyUint32(ctx, entry, 0);
+            JSValue val = JS_GetPropertyUint32(ctx, entry, 1);
+            sxn_inspect_value(ctx, out, key, depth + 1, max, seen);
+            dynstr_add(out, " => ", 4);
+            sxn_inspect_value(ctx, out, val, depth + 1, max, seen);
+            JS_FreeValue(ctx, key);
+            JS_FreeValue(ctx, val);
+        } else {
+            sxn_inspect_value(ctx, out, entry, depth + 1, max, seen);
+        }
+        JS_FreeValue(ctx, entry);
+    }
+    JS_FreeValue(ctx, next);
+    JS_FreeValue(ctx, iterator);
+}
+
+static void sxn_inspect_value(JSContext *ctx, DynStr *out, JSValueConst v, int depth, int max, SxnSeen *seen) {
+    if (JS_IsNull(v)) { dynstr_add(out, "null", 4); return; }
+    if (JS_IsUndefined(v)) { dynstr_add(out, "undefined", 9); return; }
+    if (JS_IsString(v)) {
+        if (depth == 0) sxn_inspect_str(ctx, out, v);
+        else sxn_inspect_quoted(ctx, out, v);
+        return;
+    }
+    if (JS_IsBool(v) || JS_IsNumber(v)) { sxn_inspect_str(ctx, out, v); return; }
+    if (JS_IsBigInt(v)) { sxn_inspect_str(ctx, out, v); dynstr_add(out, "n", 1); return; }
+    if (JS_IsSymbol(v)) {
+        /* A symbol refuses to become a string implicitly, so call its own
+           toString the way the JavaScript version did. */
+        JSValue fn = JS_GetPropertyStr(ctx, v, "toString");
+        JSValue text = JS_Call(ctx, fn, v, 0, NULL);
+        JS_FreeValue(ctx, fn);
+        if (JS_IsException(text)) { JS_FreeValue(ctx, JS_GetException(ctx)); dynstr_add(out, "Symbol()", 8); }
+        else sxn_inspect_str(ctx, out, text);
+        JS_FreeValue(ctx, text);
+        return;
+    }
+    if (JS_IsFunction(ctx, v)) {
+        JSValue name = JS_GetPropertyStr(ctx, v, "name");
+        const char *text = JS_IsString(name) ? JS_ToCString(ctx, name) : NULL;
+        dynstr_add(out, "[Function: ", 11);
+        if (text && text[0]) dynstr_add(out, text, strlen(text));
+        else dynstr_add(out, "anonymous", 9);
+        dynstr_add(out, "]", 1);
+        if (text) JS_FreeCString(ctx, text);
+        JS_FreeValue(ctx, name);
+        return;
+    }
+    if (!JS_IsObject(v)) { sxn_inspect_str(ctx, out, v); return; }
+
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue ctor_error = JS_GetPropertyStr(ctx, global, "Error");
+    bool is_error = JS_IsInstanceOf(ctx, v, ctor_error) > 0;
+    JS_FreeValue(ctx, ctor_error);
+    JS_FreeValue(ctx, global);
+    if (is_error) {
+        /* This engine's stack is the frames alone, with no "Error: message"
+           line at the top of it, so that line is written here -- which is
+           what Node prints and what the JavaScript version left out. */
+        JSValue name = JS_GetPropertyStr(ctx, v, "name");
+        JSValue message = JS_GetPropertyStr(ctx, v, "message");
+        sxn_inspect_str(ctx, out, name);
+        size_t message_len = 0;
+        const char *message_text = JS_ToCStringLen(ctx, &message_len, message);
+        if (message_text && message_len) {
+            dynstr_add(out, ": ", 2);
+            dynstr_add(out, message_text, message_len);
+        }
+        if (message_text) JS_FreeCString(ctx, message_text);
+        JS_FreeValue(ctx, name);
+        JS_FreeValue(ctx, message);
+        JSValue stack = JS_GetPropertyStr(ctx, v, "stack");
+        size_t stack_len = 0;
+        const char *stack_text = JS_IsString(stack) ? JS_ToCStringLen(ctx, &stack_len, stack) : NULL;
+        if (stack_text && stack_len) {
+            if (stack_text[0] != '\n') dynstr_add(out, "\n", 1);
+            dynstr_add(out, stack_text, stack_len);
+            while (out->len && out->data[out->len - 1] == '\n') out->len--;
+        }
+        if (stack_text) JS_FreeCString(ctx, stack_text);
+        JS_FreeValue(ctx, stack);
+        return;
+    }
+
+    static JSClassID date_id, regexp_id, map_id, set_id;
+    if (!date_id) {
+        static const char *probe_src = "[new Date(), /x/, new Map(), new Set()]";
+        JSValue probe = JS_Eval(ctx, probe_src, strlen(probe_src), "<inspect>", JS_EVAL_TYPE_GLOBAL);
+        JSValue item;
+        item = JS_GetPropertyUint32(ctx, probe, 0); date_id = JS_GetClassID(item); JS_FreeValue(ctx, item);
+        item = JS_GetPropertyUint32(ctx, probe, 1); regexp_id = JS_GetClassID(item); JS_FreeValue(ctx, item);
+        item = JS_GetPropertyUint32(ctx, probe, 2); map_id = JS_GetClassID(item); JS_FreeValue(ctx, item);
+        item = JS_GetPropertyUint32(ctx, probe, 3); set_id = JS_GetClassID(item); JS_FreeValue(ctx, item);
+        JS_FreeValue(ctx, probe);
+    }
+    JSClassID cls = JS_GetClassID(v);
+    if (cls == date_id) {
+        /* toISOString throws on an invalid date, which is what the
+           JavaScript version did to whoever printed one. Node prints
+           "Invalid Date" instead, and so does this. */
+        JSValue fn = JS_GetPropertyStr(ctx, v, "toISOString");
+        JSValue text = JS_Call(ctx, fn, v, 0, NULL);
+        JS_FreeValue(ctx, fn);
+        if (JS_IsException(text)) { JS_FreeValue(ctx, JS_GetException(ctx)); dynstr_add(out, "Invalid Date", 12); }
+        else sxn_inspect_str(ctx, out, text);
+        JS_FreeValue(ctx, text);
+        return;
+    }
+    if (cls == regexp_id) { sxn_inspect_call(ctx, out, v, "toString"); return; }
+
+    for (SxnSeen *p = seen; p; p = p->prev)
+        if (JS_IsStrictEqual(ctx, p->value, v)) { dynstr_add(out, "[Circular *1]", 13); return; }
+    bool is_array = JS_IsArray(v);
+    if (depth > max) {
+        if (is_array) dynstr_add(out, "[Array]", 7);
+        else dynstr_add(out, "[Object]", 8);
+        return;
+    }
+    SxnSeen here = { v, seen };
+
+    if (is_array) {
+        int64_t count = 0;
+        JS_GetLength(ctx, v, &count);
+        if (count == 0) { dynstr_add(out, "[]", 2); return; }
+        dynstr_add(out, "[ ", 2);
+        for (int64_t i = 0; i < count; i++) {
+            if (i) dynstr_add(out, ", ", 2);
+            JSValue item = JS_GetPropertyUint32(ctx, v, (uint32_t)i);
+            sxn_inspect_value(ctx, out, item, depth + 1, max, &here);
+            JS_FreeValue(ctx, item);
+        }
+        dynstr_add(out, " ]", 2);
+        return;
+    }
+    if (cls == map_id || cls == set_id) {
+        bool is_map = cls == map_id;
+        JSValue size = JS_GetPropertyStr(ctx, v, "size");
+        int32_t count = 0;
+        JS_ToInt32(ctx, &count, size);
+        JS_FreeValue(ctx, size);
+        char head[32];
+        int head_len = snprintf(head, sizeof head, "%s(%d) {", is_map ? "Map" : "Set", count);
+        dynstr_add(out, head, (size_t)head_len);
+        if (count) {
+            dynstr_add(out, " ", 1);
+            sxn_inspect_entries(ctx, out, v, is_map, depth, max, &here);
+            dynstr_add(out, " ", 1);
+        }
+        dynstr_add(out, "}", 1);
+        return;
+    }
+    size_t ta_offset = 0, ta_len = 0, ta_element = 0;
+    JSValue ta_buffer = JS_GetTypedArrayBuffer(ctx, v, &ta_offset, &ta_len, &ta_element);
+    if (!JS_IsException(ta_buffer)) {
+        JS_FreeValue(ctx, ta_buffer);
+        /* A typed array prints its own class name and its elements. */
+        JSValue ctor = JS_GetPropertyStr(ctx, v, "constructor");
+        JSValue name = JS_GetPropertyStr(ctx, ctor, "name");
+        JS_FreeValue(ctx, ctor);
+        int64_t count = 0;
+        JS_GetLength(ctx, v, &count);
+        sxn_inspect_str(ctx, out, name);
+        JS_FreeValue(ctx, name);
+        char head[32];
+        int head_len = snprintf(head, sizeof head, "(%lld) [ ", (long long)count);
+        dynstr_add(out, head, (size_t)head_len);
+        for (int64_t i = 0; i < count; i++) {
+            if (i) dynstr_add(out, ", ", 2);
+            JSValue item = JS_GetPropertyUint32(ctx, v, (uint32_t)i);
+            sxn_inspect_str(ctx, out, item);
+            JS_FreeValue(ctx, item);
+        }
+        dynstr_add(out, " ]", 2);
+        return;
+    }
+    JS_FreeValue(ctx, JS_GetException(ctx));   /* not a typed array, then */
+
+    JSPropertyEnum *keys = NULL;
+    uint32_t count = 0;
+    if (JS_GetOwnPropertyNames(ctx, &keys, &count, v, JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        dynstr_add(out, "{}", 2);
+        return;
+    }
+    if (count == 0) { JS_FreePropertyEnum(ctx, keys, count); dynstr_add(out, "{}", 2); return; }
+    dynstr_add(out, "{ ", 2);
+    for (uint32_t i = 0; i < count; i++) {
+        if (i) dynstr_add(out, ", ", 2);
+        JSValue key = JS_AtomToString(ctx, keys[i].atom);
+        size_t name_len = 0;
+        const char *name = JS_ToCStringLen(ctx, &name_len, key);
+        if (name && sxn_is_identifier(name, name_len)) dynstr_add(out, name, name_len);
+        else sxn_inspect_quoted(ctx, out, key);
+        if (name) JS_FreeCString(ctx, name);
+        JS_FreeValue(ctx, key);
+        dynstr_add(out, ": ", 2);
+        JSValue item = JS_GetProperty(ctx, v, keys[i].atom);
+        sxn_inspect_value(ctx, out, item, depth + 1, max, &here);
+        JS_FreeValue(ctx, item);
+    }
+    JS_FreePropertyEnum(ctx, keys, count);
+    dynstr_add(out, " }", 2);
+}
+
+static JSValue js_inspect(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    int max = 2;
+    bool quote_top = false;
+    if (argc > 1 && JS_IsObject(argv[1])) {
+        JSValue depth = JS_GetPropertyStr(ctx, argv[1], "depth");
+        if (!JS_IsUndefined(depth)) { int32_t d = 2; JS_ToInt32(ctx, &d, depth); max = d; }
+        JS_FreeValue(ctx, depth);
+        JSValue quoted = JS_GetPropertyStr(ctx, argv[1], "quoteStrings");
+        quote_top = JS_ToBool(ctx, quoted);
+        JS_FreeValue(ctx, quoted);
+    }
+    DynStr out = { 0 };
+    sxn_inspect_value(ctx, &out, argc > 0 ? argv[0] : JS_UNDEFINED, quote_top ? 1 : 0, max, NULL);
+    JSValue text = JS_NewStringLen(ctx, out.data ? out.data : "", out.len);
+    free(out.data);
+    return text;
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -3855,6 +4152,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnInspect", JS_NewCFunction(ctx, js_inspect, "inspect", 2));
     JS_SetPropertyStr(ctx, global, "__sxnNextTick", JS_NewCFunction(ctx, js_next_tick, "nextTick", 1));
     JS_SetPropertyStr(ctx, global, "__sxnGetHeaders", JS_NewCFunctionMagic(ctx, js_header_list, "getHeaders", 0, JS_CFUNC_generic_magic, 0));
     JS_SetPropertyStr(ctx, global, "__sxnGetHeaderNames", JS_NewCFunctionMagic(ctx, js_header_list, "getHeaderNames", 0, JS_CFUNC_generic_magic, 1));

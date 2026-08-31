@@ -247,6 +247,16 @@ for the array case is what found a sharp edge in the engine: `JS_NewCFunctionDat
 stores its magic unsigned, so -1 came back as 65535 and the call read 65535
 arguments off a four-slot array. It is 4 now.
 
+`util.inspect` was the largest piece of real logic left, and the widest gap:
+5.26 microseconds for a small object against Node's 1.56. It built an options
+object per level, a mapped array per container and a joined string per level.
+The C one walks the value into a single buffer and prints the same shapes:
+2.26 microseconds, checked value by value against the JavaScript it replaced
+before that was deleted. Two things it prints better -- an invalid date, which
+used to throw out of `toISOString` at whoever tried to print it, and an
+error, which now carries the `Error: message` line this engine's `stack`
+leaves off.
+
 A third sweep, over what a server actually touches, found two corruptions
 rather than costs. `fs/promises.readFile` read the file as text and encoded
 it back to bytes, so every byte that is not valid UTF-8 came back as the
@@ -285,6 +295,7 @@ does not have to re-derive it:
 | `PassThrough#write` | 0.600 us | two emitter hops, both already C |
 | `url.fileURLToPath` | 0.130 us | C, was 0.475 |
 | `module.isBuiltin` | 0.045 us | C, was 0.415 |
+| `util.inspect` of an object | 2.26 us | C, was 5.26; Node is 1.56 |
 | `process.nextTick` | 0.143 us | C, was 0.620 |
 | `res.getHeaders` | 0.110 us | C, was 0.173 |
 | `res.getHeaderNames` | 0.110 us | C, was 0.157 |

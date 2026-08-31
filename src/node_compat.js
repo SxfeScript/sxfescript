@@ -1354,46 +1354,11 @@
   // The parts packages actually import: promisify, callbackify, inherits,
   // format, deprecate, and the types guards. inspect is a readable
   // approximation, not Node's exact formatter.
-  function inspect(v, opts, depth) {
-    opts = opts || {};
-    const max = opts.depth === undefined ? 2 : opts.depth;
-    const seen = opts._seen || new Set();
-    depth = depth || 0;
-    const t = typeof v;
-    if (v === null) return "null";
-    if (t === "string") return depth === 0 && !opts.quoteStrings ? v : JSON.stringify(v);
-    if (t === "number" || t === "boolean" || t === "undefined") return String(v);
-    if (t === "bigint") return String(v) + "n";
-    if (t === "symbol") return v.toString();
-    if (t === "function") return "[Function: " + (v.name || "anonymous") + "]";
-    if (v instanceof Error) return v.stack || (v.name + ": " + v.message);
-    if (v instanceof Date) return v.toISOString();
-    if (v instanceof RegExp) return String(v);
-    if (seen.has(v)) return "[Circular *1]";
-    if (depth > max) return Array.isArray(v) ? "[Array]" : "[Object]";
-    seen.add(v);
-    const sub = Object.assign({}, opts, { _seen: seen, quoteStrings: true });
-    let out;
-    if (Array.isArray(v)) {
-      out = "[ " + v.map((e) => inspect(e, sub, depth + 1)).join(", ") + " ]";
-      if (v.length === 0) out = "[]";
-    } else if (v instanceof Map) {
-      out = "Map(" + v.size + ") {" + (v.size ? " " + [...v].map(([k, val]) =>
-        inspect(k, sub, depth + 1) + " => " + inspect(val, sub, depth + 1)).join(", ") + " " : "") + "}";
-    } else if (v instanceof Set) {
-      out = "Set(" + v.size + ") {" + (v.size ? " " + [...v].map((e) =>
-        inspect(e, sub, depth + 1)).join(", ") + " " : "") + "}";
-    } else if (ArrayBuffer.isView(v)) {
-      out = v.constructor.name + "(" + v.length + ") [ " + Array.from(v).join(", ") + " ]";
-    } else {
-      const keys = Object.keys(v);
-      out = keys.length === 0 ? "{}" : "{ " + keys.map((k) =>
-        (/^[A-Za-z_$][\w$]*$/.test(k) ? k : JSON.stringify(k)) + ": " +
-        inspect(v[k], sub, depth + 1)).join(", ") + " }";
-    }
-    seen.delete(v);
-    return out;
-  }
+  // Native (js_inspect in src/node.c). This was a recursive walk that built
+  // an options object per level, a mapped array per container and a joined
+  // string per level; the C one walks into a single buffer. It also answers
+  // "Invalid Date" where this used to throw out of toISOString.
+  const inspect = __sxnInspect;
 
   // Native (js_util_format in src/node.c): the scan and the substitution are
   // string work. Only the cases that need inspect -- %s of something that is
