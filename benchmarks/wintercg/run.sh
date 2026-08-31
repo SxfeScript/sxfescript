@@ -2,8 +2,8 @@
 # Side-by-side sxn vs node vs bun. No category is hidden. Each runtime runs the
 # same workload with the same iteration counts, written in that runtime's
 # idiomatic form (Bun.serve/Bun.env for bun, Sxn.serve for sxn); Buffer,
-# TextEncoder and EventEmitter are the APIs under test and are the same in all
-# three.
+# TextEncoder, EventEmitter and JSON are the APIs under test and are the same
+# in all three.
 #
 # Every runtime is overridable, because a non-interactive shell does not have
 # the PATH a login shell does and a runtime installed under ~/.local or ~/.bun
@@ -74,7 +74,7 @@ measure_throughput() {
   i=0
   while [ "$i" -lt "$RUNS" ]; do "$@" "$script" >>"$tmp"; i=$((i + 1)); done
   printf -- "-- %s (median) --\n" "$label"
-  for metric in buffer textencoder events; do
+  for metric in buffer textencoder events json; do
     value="$(awk -v metric="$metric" '$1 == metric ":" { print $2 }' "$tmp" | sort -n | median)"
     printf "%s: %s ms\n" "$metric" "$value"
   done

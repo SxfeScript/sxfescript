@@ -15964,26 +15964,91 @@ static JSValue JS_ToStringCheckObject(JSContext *ctx, JSValueConst val)
     return JS_ToString(ctx, val);
 }
 
-static JSValue JS_ToQuotedString(JSContext *ctx, JSValueConst val1)
+/* Characters a JSON string can carry unescaped: not a quote, not a
+   backslash, not a control character. Eight bytes at a time -- most strings
+   need no escaping at all, and the per-character loop this replaces was the
+   largest single cost in JSON.stringify. */
+static int json_quote_run8(const uint8_t *p, int len)
 {
+    int i = 0;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    while (i + 8 <= len) {
+        uint64_t v = get_u64(p + i);
+        uint64_t quote = v ^ 0x2222222222222222ULL;
+        uint64_t slash = v ^ 0x5c5c5c5c5c5c5c5cULL;
+        /* (x - 0x01..) & ~x sets the high bit of any byte that was zero,
+           which is how each of these three tests finds its byte. */
+        uint64_t mask = (((quote - 0x0101010101010101ULL) & ~quote)
+                       | ((slash - 0x0101010101010101ULL) & ~slash)
+                       | ((v - 0x2020202020202020ULL) & ~v))
+                      & 0x8080808080808080ULL;
+        if (mask)
+            return i + (ctz64(mask) >> 3);
+        i += 8;
+    }
+#endif
+    while (i < len) {
+        uint8_t c = p[i];
+        if (c == '"' || c == '\\' || c < 0x20)
+            break;
+        i++;
+    }
+    return i;
+}
+
+/* The same for a wide string. A surrogate ends the run, so the character
+   loop below still pairs it up or escapes it as it always did. */
+static int json_quote_run16(const uint16_t *p, int len)
+{
+    int i = 0;
+    while (i < len) {
+        uint16_t c = p[i];
+        if (c == '"' || c == '\\' || c < 0x20 || is_surrogate(c))
+            break;
+        i++;
+    }
+    return i;
+}
+
+/* Writes the quoted form of `val1` into a buffer the caller already has.
+   JSON.stringify used to allocate a quoted string for every key and every
+   string value, copy it into its output buffer, and free it again. */
+static int string_buffer_quote(StringBuffer *b, JSValueConst val1)
+{
+    JSContext *ctx = b->ctx;
     JSValue val;
     JSString *p;
-    int i;
+    int i, run;
     uint32_t c;
-    StringBuffer b_s, *b = &b_s;
     char buf[16];
 
     val = JS_ToStringCheckObject(ctx, val1);
     if (JS_IsException(val))
-        return val;
+        return -1;
     p = JS_VALUE_GET_STRING(val);
-
-    if (string_buffer_init(ctx, b, p->len + 2))
-        goto fail;
 
     if (string_buffer_putc8(b, '\"'))
         goto fail;
     for(i = 0; i < p->len; ) {
+        /* Everything up to the next character needing an escape goes over in
+           one copy; in the common case that is the whole string. */
+        if (p->is_wide_char) {
+            run = json_quote_run16(str16(p) + i, p->len - i);
+            if (run > 0) {
+                if (string_buffer_write16(b, str16(p) + i, run))
+                    goto fail;
+                i += run;
+                continue;
+            }
+        } else {
+            run = json_quote_run8(str8(p) + i, p->len - i);
+            if (run > 0) {
+                if (string_buffer_write8(b, str8(p) + i, run))
+                    goto fail;
+                i += run;
+                continue;
+            }
+        }
         c = string_getc(p, &i);
         switch(c) {
         case '\t':
@@ -16024,11 +16089,23 @@ static JSValue JS_ToQuotedString(JSContext *ctx, JSValueConst val1)
     if (string_buffer_putc8(b, '\"'))
         goto fail;
     JS_FreeValue(ctx, val);
-    return string_buffer_end(b);
+    return 0;
  fail:
     JS_FreeValue(ctx, val);
-    string_buffer_free(b);
-    return JS_EXCEPTION;
+    return -1;
+}
+
+static JSValue JS_ToQuotedString(JSContext *ctx, JSValueConst val1)
+{
+    StringBuffer b_s, *b = &b_s;
+
+    if (string_buffer_init(ctx, b, 32))
+        return JS_EXCEPTION;
+    if (string_buffer_quote(b, val1)) {
+        string_buffer_free(b);
+        return JS_EXCEPTION;
+    }
+    return string_buffer_end(b);
 }
 
 static __maybe_unused void JS_DumpObjectHeader(JSRuntime *rt)
@@ -25345,6 +25422,31 @@ static int json_parse_error(JSParseState *s, const uint8_t *curp, const char *ms
                           msg, position, line, (int)(p - line_start) + 1);
 }
 
+/* The first byte a JSON string cannot pass through untouched: a closing
+   quote, a backslash, a control character, or anything non-ASCII. Eight
+   bytes at a time -- byte-at-a-time scanning was the largest single cost in
+   JSON.parse. */
+static const uint8_t *json_scan_plain(const uint8_t *p, const uint8_t *end)
+{
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    while (p + 8 <= end) {
+        uint64_t v = get_u64(p);
+        uint64_t quote = v ^ 0x2222222222222222ULL;
+        uint64_t slash = v ^ 0x5c5c5c5c5c5c5c5cULL;
+        uint64_t mask = (((quote - 0x0101010101010101ULL) & ~quote)
+                       | ((slash - 0x0101010101010101ULL) & ~slash)
+                       | ((v - 0x2020202020202020ULL) & ~v)
+                       | v) & 0x8080808080808080ULL;
+        if (mask)
+            return p + (ctz64(mask) >> 3);
+        p += 8;
+    }
+#endif
+    while (p < end && *p != '"' && *p != '\\' && *p >= 0x20 && *p < 0x80)
+        p++;
+    return p;
+}
+
 static int json_parse_string(JSParseState *s, const uint8_t **pp)
 {
     const uint8_t *p, *p_next;
@@ -25356,6 +25458,26 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
         goto fail;
 
     p = *pp;
+
+    /* A string with no escape and nothing above ASCII -- most strings in most
+       JSON -- is scanned once and allocated once, rather than accumulated
+       into a StringBuffer that starts at 48 characters and is then grown,
+       copied and trimmed. */
+    {
+        const uint8_t *q = json_scan_plain(p, s->buf_end);
+        if (q < s->buf_end && *q == '"') {
+            JSValue str = js_new_string8_len(s->ctx, (const char *)p, q - p);
+            string_buffer_free(b);
+            if (JS_IsException(str))
+                return -1;
+            s->token.val = TOK_STRING;
+            s->token.u.str.sep = '"';
+            s->token.u.str.str = str;
+            *pp = q + 1;
+            return 0;
+        }
+    }
+
     for(;;) {
         if (p >= s->buf_end) {
             goto end_of_input;
@@ -25363,9 +25485,7 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
 
         // Fast path: batch consecutive ASCII characters
         const uint8_t *p_start = p;
-        while (p < s->buf_end && *p != '"' && *p != '\\' && *p >= 0x20 && *p < 0x80) {
-            p++;
-        }
+        p = json_scan_plain(p, s->buf_end);
 
         // Write batched ASCII in one call
         if (p > p_start) {
@@ -25453,6 +25573,7 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
     while (is_digit(*p))
         p++;
 
+    const uint8_t *p_int_end = p;
     if (*p == '.') {
         p++;
         if (!is_digit(*p))
@@ -25470,7 +25591,26 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
             p++;
     }
     s->token.val = TOK_NUMBER;
-    s->token.u.num.val = js_float64(strtod((const char *)p_start, NULL));
+    /* A plain integer is converted here: strtod is locale-aware -- it takes a
+       lock to find the decimal separator -- and rescans the digits. 18 digits
+       is the widest that always fits in an int64. */
+    if (p == p_int_end && (size_t)(p_int_end - p_start) <= 18) {
+        const uint8_t *d = p_start;
+        int negative = (*d == '-' || *d == '+') ? (*d++ == '-') : 0;
+        int64_t v = 0;
+        while (d < p_int_end)
+            v = v * 10 + (*d++ - '0');
+        if (negative)
+            v = -v;
+        if (negative && v == 0)
+            s->token.u.num.val = js_float64(-0.0);   /* -0 is not 0 */
+        else if (v >= INT32_MIN && v <= INT32_MAX)
+            s->token.u.num.val = js_int32((int32_t)v);
+        else
+            s->token.u.num.val = js_float64((double)v);
+    } else {
+        s->token.u.num.val = js_float64(strtod((const char *)p_start, NULL));
+    }
     *pp = p;
     return 0;
 }
@@ -54256,13 +54396,11 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                 if (!JS_IsUndefined(v)) {
                     if (has_content)
                         string_buffer_putc8(jsc->b, ',');
-                    prop = JS_ToQuotedStringFree(ctx, prop);
-                    if (JS_IsException(prop)) {
+                    string_buffer_concat_value(jsc->b, sep);
+                    if (string_buffer_quote(jsc->b, prop)) {
                         JS_FreeValue(ctx, v);
                         goto exception;
                     }
-                    string_buffer_concat_value(jsc->b, sep);
-                    string_buffer_concat_value(jsc->b, prop);
                     string_buffer_putc8(jsc->b, ':');
                     string_buffer_concat_value(jsc->b, sep1);
                     if (js_json_to_str(ctx, jsc, val, v, indent1))
@@ -54290,10 +54428,9 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
     switch (JS_VALUE_GET_NORM_TAG(val)) {
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
-        val = JS_ToQuotedStringFree(ctx, val);
-        if (JS_IsException(val))
-            goto exception;
-        goto concat_value;
+        ret = string_buffer_quote(jsc->b, val);
+        JS_FreeValue(ctx, val);
+        return ret;
     case JS_TAG_FLOAT64:
         if (!isfinite(JS_VALUE_GET_FLOAT64(val))) {
             val = JS_NULL;

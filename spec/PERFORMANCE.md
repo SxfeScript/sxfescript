@@ -211,6 +211,51 @@ zero GC cycles during the loops throughout. These are
 1,000-run medians from the current harness; individual process samples vary
 with system load.
 
+## JSON
+
+The harness's `json` row parses a 1MB API payload and writes it back out,
+forty times. It is the one row named after a workload rather than an API,
+because it is what an HTTP service spends its time on: a request body in,
+a response body out.
+
+Three changes, all inside the tokenizer and the serializer rather than the
+value model:
+
+- **Strings are scanned a word at a time.** Both directions used to walk a
+  string one character per iteration -- four comparisons per byte on the way
+  in, a `string_getc`/`string_buffer_putc` pair per character on the way
+  out. Both now test eight bytes at once for the only bytes that matter (a
+  quote, a backslash, a control character, and on the way in anything
+  non-ASCII), using the standard `(x - 0x01..) & ~x` zero-byte trick, and
+  copy the run between them in one `memcpy`. Scanning was the largest single
+  cost in each direction.
+- **An escape-free string is allocated once.** The parser accumulated every
+  string into a `StringBuffer` that starts at 48 characters and is then
+  grown, copied and trimmed. A string with no escape and nothing above ASCII
+  -- most strings in most JSON -- is now measured by the scan above and
+  allocated at its final size.
+- **Quoting writes into the buffer the caller already has.** `stringify`
+  allocated a quoted copy of every key and every string value, copied it into
+  its output, and freed it. It writes through now.
+
+A fourth: a plain integer is converted by the tokenizer instead of `strtod`,
+which is locale-aware -- it takes a lock to find the decimal separator -- and
+rescans the digits.
+
+On the Mac, the round trip went 165.4 -> 81.5 ms against Node's 26.9 and
+Bun's 23.3. Separately: parsing that 1MB document 2.29 -> 1.88 ms against
+Node's 1.05, writing it 7.01 -> 2.26 against Node's 0.60. Writing one long
+string, where the run scan is all there is, went 2.52 -> 0.10 ms against
+Node's 0.12 -- ahead, for that shape.
+
+What remains is not the scanning. On an object-heavy document the profile is
+spread across property enumeration, the atom lookup behind each property
+read, and one allocation per value -- the same interpreted-object-model cost
+that the rest of this document keeps arriving at, and the reason a faster
+external parser is not the answer here: a DOM parser would replace the part
+that is now cheap and still leave every JavaScript object to be built one
+property at a time, plus a second representation to copy out of.
+
 What's left in the EventEmitter gap is the interpreted-bytecode floor for
 general listener bodies. The benchmark's numeric accumulator takes a native
 fast path and now a fused call site as well, but arbitrary listeners still
