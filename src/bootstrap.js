@@ -708,7 +708,19 @@
     if (typeof b === "string") { this._bodyUsed = true; return b; }
     return new TextDecoder().decode(this._readBytes());
   };
-  Request.prototype.json = async function () { return JSON.parse(await this.text()); };
+  Request.prototype.json = async function () {
+    // Straight from the bytes when that is what arrived: decoding a megabyte
+    // into a string and parsing the string costs two passes and a copy that
+    // the parser does not need.
+    var b = this._body;
+    if (b instanceof Uint8Array && typeof __sxnParseJSONBytes === "function") {
+      this._bodyUsed = true;
+      // JS_GetUint8Array hands back the view's own start and length, so the
+      // offset is already accounted for.
+      return __sxnParseJSONBytes(b);
+    }
+    return JSON.parse(await this.text());
+  };
   Request.prototype.arrayBuffer = async function () { return this._readBytes().slice().buffer; };
   Request.prototype.blob = async function () {
     return new Blob([this._readBytes()], { type: this.headers.get("content-type") || "" });
@@ -1640,9 +1652,14 @@
         href = new URL(path, "http://" + origin).href;
       }
       var init = { method: raw.method || "GET" };
-      // A GET/HEAD request may not carry a body, and the native layer sends
-      // "" rather than nothing when there is none.
-      if (raw.body !== undefined && raw.body !== null && raw.body !== "") init.body = raw.body;
+      // The body as the bytes the native layer already has, rather than a
+      // string copied out of them: a megabyte of JSON is not turned into a
+      // megabyte of JavaScript string on the way to JSON.parse.
+      if (raw.bodyBytes !== undefined && raw.bodyLength > 0) {
+        init.body = raw.bodyBytes.subarray(raw.bodyOffset, raw.bodyOffset + raw.bodyLength);
+      } else if (raw.body !== undefined && raw.body !== null && raw.body !== "") {
+        init.body = raw.body;
+      }
       var request = new Request(href, init);
       // The headers are built on first read. Copying every header into a
       // Headers list costs about a microsecond a request, and a handler that

@@ -563,6 +563,43 @@ static void conn_deliver(JSContext *ctx, ConnState *conn, JSValue result,
    terminated for the header scanning below, and `length` is what bounds the
    body -- a body may legitimately contain a NUL byte, so its length never
    comes from strlen. */
+/* The connection's read buffer, once it has been handed to JavaScript. */
+static void sxn_free_read_buffer(JSRuntime *rt, void *opaque, void *ptr) {
+    (void)rt; (void)opaque;
+    free(ptr);
+}
+
+/* `body`, materialised only if something reads it. The bytes belong to the
+   Uint8Array in func_data, so this cannot outlive them. */
+static JSValue conn_body_string(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv,
+                                int magic, JSValueConst *func_data) {
+    (void)this_val; (void)argc; (void)argv; (void)magic;
+    size_t size = 0;
+    uint8_t *bytes = JS_GetUint8Array(ctx, &size, func_data[0]);
+    int64_t offset = 0, length = 0;
+    JS_ToInt64(ctx, &offset, func_data[1]);
+    JS_ToInt64(ctx, &length, func_data[2]);
+    if (!bytes || (size_t)(offset + length) > size) return JS_NewString(ctx, "");
+    return JS_NewStringLen(ctx, (const char *)bytes + offset, (size_t)length);
+}
+
+/* JSON straight from the bytes, with no string in between: a 1MB request
+   body would otherwise be copied into a JavaScript string first, and the
+   parser only wants the bytes. */
+static JSValue sxn_parse_json_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    size_t size = 0;
+    uint8_t *bytes = argc > 0 ? JS_GetUint8Array(ctx, &size, argv[0]) : NULL;
+    if (!bytes) return JS_ThrowTypeError(ctx, "expected a Uint8Array");
+    int64_t offset = 0, length = (int64_t)size;
+    if (argc > 1) JS_ToInt64(ctx, &offset, argv[1]);
+    if (argc > 2) JS_ToInt64(ctx, &length, argv[2]);
+    if (offset < 0 || length < 0 || (size_t)(offset + length) > size)
+        return JS_ThrowRangeError(ctx, "body slice out of range");
+    return JS_ParseJSON(ctx, (const char *)bytes + offset, (size_t)length, "<body>");
+}
+
 static void conn_dispatch_request(ConnState *conn, char *request, size_t length) {
     JSContext *ctx = conn->serve->ctx;
     char method[16] = {0}, url[4096] = {0}; sscanf(request, "%15s %4095s", method, url);
@@ -574,7 +611,46 @@ static void conn_dispatch_request(ConnState *conn, char *request, size_t length)
     JSValue req_obj = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, req_obj, "method", JS_NewString(ctx, method));
     JS_SetPropertyStr(ctx, req_obj, "url", JS_NewString(ctx, url));
-    JS_SetPropertyStr(ctx, req_obj, "body", JS_NewStringLen(ctx, body, body_len));
+    if (body_len == 0) {
+        JS_SetPropertyStr(ctx, req_obj, "body", JS_NewString(ctx, ""));
+    } else {
+        /* Hand the body over as bytes JavaScript owns. When nothing else is
+           in the buffer -- which is every request that is not pipelined --
+           the buffer itself goes, so a megabyte of body is not copied into a
+           string that the handler may not even read. */
+        JSValue bytes;
+        size_t offset = (size_t)(body - request);
+        if (conn->in.data == request && conn->in.length == length) {
+            conn->in.data[length] = 0;   /* the parser may look one past the end */
+            bytes = JS_NewUint8Array(ctx, (uint8_t *)request, length + 1,
+                                     sxn_free_read_buffer, NULL, false);
+            conn->in.data = NULL; conn->in.length = 0; conn->in.cap = 0;
+        } else {
+            /* Another request is already in the buffer behind this one, so
+               the buffer cannot be handed over. The copy carries a trailing
+               NUL for the same reason the transferred buffer does: the JSON
+               parser may look one byte past the body. */
+            uint8_t *copy = malloc(length + 1);
+            if (!copy) { JS_FreeValue(ctx, req_obj); return; }
+            memcpy(copy, request, length);
+            copy[length] = 0;
+            bytes = JS_NewUint8Array(ctx, copy, length + 1, sxn_free_read_buffer, NULL, false);
+        }
+        JSValue offset_value = JS_NewInt64(ctx, (int64_t)offset);
+        JSValue length_value = JS_NewInt64(ctx, (int64_t)body_len);
+        JS_SetPropertyStr(ctx, req_obj, "bodyBytes", JS_DupValue(ctx, bytes));
+        JS_SetPropertyStr(ctx, req_obj, "bodyOffset", JS_DupValue(ctx, offset_value));
+        JS_SetPropertyStr(ctx, req_obj, "bodyLength", JS_DupValue(ctx, length_value));
+        /* `body` stays a string for node:http, built only if it is read. */
+        JSValueConst data[3] = { bytes, offset_value, length_value };
+        JSValue getter = JS_NewCFunctionData(ctx, conn_body_string, 0, 0, 3, data);
+        JSAtom body_atom = JS_NewAtom(ctx, "body");
+        JS_DefinePropertyGetSet(ctx, req_obj, body_atom, getter, JS_UNDEFINED, JS_PROP_C_W_E);
+        JS_FreeAtom(ctx, body_atom);
+        JS_FreeValue(ctx, bytes);
+        JS_FreeValue(ctx, offset_value);
+        JS_FreeValue(ctx, length_value);
+    }
     /* Every request header, lowercased, the way Node presents them. Only
        `upgrade` used to be exposed, so a handler could not read an
        Authorization, Content-Type or Cookie header at all. */
@@ -2181,6 +2257,7 @@ int sxn_install_network(JSContext *ctx) {
     JS_SetPropertyStr(ctx, global, "__sxnFetchRaw", JS_NewCFunction(ctx, js_sxn_fetch_raw, "__sxnFetchRaw", 5));
     /* Named "now" because bootstrap.js binds this straight onto performance
        rather than wrapping it, so this is the function user code sees. */
+    JS_SetPropertyStr(ctx, global, "__sxnParseJSONBytes", JS_NewCFunction(ctx, sxn_parse_json_bytes, "__sxnParseJSONBytes", 3));
     JS_SetPropertyStr(ctx, global, "__sxnPid", JS_NewInt32(ctx, (int32_t)uv_os_getpid()));
     JS_SetPropertyStr(ctx, global, "__sxnWriteStderr", JS_NewCFunction(ctx, sxn_write_stderr, "__sxnWriteStderr", 1));
     JS_SetPropertyStr(ctx, global, "__sxnNow", JS_NewCFunction(ctx, sxn_now, "now", 0));
