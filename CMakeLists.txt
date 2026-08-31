@@ -362,6 +362,9 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # latin1/ascii/utf16le in both directions, now native, against Node.
   add_test(NAME sxn-node-buffer-units COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_buffer_units.mjs)
   set_tests_properties(sxn-node-buffer-units PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # process.cwd() is cached; process.chdir() is what clears it.
+  add_test(NAME sxn-node-process-cwd COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_process_cwd.mjs)
+  set_tests_properties(sxn-node-process-cwd PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   # node:assert's structural comparison, now native C, against Node's answers
   # for the same 130 pairs.
   add_test(NAME sxn-node-assert COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_assert.mjs)

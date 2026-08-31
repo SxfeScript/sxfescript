@@ -229,6 +229,14 @@ version of it, a shared no-op for writes with no callback, was faster at
 has to reach the stream's 'error' listeners whether anyone passed a callback
 or not.
 
+The second sweep, over `node:util`, `node:string_decoder` and `process`,
+found something worse than any of the migrations: `process.cwd()` cost 7
+microseconds against Node's 0.01. It was calling `getcwd()` every time, and
+that walks the directory back to the root. Every relative path a package
+resolves goes through it. It is cached now, and `process.chdir()` -- which
+this runtime did not have at all -- is what clears the cache: 0.065
+microseconds.
+
 The sweep also turned up a bug rather than a cost. A `Readable` took chunks
 off its queue with `shift()`, which copies the whole queue down by one every
 time, so draining 20000 buffered chunks took 44 milliseconds against 1 for

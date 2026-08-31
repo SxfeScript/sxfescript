@@ -38,11 +38,36 @@ extern char **environ;
    that genuinely need C: real cwd/env access, exit, and safe signal
    delivery. Same split as bootstrap.js / network.c (Task 2). */
 
+/* process.cwd() is asked constantly -- every relative path a package
+   resolves goes through it -- and getcwd() is a system call that walks the
+   directory back to the root: 7 microseconds here. Node caches it, and so
+   does this, with process.chdir() below as the only thing that can change
+   it. */
+static char sxn_cwd_cache[4096];
+
 static JSValue js_sxn_cwd(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val; (void)argc; (void)argv;
-    char buf[4096];
-    if (!getcwd(buf, sizeof(buf))) return JS_ThrowInternalError(ctx, "getcwd failed: %s", strerror(errno));
-    return JS_NewString(ctx, buf);
+    if (!sxn_cwd_cache[0] && !getcwd(sxn_cwd_cache, sizeof(sxn_cwd_cache)))
+        return JS_ThrowInternalError(ctx, "getcwd failed: %s", strerror(errno));
+    return JS_NewString(ctx, sxn_cwd_cache);
+}
+
+static JSValue js_sxn_chdir(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    const char *dir = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+    if (!dir) return JS_ThrowTypeError(ctx, "chdir(directory) requires a directory");
+    int rc = chdir(dir);
+    if (rc != 0) {
+        JSValue error = JS_ThrowInternalError(ctx, "chdir %s: %s", dir, strerror(errno));
+        JSValue exception = JS_GetException(ctx);
+        JS_SetPropertyStr(ctx, exception, "code", JS_NewString(ctx, "ENOENT"));
+        JS_Throw(ctx, exception);
+        JS_FreeCString(ctx, dir);
+        return error;
+    }
+    JS_FreeCString(ctx, dir);
+    sxn_cwd_cache[0] = '\0';        /* the cache is what chdir invalidates */
+    return JS_UNDEFINED;
 }
 
 /* --- process.env: native exotic object, phase 1 of replacing node_compat.js
@@ -3579,6 +3604,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
 #endif
     JS_SetPropertyStr(ctx, global, "__sxnExecPath", JS_NewString(ctx, exec_path ? exec_path : "sxn"));
     JS_SetPropertyStr(ctx, global, "__sxnCwd", JS_NewCFunction(ctx, js_sxn_cwd, "__sxnCwd", 0));
+    JS_SetPropertyStr(ctx, global, "__sxnChdir", JS_NewCFunction(ctx, js_sxn_chdir, "__sxnChdir", 1));
     /* Node names the OS and CPU; packages branch on them. Derived from the
        compiler's own target macros rather than a runtime uname call. */
     JS_SetPropertyStr(ctx, global, "__sxnZlibDeflate", JS_NewCFunction(ctx, js_zlib_deflate, "__sxnZlibDeflate", 3));
