@@ -135,21 +135,11 @@
     return out.subarray(0, n);
   }
 
-  function utf16leBytes(str) {
-    var out = new Uint8Array(str.length * 2);
-    for (var i = 0; i < str.length; i++) {
-      var c = str.charCodeAt(i);
-      out[i * 2] = c & 0xff;
-      out[i * 2 + 1] = c >> 8;
-    }
-    return out;
-  }
-  function utf16leString(bytes) {
-    var out = "";
-    for (var i = 0; i + 1 < bytes.length; i += 2)
-      out += String.fromCharCode(bytes[i] | (bytes[i + 1] << 8));
-    return out;
-  }
+  var utf16leBytes = __sxnUtf16leBytes;
+  // Native (js_buffer_decode_units in src/node.c): latin1, Node's 7-bit
+  // "ascii" and utf16le are all a widening of bytes into code units, which
+  // was a String.fromCharCode per byte here.
+  var utf16leString = __sxnUtf16leString;
 
   function bufferBytesFromString(str, encoding) {
     // The native readers are lenient the way Node is -- hex stops at the
@@ -176,11 +166,7 @@
     }
     if (encoding === "ucs2" || encoding === "ucs-2" ||
         encoding === "utf16le" || encoding === "utf-16le") return utf16leBytes(str);
-    if (encoding === "latin1" || encoding === "binary" || encoding === "ascii") {
-      var bytes = new Uint8Array(str.length);
-      for (var i = 0; i < str.length; i++) bytes[i] = str.charCodeAt(i) & 0xff;
-      return bytes;
-    }
+    if (encoding === "latin1" || encoding === "binary" || encoding === "ascii") return __sxnLatin1Bytes(str);
     throw new TypeError("Unknown encoding: " + encoding);
   }
 
@@ -202,17 +188,9 @@
       if (encoding === "base64url") return this.toBase64({ alphabet: "base64url", omitPadding: true }); // Node emits base64url unpadded
       if (encoding === "ucs2" || encoding === "ucs-2" ||
           encoding === "utf16le" || encoding === "utf-16le") return utf16leString(this);
-      if (encoding === "latin1" || encoding === "binary") {
-        var out = "";
-        for (var i = 0; i < this.length; i++) out += String.fromCharCode(this[i]);
-        return out;
-      }
-      if (encoding === "ascii") {
-        // Node's "ascii" is 7-bit: the high bit is stripped, unlike latin1.
-        var a = "";
-        for (var j = 0; j < this.length; j++) a += String.fromCharCode(this[j] & 0x7f);
-        return a;
-      }
+      if (encoding === "latin1" || encoding === "binary") return __sxnLatin1String(this);
+      // Node's "ascii" is 7-bit: the high bit is stripped, unlike latin1.
+      if (encoding === "ascii") return __sxnAsciiString(this);
       throw new TypeError("Unknown encoding: " + encoding);
     }
     // Node's Buffer#slice (and #subarray) are zero-copy views over the same

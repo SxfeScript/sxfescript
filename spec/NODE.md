@@ -113,7 +113,8 @@ string work with no JavaScript state of its own.
 Native now: `path` in both halves, `querystring`, `net.isIP`, `os` in full
 (from libuv), `fs`'s `stat`/`lstat` and the read primitives, `crypto`'s
 digests, HMAC and `timingSafeEqual`, `zlib`'s deflate and inflate, Buffer's
-encodings, lenient hex/base64 readers and numeric accessors, `util.format`,
+encodings including latin1, Node's 7-bit `ascii` and utf16le in both
+directions, lenient hex/base64 readers and numeric accessors, `util.format`,
 `EventEmitter`'s `on`/`emit` fast path, and the structural comparison behind
 `assert.deepStrictEqual`, `assert.deepEqual` and `util.isDeepStrictEqual`.
 
@@ -131,6 +132,13 @@ glue, and it is now checked against Node's own answers for 130 pairs, which
 the JavaScript never was. Both facts belong in the same sentence. The work in
 all three had already shrunk to the JavaScript-to-C boundary itself. That is
 the shape of what is left everywhere else in this file.
+
+The move after them was the opposite kind: `Buffer#toString("latin1")` and
+its utf16le and `ascii` siblings were a `String.fromCharCode` appended in a
+loop, which builds a whole new string per byte. Filling the code units in C
+and handing the engine one string took 4KB of latin1 from 395 microseconds to
+0.5. Nothing here is a boundary crossing per byte, which is why it moved so
+far when the deep comparison did not move at all.
 
 Still JavaScript, with the reason measured rather than asserted:
 

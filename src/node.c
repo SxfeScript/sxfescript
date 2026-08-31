@@ -2566,6 +2566,63 @@ static JSValue js_util_format(JSContext *ctx, JSValueConst this_val, int argc, J
 }
 
 
+
+/* Buffer#toString for the encodings that are a straight widening of bytes
+   into code units: latin1, Node's 7-bit "ascii", and utf16le. In JavaScript
+   each of these was a String.fromCharCode appended in a loop, which builds a
+   new string per byte; here the code units are filled in once and handed to
+   the engine as a whole string. */
+static JSValue js_buffer_decode_units(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic) {
+    (void)this_val;
+    size_t len = 0;
+    uint8_t *bytes = argc > 0 ? JS_GetUint8Array(ctx, &len, argv[0]) : NULL;
+    if (!bytes) return JS_EXCEPTION;
+    size_t count = magic == 2 ? len / 2 : len;
+    if (count == 0) return JS_NewStringLen(ctx, "", 0);
+    uint16_t *units = js_malloc(ctx, count * sizeof(uint16_t));
+    if (!units) return JS_EXCEPTION;
+    if (magic == 2)
+        for (size_t i = 0; i < count; i++) units[i] = (uint16_t)(bytes[i * 2] | (bytes[i * 2 + 1] << 8));
+    else {
+        uint8_t mask = magic == 1 ? 0x7f : 0xff;   /* "ascii" drops the high bit */
+        for (size_t i = 0; i < count; i++) units[i] = bytes[i] & mask;
+    }
+    JSValue str = JS_NewStringUTF16(ctx, units, count);
+    js_free(ctx, units);
+    return str;
+}
+
+
+/* The other direction: a string into latin1 bytes (Node keeps the low byte
+   of each code unit) or into utf16le. The string is read as CESU-8, which
+   encodes each surrogate on its own, so every code unit survives the trip. */
+static JSValue js_buffer_encode_units(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic) {
+    (void)this_val;
+    size_t len = 0;
+    const char *str = argc > 0 ? JS_ToCStringLen2(ctx, &len, argv[0], true) : NULL;
+    if (!str) return JS_EXCEPTION;
+    size_t cap = magic ? (len + 1) * 2 : len + 1;
+    uint8_t *out = js_malloc(ctx, cap);
+    if (!out) { JS_FreeCString(ctx, str); return JS_EXCEPTION; }
+    size_t n = 0;
+    for (size_t i = 0; i < len; ) {
+        uint8_t c = (uint8_t)str[i];
+        uint32_t unit;
+        if (c < 0x80) { unit = c; i += 1; }
+        else if ((c & 0xe0) == 0xc0 && i + 1 < len) { unit = ((c & 0x1fu) << 6) | ((uint8_t)str[i + 1] & 0x3fu); i += 2; }
+        else if ((c & 0xf0) == 0xe0 && i + 2 < len) {
+            unit = ((c & 0x0fu) << 12) | (((uint8_t)str[i + 1] & 0x3fu) << 6) | ((uint8_t)str[i + 2] & 0x3fu);
+            i += 3;
+        } else { unit = c; i += 1; }
+        if (magic) { out[n++] = unit & 0xff; out[n++] = (unit >> 8) & 0xff; }
+        else out[n++] = unit & 0xff;
+    }
+    JS_FreeCString(ctx, str);
+    JSValue bytes = JS_NewUint8ArrayCopy(ctx, out, n);
+    js_free(ctx, out);
+    return bytes;
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -3046,6 +3103,11 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnLatin1Bytes", JS_NewCFunctionMagic(ctx, js_buffer_encode_units, "__sxnLatin1Bytes", 1, JS_CFUNC_generic_magic, 0));
+    JS_SetPropertyStr(ctx, global, "__sxnUtf16leBytes", JS_NewCFunctionMagic(ctx, js_buffer_encode_units, "__sxnUtf16leBytes", 1, JS_CFUNC_generic_magic, 1));
+    JS_SetPropertyStr(ctx, global, "__sxnLatin1String", JS_NewCFunctionMagic(ctx, js_buffer_decode_units, "__sxnLatin1String", 1, JS_CFUNC_generic_magic, 0));
+    JS_SetPropertyStr(ctx, global, "__sxnAsciiString", JS_NewCFunctionMagic(ctx, js_buffer_decode_units, "__sxnAsciiString", 1, JS_CFUNC_generic_magic, 1));
+    JS_SetPropertyStr(ctx, global, "__sxnUtf16leString", JS_NewCFunctionMagic(ctx, js_buffer_decode_units, "__sxnUtf16leString", 1, JS_CFUNC_generic_magic, 2));
     JS_SetPropertyStr(ctx, global, "__sxnDeepEqual", JS_NewCFunctionMagic(ctx, js_deep_equal, "__sxnDeepEqual", 2, JS_CFUNC_generic_magic, 1));
     JS_SetPropertyStr(ctx, global, "__sxnLooseDeepEqual", JS_NewCFunctionMagic(ctx, js_deep_equal, "__sxnLooseDeepEqual", 2, JS_CFUNC_generic_magic, 0));
     JS_SetPropertyStr(ctx, global, "__sxnFormat", JS_NewCFunction(ctx, js_util_format, "__sxnFormat", 3));
