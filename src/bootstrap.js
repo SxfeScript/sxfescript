@@ -681,6 +681,10 @@
     if (init.headers !== undefined) this.headers = new Headers(init.headers);
     if (init.body !== undefined) this._body = init.body;
     if (init.signal !== undefined) this.signal = init.signal;
+    // Fetch's redirect mode travels with the request, so `fetch(request)`
+    // honours what the Request was built with.
+    this.redirect = init.redirect !== undefined ? init.redirect
+                  : (input instanceof Request ? input.redirect : "follow");
   }
   Object.defineProperty(Request.prototype, "body", { get: function () { return null; } });
   Request.prototype.clone = function () { return new Request(this); };
@@ -839,12 +843,21 @@
       return Promise.reject(signal.reason !== undefined ? signal.reason : domError("AbortError", "The operation was aborted."));
     }
     var body = request._body !== undefined && request._body !== null ? String(request._body) : undefined;
-    var raw = __sxnFetchRaw(request.url, request.method, headerPairsFromHeaders(request.headers), body);
+    // "follow" (the default), "manual" -- hand back the 3xx itself -- or
+    // "error", which rejects rather than following.
+    var mode = init.redirect !== undefined ? init.redirect : (request.redirect || "follow");
+    if (mode !== "follow" && mode !== "manual" && mode !== "error")
+      return Promise.reject(new TypeError("fetch: redirect must be follow, manual or error"));
+    var raw = __sxnFetchRaw(request.url, request.method, headerPairsFromHeaders(request.headers), body, mode);
     if (signal) signal.addEventListener("abort", raw.stream.__abort.bind(raw.stream));
     return raw.promise.then(function (head) {
+      if (mode === "error" && head.status >= 300 && head.status < 400 && head.status !== 304)
+        throw new TypeError("fetch: the server redirected and redirect is 'error'");
       var headers = new Headers();
       for (var i = 0; i < head.headers.length; i += 2) headers.append(head.headers[i], head.headers[i + 1]);
-      return new Response(raw.stream, { status: head.status, statusText: head.statusText, headers: headers, url: head.url });
+      var response = new Response(raw.stream, { status: head.status, statusText: head.statusText, headers: headers, url: head.url });
+      response.redirected = mode === "follow" && head.url !== request.url;
+      return response;
     });
   };
 
@@ -1665,15 +1678,18 @@
           headers[name] = value;
         }
       });
+      // A HEAD response reports the length its body would have had and
+      // sends none of it.
+      var omit = result.status !== 204 && result.status !== 304 && result.bodyOmitted === true;
       // Hand a text body over as a string so the native layer's own
       // text/plain default applies; bytes go over as bytes.
       var body = result._staticBody !== undefined ? result._staticBody : null;
       if (body === null) {
         return result.arrayBuffer().then(function (buf) {
-          return { statusCode: result.status, headers: headers, body: new Uint8Array(buf) };
+          return { statusCode: result.status, headers: headers, body: new Uint8Array(buf), bodyOmitted: omit };
         });
       }
-      return { statusCode: result.status, headers: headers, body: body };
+      return { statusCode: result.status, headers: headers, body: body, bodyOmitted: omit };
     }
 
     Sxn.serve = function serve(options, handler) {

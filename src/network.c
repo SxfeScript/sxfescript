@@ -5,6 +5,17 @@
 #include <openssl/rand.h>
 #include <curl/curl.h>
 #include <uv.h>
+/* UV_TCP_REUSEPORT arrived in libuv 1.49; older versions get the socket
+   option set by hand below. */
+#if UV_VERSION_MAJOR > 1 || (UV_VERSION_MAJOR == 1 && UV_VERSION_MINOR >= 49)
+#define SXN_UV_HAS_REUSEPORT 1
+#else
+#define SXN_UV_HAS_REUSEPORT 0
+#endif
+#ifndef _WIN32
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 #include "sxfe.h"
 #include "sxn_bootstrap.h"
 
@@ -490,6 +501,13 @@ static void conn_deliver(JSContext *ctx, ConnState *conn, JSValue result,
             JS_FreeValue(ctx, hdrs);
             if (ct_override) content_type = ct_override;
 
+            /* A HEAD response carries the length the body would have had
+               and no body at all, which is the one thing a handler cannot
+               express by returning bytes. */
+            JSValue nobody_value = JS_GetPropertyStr(ctx, result, "bodyOmitted");
+            int body_omitted = JS_ToBool(ctx, nobody_value);
+            JS_FreeValue(ctx, nobody_value);
+
             char head[512]; int n = snprintf(head, sizeof(head), "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\nConnection: %s\r\nContent-Type: %s\r\n", status, reason(status), body_len, conn->keep_alive ? "keep-alive" : "close", content_type);
             dynbuf_append(&out, head, (size_t)n);
             if (extra && extra_len) dynbuf_append(&out, extra, extra_len);
@@ -497,7 +515,8 @@ static void conn_deliver(JSContext *ctx, ConnState *conn, JSValue result,
             free(extra);
             if (ct_override) JS_FreeCString(ctx, ct_override);
             JS_FreeValue(ctx, ct_value);
-            if (is_binary) { if (body_bytes) dynbuf_append(&out, body_bytes, body_len); }
+            if (body_omitted) { /* HEAD: the length above, and nothing after it */ }
+            else if (is_binary) { if (body_bytes) dynbuf_append(&out, body_bytes, body_len); }
             else if (body_text) dynbuf_append(&out, body_text, body_len);
 
             if (borrowed_cv && !JS_IsUndefined(borrow_u8)) {
@@ -773,7 +792,6 @@ static JSValue js_serve(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     uv_tcp_t *server = malloc(sizeof(*server));
     uv_tcp_init(sxn_loop(), server); server->data = serve;
     struct sockaddr_storage address;
-    unsigned int bind_flags = reuse_port ? UV_TCP_REUSEPORT : 0;
     int rc;
     /* The one name worth resolving without a DNS lookup, and the one people
        actually write. */
@@ -787,7 +805,34 @@ static JSValue js_serve(JSContext *ctx, JSValueConst this_val, int argc, JSValue
         free(server); JS_FreeValue(ctx, serve->handler); free(serve);
         return JS_ThrowTypeError(ctx, "serve: '%s' is not an IP address to bind", host);
     }
-    rc = uv_tcp_bind(server, (const struct sockaddr *)&address, bind_flags);
+    if (!reuse_port) {
+        rc = uv_tcp_bind(server, (const struct sockaddr *)&address, 0);
+    } else {
+#if SXN_UV_HAS_REUSEPORT
+        rc = uv_tcp_bind(server, (const struct sockaddr *)&address, UV_TCP_REUSEPORT);
+#elif defined(SO_REUSEPORT) && defined(__linux__)
+        /* libuv older than 1.49 has no flag for it, so the socket is made
+           and configured here and handed over. Linux only: this is where
+           SO_REUSEPORT distributes connections rather than handing the last
+           binder everything. */
+        int fd = socket(address.ss_family, SOCK_STREAM, 0);
+        int on = 1;
+        if (fd < 0) rc = UV_ENOTSUP;
+        else if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0
+                 || setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) != 0
+                 || bind(fd, (const struct sockaddr *)&address,
+                         address.ss_family == AF_INET6 ? sizeof(struct sockaddr_in6)
+                                                       : sizeof(struct sockaddr_in)) != 0) {
+            close(fd);
+            rc = UV_ENOTSUP;
+        } else {
+            rc = uv_tcp_open(server, fd);
+            if (rc != 0) close(fd);
+        }
+#else
+        rc = UV_ENOTSUP;
+#endif
+    }
     /* 511, the same backlog Node uses: at 64 a burst of concurrent clients got
        connection-refused rather than queued. */
     if (rc == 0) rc = uv_listen((uv_stream_t *)server, 511, on_connection_cb);
@@ -1468,6 +1513,12 @@ static JSValue js_sxn_fetch_raw(JSContext *ctx, JSValueConst this_val, int argc,
         }
     }
 
+    /* argv[4], when given, is the redirect mode. */
+    long follow = 1;
+    if (argc > 4 && JS_IsString(argv[4])) {
+        const char *mode = JS_ToCString(ctx, argv[4]);
+        if (mode) { follow = strcmp(mode, "follow") == 0; JS_FreeCString(ctx, mode); }
+    }
     char *request_body = NULL; size_t request_body_len = 0;
     if (argc > 3 && !JS_IsUndefined(argv[3]) && !JS_IsNull(argv[3])) {
         /* Counted, not NUL terminated: a request body may contain a 0x00
@@ -1495,7 +1546,10 @@ static JSValue js_sxn_fetch_raw(JSContext *ctx, JSValueConst this_val, int argc,
     fs->pending_read_resolve = JS_UNDEFINED; fs->pending_read_reject = JS_UNDEFINED;
 
     curl_easy_setopt(easy, CURLOPT_URL, url);
-    curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
+    /* Fetch's `redirect` option: "follow" is the default, "manual" hands the
+       3xx back as it arrived, and "error" is rejected by the JS wrapper --
+       both need the transfer to stop at the first response. */
+    curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, follow ? 1L : 0L);
     curl_easy_setopt(easy, CURLOPT_USERAGENT, "sxn/0.0.1");
     curl_easy_setopt(easy, CURLOPT_PRIVATE, fs);
     curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, fetch_header_cb);
@@ -1504,6 +1558,10 @@ static JSValue js_sxn_fetch_raw(JSContext *ctx, JSValueConst this_val, int argc,
     curl_easy_setopt(easy, CURLOPT_WRITEDATA, fs);
     if (headers) curl_easy_setopt(easy, CURLOPT_HTTPHEADER, headers);
     if (method) curl_easy_setopt(easy, CURLOPT_CUSTOMREQUEST, method);
+    /* A HEAD response carries the length of a body it does not send, so the
+       transfer has to be told there is nothing to wait for. Without this a
+       fetch of a HEAD hung until the server closed the connection. */
+    if (method && !sxn_strcasecmp(method, "HEAD")) curl_easy_setopt(easy, CURLOPT_NOBODY, 1L);
     if (request_body) {
         /* POSTFIELDSIZE must be set BEFORE COPYPOSTFIELDS: libcurl reads the
            size at the moment the fields are copied. Setting it afterwards
@@ -2100,7 +2158,7 @@ int sxn_install_network(JSContext *ctx) {
        networking primitive, the monotonic clock, and OpenSSL-backed
        crypto); bootstrap.js builds the spec-shaped globals on top of them
        and installs fetch/TextEncoder/URL/Headers/etc. on `global` itself. */
-    JS_SetPropertyStr(ctx, global, "__sxnFetchRaw", JS_NewCFunction(ctx, js_sxn_fetch_raw, "__sxnFetchRaw", 4));
+    JS_SetPropertyStr(ctx, global, "__sxnFetchRaw", JS_NewCFunction(ctx, js_sxn_fetch_raw, "__sxnFetchRaw", 5));
     /* Named "now" because bootstrap.js binds this straight onto performance
        rather than wrapping it, so this is the function user code sees. */
     JS_SetPropertyStr(ctx, global, "__sxnWriteStderr", JS_NewCFunction(ctx, sxn_write_stderr, "__sxnWriteStderr", 1));
