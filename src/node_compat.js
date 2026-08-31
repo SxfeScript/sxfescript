@@ -508,7 +508,9 @@
   // doubling it.
   const stripNL = (s) => (s.endsWith("\n") ? s.slice(0, -1) : s);
   process.stdout = makeStdio(1, (t) => { if (t) console.log(stripNL(t)); });
-  process.stderr = makeStdio(2, (t) => { if (t) console.error(stripNL(t)); });
+  // Straight to fd 2 -- console.error is itself built on __sxnWriteStderr, so
+  // routing through it would be a cycle.
+  process.stderr = makeStdio(2, (t) => { if (t) __sxnWriteStderr(t); });
   process.stdin = { fd: 0, isTTY: false, readable: false,
                     on() { return this; }, once() { return this; }, off() { return this; },
                     resume() { return this; }, pause() { return this; },

@@ -91,6 +91,9 @@ of the same digests; see spec/NODE.md.
 `clearX` counterparts, `performance.now` (bound directly to its C primitive,
 not wrapped — see the README benchmarks for why that matters).
 
+`console.log`/`info`/`debug` write to stdout and `console.error`/`warn` to
+stderr, which is also what `process.stderr` is built on.
+
 Not implemented: `URLPattern`, `BroadcastChannel`, `Worker`, `WebSocket` as an
 *outbound client* (the server side — upgrading an incoming connection to a
 WebSocket from a `Sxn.serve` handler — works), `ErrorEvent`,

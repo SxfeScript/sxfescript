@@ -307,7 +307,10 @@ static void conn_deliver(JSContext *ctx, ConnState *conn, JSValue result,
             JSValue events = JS_GetPropertyStr(ctx, result, "events"); uint32_t length = 0; JSValue size = JS_GetPropertyStr(ctx, events, "length"); JS_ToUint32(ctx, &length, size); JS_FreeValue(ctx, size);
             for (uint32_t i = 0; i < length; ++i) {
                 JSValue event = JS_GetPropertyUint32(ctx, events, i); JSValue data = JS_GetPropertyStr(ctx, event, "data"); JSValue type = JS_GetPropertyStr(ctx, event, "event"); JSValue id = JS_GetPropertyStr(ctx, event, "id");
-                const char *text = JS_ToCString(ctx, data), *event_name = JS_ToCString(ctx, type), *event_id = JS_ToCString(ctx, id);
+                const char *text = JS_ToCString(ctx, data), *event_name = (JS_IsUndefined(type) || JS_IsNull(type)) ? NULL : JS_ToCString(ctx, type);
+                /* An absent id must be left out, not written as the string
+                   "undefined" -- JS_ToCString stringifies undefined. */
+                const char *event_id = (JS_IsUndefined(id) || JS_IsNull(id)) ? NULL : JS_ToCString(ctx, id);
                 char full[4096]; int n;
                 if (event_id) n = snprintf(full, sizeof(full), "event: %s\nid: %s\ndata: %s\n\n", event_name ? event_name : "message", event_id, text ? text : "");
                 else n = snprintf(full, sizeof(full), "%s%s%sdata: %s\n\n", event_name ? "event: " : "", event_name ? event_name : "", event_name ? "\n" : "", text ? text : "");
@@ -1832,6 +1835,21 @@ static JSValue sxn_file(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     JS_FreeCString(ctx, path); return file;
 }
 
+/* The only way to reach fd 2 from JS: console.error/warn and
+   process.stderr are built on this, so a diagnostic does not land in the
+   program's own stdout. */
+static JSValue sxn_write_stderr(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_UNDEFINED;
+    size_t length = 0;
+    const char *text = JS_ToCStringLen(ctx, &length, argv[0]);
+    if (!text) return JS_EXCEPTION;
+    fwrite(text, 1, length, stderr);
+    fflush(stderr);
+    JS_FreeCString(ctx, text);
+    return JS_UNDEFINED;
+}
+
 static JSValue sxn_write(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     if (argc < 2) return JS_ThrowTypeError(ctx, "Sxn.write(destination, data) requires two arguments");
     const char *path = JS_ToCString(ctx, argv[0]); size_t length = 0;
@@ -1883,6 +1901,7 @@ int sxn_install_network(JSContext *ctx) {
     JS_SetPropertyStr(ctx, global, "__sxnFetchRaw", JS_NewCFunction(ctx, js_sxn_fetch_raw, "__sxnFetchRaw", 4));
     /* Named "now" because bootstrap.js binds this straight onto performance
        rather than wrapping it, so this is the function user code sees. */
+    JS_SetPropertyStr(ctx, global, "__sxnWriteStderr", JS_NewCFunction(ctx, sxn_write_stderr, "__sxnWriteStderr", 1));
     JS_SetPropertyStr(ctx, global, "__sxnNow", JS_NewCFunction(ctx, sxn_now, "now", 0));
 #ifdef SXN_ABLATE_FUSION
     JS_SetPropertyStr(ctx, global, "__ablNop",

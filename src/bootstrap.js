@@ -1660,4 +1660,28 @@
       return handle;
     };
   })();
+
+  // ---------------- console.error and friends ----------------
+  // QuickJS installs console.log and nothing else, so ported code that logs a
+  // warning or an error died on a missing function. error/warn go to stderr
+  // (__sxnWriteStderr, the one JS-visible write to fd 2), which is also what
+  // process.stderr is built on, so a diagnostic never lands in the program's
+  // own stdout.
+  (function () {
+    function format(args) {
+      var parts = [];
+      for (var i = 0; i < args.length; i++) {
+        var value = args[i];
+        if (typeof value === "string") { parts.push(value); continue; }
+        if (value instanceof Error) { parts.push(String(value.stack || value)); continue; }
+        try { parts.push(JSON.stringify(value) ?? String(value)); }
+        catch (e) { parts.push(String(value)); }
+      }
+      return parts.join(" ");
+    }
+    console.error = function error() { __sxnWriteStderr(format(Array.prototype.slice.call(arguments)) + "\n"); };
+    console.warn = console.error;
+    console.info = console.log;
+    console.debug = console.log;
+  })();
 })();
