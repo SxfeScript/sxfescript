@@ -248,7 +248,10 @@ does not have to re-derive it:
 | `querystring.parse` | 0.235 us | already C |
 | `Readable#push` + emit | 0.290 us | the emit is C; the wrap is not (see below) |
 | `PassThrough#write` | 0.600 us | two emitter hops, both already C |
+| `url.fileURLToPath` | 0.130 us | C, was 0.475 |
+| `module.isBuiltin` | 0.045 us | C, was 0.415 |
 | `new URL` | 0.885 us | the engine's own |
+| `url.pathToFileURL` | 1.30 us | `new URL` is most of it |
 | `createRequire` | 1.00 us | already C |
 
 Nothing in that list is a JavaScript loop any more. What remains in the file

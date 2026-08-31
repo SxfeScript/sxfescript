@@ -42,6 +42,16 @@ p("qs roundtrip", { ...qs.parse(qs.stringify({ k: "a b&c" })) });
 // url
 p("fileURLToPath", fileURLToPath("file:///tmp/x%20y.txt"));
 p("pathToFileURL", String(pathToFileURL("/tmp/a b.txt")));
+// fileURLToPath is native now: the scheme check, an empty localhost host,
+// percent-decoding including a multi-byte character, and a URL object.
+p("file url root", fileURLToPath("file:///"));
+p("file url localhost", fileURLToPath("file://localhost/x/y"));
+p("file url utf8", fileURLToPath("file:///a/%C3%A9.txt"));
+p("file url plus", fileURLToPath("file:///a+b"));
+p("file url object", fileURLToPath(new URL("file:///from/object")));
+p("file url rejects http", (() => { try { fileURLToPath("http://x/y"); return "no"; }
+  catch (e) { return e.constructor.name; } })());
+p("round trip", fileURLToPath(pathToFileURL("/tmp/a b.txt")));
 
 // assert
 p("assert ok", (()=>{ assert(true); assert.ok(1); return "passed" })());

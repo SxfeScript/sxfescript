@@ -3134,6 +3134,48 @@ static JSValue js_write_callback(JSContext *ctx, JSValueConst this_val, int argc
     return fn;
 }
 
+
+/* url.fileURLToPath: strip the scheme and an empty "localhost" host, then
+   percent-decode what is left. This was a startsWith, a regexp and
+   decodeURIComponent per call. */
+static int sxn_hex_digit(unsigned char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static JSValue js_file_url_to_path(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "must be a file: URL");
+    size_t len = 0;
+    const char *str = JS_ToCStringLen(ctx, &len, argv[0]);
+    if (!str) return JS_EXCEPTION;
+    if (len < 7 || memcmp(str, "file://", 7) != 0) {
+        JS_FreeCString(ctx, str);
+        return JS_ThrowTypeError(ctx, "must be a file: URL");
+    }
+    const char *body = str + 7;
+    size_t body_len = len - 7;
+    if (body_len >= 9 && memcmp(body, "localhost", 9) == 0) { body += 9; body_len -= 9; }
+    char *out = js_malloc(ctx, body_len + 2);
+    if (!out) { JS_FreeCString(ctx, str); return JS_EXCEPTION; }
+    size_t n = 0;
+    for (size_t i = 0; i < body_len; i++) {
+        if (body[i] == '%' && i + 2 < body_len) {
+            int hi = sxn_hex_digit((unsigned char)body[i + 1]);
+            int lo = sxn_hex_digit((unsigned char)body[i + 2]);
+            if (hi >= 0 && lo >= 0) { out[n++] = (char)((hi << 4) | lo); i += 2; continue; }
+        }
+        out[n++] = body[i];
+    }
+    if (n == 0) out[n++] = '/';
+    JSValue path = JS_NewStringLen(ctx, out, n);
+    js_free(ctx, out);
+    JS_FreeCString(ctx, str);
+    return path;
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -3614,6 +3656,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnFileUrlToPath", JS_NewCFunction(ctx, js_file_url_to_path, "fileURLToPath", 1));
     JS_SetPropertyStr(ctx, global, "__sxnWriteCallback", JS_NewCFunction(ctx, js_write_callback, "__sxnWriteCallback", 2));
     JS_SetPropertyStr(ctx, global, "__sxnConcatBytes", JS_NewCFunction(ctx, js_concat_bytes, "__sxnConcatBytes", 2));
     JS_SetPropertyStr(ctx, global, "__sxnSetHeader", JS_NewCFunctionMagic(ctx, js_header_op, "setHeader", 2, JS_CFUNC_generic_magic, 0));

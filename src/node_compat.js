@@ -1325,7 +1325,9 @@
     createRequire: (from) => __sxnMakeRequire(String(from)),
     builtinModules: ["assert","buffer","events","fs","http","os","path","process",
                      "querystring","stream","string_decoder","timers","tty","url","util"],
-    isBuiltin: (n) => moduleModule.builtinModules.includes(String(n).replace(/^node:/, "")),
+    // Native, and the same answer require() gives, which the hand-written
+    // list above was not: it is short of several modules that do resolve.
+    isBuiltin: __sxnIsBuiltin,
   });
   globalThis.__sxnModule = moduleModule;
 
@@ -1529,11 +1531,9 @@
   const url = {
     URL: globalThis.URL,
     URLSearchParams: globalThis.URLSearchParams,
-    fileURLToPath(u) {
-      const s = typeof u === "string" ? u : String(u);
-      if (!s.startsWith("file://")) throw new TypeError("must be a file: URL");
-      return decodeURIComponent(s.slice(7).replace(/^localhost/, "")) || "/";
-    },
+    // Native (js_file_url_to_path in src/node.c): a scheme check, a host
+    // check and a percent-decode, none of which needs a regexp.
+    fileURLToPath: (u) => __sxnFileUrlToPath(typeof u === "string" ? u : String(u)),
     pathToFileURL(p) {
       return new URL("file://" + encodeURI(String(p)).replace(/[?#]/g, encodeURIComponent));
     },
