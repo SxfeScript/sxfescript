@@ -458,13 +458,10 @@
   // and the Date fields are the shape Node hands back.
   var S_IFMT = 0o170000, S_IFREG = 0o100000, S_IFDIR = 0o040000, S_IFLNK = 0o120000;
   var S_IFCHR = 0o020000, S_IFBLK = 0o060000, S_IFIFO = 0o010000, S_IFSOCK = 0o140000;
-  function Stats(raw) {
-    for (var key in raw) this[key] = raw[key];
-    this.atime = new Date(raw.atimeMs);
-    this.mtime = new Date(raw.mtimeMs);
-    this.ctime = new Date(raw.ctimeMs);
-    this.birthtime = new Date(raw.birthtimeMs);
-  }
+  // Native: __sxnStat fills the object itself, on this prototype, rather
+  // than handing back a plain one whose every field was then copied across
+  // by a for-in loop here.
+  function Stats() {}
   Stats.prototype.isFile = function () { return (this.mode & S_IFMT) === S_IFREG; };
   Stats.prototype.isDirectory = function () { return (this.mode & S_IFMT) === S_IFDIR; };
   Stats.prototype.isSymbolicLink = function () { return (this.mode & S_IFMT) === S_IFLNK; };
@@ -481,8 +478,8 @@
     },
     writeFileSync: globalThis.__sxnWriteFileSync,
     existsSync: globalThis.__sxnExistsSync,
-    statSync: function (path) { return new Stats(__sxnStat(path, true)); },
-    lstatSync: function (path) { return new Stats(__sxnStat(path, false)); },
+    statSync: function (path) { return __sxnStat(path, true, Stats.prototype); },
+    lstatSync: function (path) { return __sxnStat(path, false, Stats.prototype); },
     Stats: Stats,
     // The whole file, handed to a Readable in one chunk. Enough for serving
     // a file, which is what this exists for; it is not a window onto a file
@@ -518,11 +515,11 @@
     },
     writeFile: __sxnWriteFileAsync,
     stat: function (path) {
-      try { return Promise.resolve(new Stats(__sxnStat(path, true))); }
+      try { return Promise.resolve(__sxnStat(path, true, Stats.prototype)); }
       catch (e) { return Promise.reject(e); }
     },
     lstat: function (path) {
-      try { return Promise.resolve(new Stats(__sxnStat(path, false))); }
+      try { return Promise.resolve(__sxnStat(path, false, Stats.prototype)); }
       catch (e) { return Promise.reject(e); }
     },
   };

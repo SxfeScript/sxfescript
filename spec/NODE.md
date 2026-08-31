@@ -187,6 +187,12 @@ microseconds a request against 0.010 for the two fields that replaced them.
 that is a scan over a short string rather than a call back into the engine
 per step: 0.17 microseconds a call became 0.058.
 
+`fs.statSync` had the same shape of waste: the native call built an object
+with fifteen fields on it, and JavaScript then copied every one of them onto
+a fresh `Stats` with a `for-in` loop and added four Dates. The native call
+takes `Stats.prototype` now and fills the object once -- 3.30 microseconds a
+stat became 2.75.
+
 A second was tried and thrown away for a better reason than speed. A stream
 pushing a `Uint8Array` wraps it in a Buffer over the same bytes, which costs
 0.24 microseconds a chunk; giving the array Buffer's prototype in place costs

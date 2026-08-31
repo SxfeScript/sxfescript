@@ -41,6 +41,17 @@ check("mtime is a Date", s.mtime instanceof Date && s.mtime.getTime() > 0, true)
 check("statSync agrees", statSync(self).size, s.size);
 check("a directory is a directory", statSync(os.tmpdir()).isDirectory(), true);
 check("lstat works too", (await lstat(self)).isFile(), true);
+// The stat object is built native, on Stats' own prototype, so it has to
+// still be a Stats with all four dates agreeing with their millisecond twins.
+check("it is a Stats", s.constructor.name, "Stats");
+check("dates match their milliseconds",
+      ["atime", "mtime", "ctime", "birthtime"].every((k) => s[k] instanceof Date &&
+        Math.abs(s[k].getTime() - s[k + "Ms"]) < 1), true);
+check("the numbers are numbers",
+      ["dev", "ino", "mode", "nlink", "uid", "gid", "size", "blksize", "blocks"]
+        .every((k) => typeof s[k] === "number"), true);
+check("not a directory", s.isDirectory(), false);
+check("not a symlink", s.isSymbolicLink(), false);
 let code = "";
 try { await stat(self + ".missing"); } catch (e) { code = e.code; }
 check("a missing file is ENOENT", code, "ENOENT");

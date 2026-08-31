@@ -2279,7 +2279,10 @@ static JSValue sxn_stat(JSContext *ctx, JSValueConst this_val, int argc, JSValue
         return error;
     }
     const uv_stat_t *st = &req.statbuf;
-    JSValue out = JS_NewObject(ctx);
+    /* The caller passes Stats.prototype, so the object comes back already
+       being a Stats -- node:fs used to copy every field of this onto a fresh
+       one with a for-in loop. */
+    JSValue out = (argc > 2 && JS_IsObject(argv[2])) ? JS_NewObjectProto(ctx, argv[2]) : JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, out, "dev", JS_NewFloat64(ctx, (double)st->st_dev));
     JS_SetPropertyStr(ctx, out, "ino", JS_NewFloat64(ctx, (double)st->st_ino));
     JS_SetPropertyStr(ctx, out, "mode", JS_NewInt64(ctx, (int64_t)st->st_mode));
@@ -2293,6 +2296,24 @@ static JSValue sxn_stat(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     JS_SetPropertyStr(ctx, out, "mtimeMs", JS_NewFloat64(ctx, st->st_mtim.tv_sec * 1000.0 + st->st_mtim.tv_nsec / 1e6));
     JS_SetPropertyStr(ctx, out, "ctimeMs", JS_NewFloat64(ctx, st->st_ctim.tv_sec * 1000.0 + st->st_ctim.tv_nsec / 1e6));
     JS_SetPropertyStr(ctx, out, "birthtimeMs", JS_NewFloat64(ctx, st->st_birthtim.tv_sec * 1000.0 + st->st_birthtim.tv_nsec / 1e6));
+    /* Node's Stats carries the same four times over again as Dates. */
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue date_class = JS_GetPropertyStr(ctx, global, "Date");
+    JS_FreeValue(ctx, global);
+    static const char *time_names[4] = { "atime", "mtime", "ctime", "birthtime" };
+    double times[4] = {
+        st->st_atim.tv_sec * 1000.0 + st->st_atim.tv_nsec / 1e6,
+        st->st_mtim.tv_sec * 1000.0 + st->st_mtim.tv_nsec / 1e6,
+        st->st_ctim.tv_sec * 1000.0 + st->st_ctim.tv_nsec / 1e6,
+        st->st_birthtim.tv_sec * 1000.0 + st->st_birthtim.tv_nsec / 1e6,
+    };
+    for (int i = 0; i < 4; i++) {
+        JSValue ms = JS_NewFloat64(ctx, times[i]);
+        JSValueConst args[1] = { ms };
+        JS_SetPropertyStr(ctx, out, time_names[i], JS_CallConstructor(ctx, date_class, 1, args));
+        JS_FreeValue(ctx, ms);
+    }
+    JS_FreeValue(ctx, date_class);
     JS_FreeCString(ctx, path);
     uv_fs_req_cleanup(&req);
     return out;
@@ -2496,7 +2517,7 @@ int sxn_install_network(JSContext *ctx) {
     /* Named "now" because bootstrap.js binds this straight onto performance
        rather than wrapping it, so this is the function user code sees. */
     JS_SetPropertyStr(ctx, global, "__sxnParseJSONBytes", JS_NewCFunction(ctx, sxn_parse_json_bytes, "__sxnParseJSONBytes", 3));
-    JS_SetPropertyStr(ctx, global, "__sxnStat", JS_NewCFunction(ctx, sxn_stat, "__sxnStat", 2));
+    JS_SetPropertyStr(ctx, global, "__sxnStat", JS_NewCFunction(ctx, sxn_stat, "__sxnStat", 3));
     JS_SetPropertyStr(ctx, global, "__sxnOsHostname", JS_NewCFunction(ctx, sxn_os_hostname, "__sxnOsHostname", 0));
     JS_SetPropertyStr(ctx, global, "__sxnOsHomedir", JS_NewCFunctionMagic(ctx, sxn_os_dir, "__sxnOsHomedir", 0, JS_CFUNC_generic_magic, 0));
     JS_SetPropertyStr(ctx, global, "__sxnOsTmpdir", JS_NewCFunctionMagic(ctx, sxn_os_dir, "__sxnOsTmpdir", 0, JS_CFUNC_generic_magic, 1));
