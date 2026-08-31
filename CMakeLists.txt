@@ -338,6 +338,9 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # rather than against stubbed answers.
   add_test(NAME sxn-node-os-fs COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_os_fs.mjs)
   set_tests_properties(sxn-node-os-fs PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # node:querystring, now native C, against what Node itself printed.
+  add_test(NAME sxn-node-querystring COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_querystring.mjs)
+  set_tests_properties(sxn-node-querystring PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   # Every Buffer encoding in both directions, including Node's lenient hex and
   # base64 readers. Expectations are Node's own output, so a divergence fails.
   add_test(NAME sxn-buffer-encodings COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/buffer_encodings.mjs)

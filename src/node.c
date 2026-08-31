@@ -1486,7 +1486,248 @@ static const char *node_os_names[] = {
     "availableParallelism", "networkInterfaces", "totalmem", "freemem",
     "loadavg", "uptime", "userInfo", "devNull", "constants",
 };
-static const char *node_querystring_names[] = { "parse", "stringify", "escape", "unescape" };
+
+/* ---------------- node:querystring, in C ----------------
+   Pure string work with no state of its own, which is what makes it worth
+   moving out of node_compat.js: every byte of a query string went through
+   split(), a regexp for "+", and decodeURIComponent per part. */
+
+static int sxn_hex_value(unsigned char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Percent-decoding with "+" for space, into a fresh buffer. A stray "%" is
+   kept as it stands, which is what Node's lenient fallback does rather than
+   throwing the way decodeURIComponent would. */
+static char *sxn_qs_decode(const char *src, size_t len, size_t *out_len) {
+    char *out = malloc(len + 1);
+    if (!out) return NULL;
+    size_t o = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '+') { out[o++] = ' '; continue; }
+        if (c == '%' && i + 2 < len) {
+            int hi = sxn_hex_value((unsigned char)src[i + 1]);
+            int lo = sxn_hex_value((unsigned char)src[i + 2]);
+            if (hi >= 0 && lo >= 0) { out[o++] = (char)((hi << 4) | lo); i += 2; continue; }
+        }
+        out[o++] = (char)c;
+    }
+    out[o] = 0;
+    *out_len = o;
+    return out;
+}
+
+/* The characters querystring.escape leaves alone, which are the same ones
+   encodeURIComponent leaves alone. */
+static bool sxn_qs_unreserved(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+        || c == '-' || c == '_' || c == '.' || c == '!' || c == '~' || c == '*'
+        || c == '\'' || c == '(' || c == ')';
+}
+
+/* A tiny growable string, so encoding does not build JS values per piece. */
+typedef struct DynStr { char *data; size_t len, cap; } DynStr;
+
+static void dynstr_need(DynStr *s, size_t extra) {
+    if (s->len + extra + 1 <= s->cap) return;
+    size_t cap = s->cap ? s->cap * 2 : 128;
+    while (cap < s->len + extra + 1) cap *= 2;
+    s->data = realloc(s->data, cap);
+    s->cap = cap;
+}
+
+static void dynstr_add(DynStr *s, const char *src, size_t len) {
+    dynstr_need(s, len);
+    memcpy(s->data + s->len, src, len);
+    s->len += len;
+    s->data[s->len] = 0;
+}
+
+static void sxn_qs_encode_into(DynStr *out, const char *src, size_t len) {
+    static const char hex[] = "0123456789ABCDEF";
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (sxn_qs_unreserved(c)) {
+            dynstr_add(out, (const char *)&c, 1);
+        } else {
+            char esc[3] = { '%', hex[c >> 4], hex[c & 15] };
+            dynstr_add(out, esc, 3);
+        }
+    }
+}
+
+static JSValue js_qs_parse(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    JSValue out = JS_NewObjectProto(ctx, JS_NULL);   /* Node hands back a bare object */
+    if (argc < 1 || !JS_IsString(argv[0])) return out;
+    size_t len = 0;
+    const char *str = JS_ToCStringLen(ctx, &len, argv[0]);
+    if (!str) { JS_FreeValue(ctx, out); return JS_EXCEPTION; }
+
+    const char *sep = "&"; size_t sep_len = 1;
+    const char *eq = "="; size_t eq_len = 1;
+    const char *sep_owned = NULL, *eq_owned = NULL;
+    if (argc > 1 && JS_IsString(argv[1])) { sep_owned = JS_ToCStringLen(ctx, &sep_len, argv[1]); if (sep_owned && sep_len) sep = sep_owned; else sep_len = 1; }
+    if (argc > 2 && JS_IsString(argv[2])) { eq_owned = JS_ToCStringLen(ctx, &eq_len, argv[2]); if (eq_owned && eq_len) eq = eq_owned; else eq_len = 1; }
+    /* Node stops at 1000 keys unless told otherwise, so a query string
+       cannot be used to make an object with a million properties. */
+    int64_t max_keys = 1000;
+    if (argc > 3 && JS_IsObject(argv[3])) {
+        JSValue limit = JS_GetPropertyStr(ctx, argv[3], "maxKeys");
+        if (!JS_IsUndefined(limit)) JS_ToInt64(ctx, &max_keys, limit);
+        JS_FreeValue(ctx, limit);
+    }
+
+    int64_t seen = 0;
+    size_t i = 0;
+    while (i <= len) {
+        const char *part = str + i;
+        const char *found = sep_len == 1 ? memchr(part, sep[0], len - i) : strstr(part, sep);
+        size_t part_len = found ? (size_t)(found - part) : len - i;
+        i += part_len + sep_len;
+        if (part_len == 0) { if (!found) break; continue; }
+        if (max_keys > 0 && seen >= max_keys) break;
+
+        const char *split = eq_len == 1 ? memchr(part, eq[0], part_len) : NULL;
+        if (!split && eq_len > 1) {
+            for (size_t j = 0; j + eq_len <= part_len; j++)
+                if (!memcmp(part + j, eq, eq_len)) { split = part + j; break; }
+        }
+        size_t key_len = split ? (size_t)(split - part) : part_len;
+        size_t value_len = split ? part_len - key_len - eq_len : 0;
+        size_t dk = 0, dv = 0;
+        char *key = sxn_qs_decode(part, key_len, &dk);
+        char *value = split ? sxn_qs_decode(split + eq_len, value_len, &dv) : sxn_qs_decode("", 0, &dv);
+        if (!key || !value) { free(key); free(value); break; }
+        seen++;
+
+        JSAtom atom = JS_NewAtomLen(ctx, key, dk);
+        JSValue existing = JS_GetProperty(ctx, out, atom);
+        JSValue fresh = JS_NewStringLen(ctx, value, dv);
+        if (JS_IsUndefined(existing)) {
+            JS_SetProperty(ctx, out, atom, fresh);
+        } else if (JS_IsArray(existing)) {
+            uint32_t length = 0;
+            JSValue size = JS_GetPropertyStr(ctx, existing, "length");
+            JS_ToUint32(ctx, &length, size);
+            JS_FreeValue(ctx, size);
+            JS_SetPropertyUint32(ctx, existing, length, fresh);
+            JS_SetProperty(ctx, out, atom, existing);
+            existing = JS_UNDEFINED;
+        } else {
+            JSValue list = JS_NewArray(ctx);
+            JS_SetPropertyUint32(ctx, list, 0, existing);
+            JS_SetPropertyUint32(ctx, list, 1, fresh);
+            JS_SetProperty(ctx, out, atom, list);
+            existing = JS_UNDEFINED;
+        }
+        JS_FreeValue(ctx, existing);
+        JS_FreeAtom(ctx, atom);
+        free(key);
+        free(value);
+        if (!found) break;
+    }
+    JS_FreeCString(ctx, str);
+    if (sep_owned) JS_FreeCString(ctx, sep_owned);
+    if (eq_owned) JS_FreeCString(ctx, eq_owned);
+    return out;
+}
+
+/* One value of an object being stringified: a string, a number, a boolean or
+   anything else, which Node writes as empty. */
+static void sxn_qs_add_value(JSContext *ctx, DynStr *out, JSValueConst value) {
+    int tag = JS_VALUE_GET_NORM_TAG(value);
+    if (tag == JS_TAG_STRING || tag == JS_TAG_INT || tag == JS_TAG_FLOAT64 || tag == JS_TAG_BOOL) {
+        size_t len = 0;
+        const char *text = JS_ToCStringLen(ctx, &len, value);
+        if (text) { sxn_qs_encode_into(out, text, len); JS_FreeCString(ctx, text); }
+    }
+}
+
+static JSValue js_qs_stringify(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1 || !JS_IsObject(argv[0])) return JS_NewString(ctx, "");
+    const char *sep = "&", *eq = "=";
+    const char *sep_owned = NULL, *eq_owned = NULL;
+    size_t sep_len = 1, eq_len = 1;
+    if (argc > 1 && JS_IsString(argv[1])) { sep_owned = JS_ToCStringLen(ctx, &sep_len, argv[1]); if (sep_owned) sep = sep_owned; }
+    if (argc > 2 && JS_IsString(argv[2])) { eq_owned = JS_ToCStringLen(ctx, &eq_len, argv[2]); if (eq_owned) eq = eq_owned; }
+
+    JSPropertyEnum *props = NULL;
+    uint32_t count = 0;
+    DynStr out = {0};
+    if (!JS_GetOwnPropertyNames(ctx, &props, &count, argv[0], JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
+        for (uint32_t i = 0; i < count; i++) {
+            JSValue value = JS_GetProperty(ctx, argv[0], props[i].atom);
+            size_t key_len = 0;
+            JSValue key_value = JS_AtomToString(ctx, props[i].atom);
+            const char *key = JS_ToCStringLen(ctx, &key_len, key_value);
+            if (JS_IsArray(value)) {
+                uint32_t length = 0;
+                JSValue size = JS_GetPropertyStr(ctx, value, "length");
+                JS_ToUint32(ctx, &length, size);
+                JS_FreeValue(ctx, size);
+                for (uint32_t j = 0; j < length; j++) {
+                    if (out.len) dynstr_add(&out, sep, sep_len);
+                    if (key) sxn_qs_encode_into(&out, key, key_len);
+                    dynstr_add(&out, eq, eq_len);
+                    JSValue one = JS_GetPropertyUint32(ctx, value, j);
+                    sxn_qs_add_value(ctx, &out, one);
+                    JS_FreeValue(ctx, one);
+                }
+            } else {
+                if (out.len) dynstr_add(&out, sep, sep_len);
+                if (key) sxn_qs_encode_into(&out, key, key_len);
+                dynstr_add(&out, eq, eq_len);
+                sxn_qs_add_value(ctx, &out, value);
+            }
+            if (key) JS_FreeCString(ctx, key);
+            JS_FreeValue(ctx, key_value);
+            JS_FreeValue(ctx, value);
+        }
+        JS_FreePropertyEnum(ctx, props, count);
+    }
+    if (sep_owned) JS_FreeCString(ctx, sep_owned);
+    if (eq_owned) JS_FreeCString(ctx, eq_owned);
+    JSValue result = JS_NewStringLen(ctx, out.data ? out.data : "", out.len);
+    free(out.data);
+    return result;
+}
+
+static JSValue js_qs_escape(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_NewString(ctx, "undefined");
+    size_t len = 0;
+    const char *text = JS_ToCStringLen(ctx, &len, argv[0]);
+    if (!text) return JS_EXCEPTION;
+    DynStr out = {0};
+    sxn_qs_encode_into(&out, text, len);
+    JS_FreeCString(ctx, text);
+    JSValue result = JS_NewStringLen(ctx, out.data ? out.data : "", out.len);
+    free(out.data);
+    return result;
+}
+
+static JSValue js_qs_unescape(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_NewString(ctx, "undefined");
+    size_t len = 0;
+    const char *text = JS_ToCStringLen(ctx, &len, argv[0]);
+    if (!text) return JS_EXCEPTION;
+    size_t out_len = 0;
+    char *decoded = sxn_qs_decode(text, len, &out_len);
+    JS_FreeCString(ctx, text);
+    if (!decoded) return JS_ThrowOutOfMemory(ctx);
+    JSValue result = JS_NewStringLen(ctx, decoded, out_len);
+    free(decoded);
+    return result;
+}
+
+static const char *node_querystring_names[] = { "parse", "stringify", "escape", "unescape", "decode", "encode" };
 static const char *node_url_names[] = {
     "URL", "URLSearchParams", "fileURLToPath", "pathToFileURL", "format", "parse",
 };
@@ -1701,6 +1942,10 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
     JS_SetPropertyStr(ctx, global, "__sxnPosixBasename", JS_NewCFunction(ctx, js_path_posix_basename, "basename", 2));
     JS_SetPropertyStr(ctx, global, "__sxnPosixExtname", JS_NewCFunction(ctx, js_path_posix_extname, "extname", 1));
     JS_SetPropertyStr(ctx, global, "__sxnPosixRelative", JS_NewCFunction(ctx, js_path_posix_relative, "relative", 2));
+    JS_SetPropertyStr(ctx, global, "__sxnQsParse", JS_NewCFunction(ctx, js_qs_parse, "parse", 4));
+    JS_SetPropertyStr(ctx, global, "__sxnQsStringify", JS_NewCFunction(ctx, js_qs_stringify, "stringify", 3));
+    JS_SetPropertyStr(ctx, global, "__sxnQsEscape", JS_NewCFunction(ctx, js_qs_escape, "escape", 1));
+    JS_SetPropertyStr(ctx, global, "__sxnQsUnescape", JS_NewCFunction(ctx, js_qs_unescape, "unescape", 1));
     JS_SetPropertyStr(ctx, global, "__sxnExit", JS_NewCFunction(ctx, js_sxn_exit, "__sxnExit", 1));
     JS_SetPropertyStr(ctx, global, "__sxnWatchSignal", JS_NewCFunction(ctx, js_sxn_watch_signal, "__sxnWatchSignal", 2));
     JS_SetPropertyStr(ctx, global, "__sxnReadFileSync", JS_NewCFunction(ctx, js_sxn_read_file_sync, "__sxnReadFileSync", 1));

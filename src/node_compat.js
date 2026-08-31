@@ -1826,35 +1826,21 @@
   globalThis.__sxnOs = os;
 
   // ---------------- node:querystring ----------------
+  // Native (js_qs_* in src/node.c): pure string work with no state, which
+  // went through split(), a regexp for "+" and decodeURIComponent per part.
   const querystring = {
-    parse(str, sep, eq) {
-      const out = Object.create(null);
-      if (typeof str !== "string" || str.length === 0) return out;
-      for (const part of str.split(sep || "&")) {
-        if (!part) continue;
-        const i = part.indexOf(eq || "=");
-        const k = decodeURIComponent((i < 0 ? part : part.slice(0, i)).replace(/\+/g, " "));
-        const v = i < 0 ? "" : decodeURIComponent(part.slice(i + 1).replace(/\+/g, " "));
-        if (k in out) { if (Array.isArray(out[k])) out[k].push(v); else out[k] = [out[k], v]; }
-        else out[k] = v;
-      }
-      return out;
-    },
-    stringify(obj, sep, eq) {
-      if (!obj || typeof obj !== "object") return "";
-      const parts = [];
-      for (const k of Object.keys(obj)) {
-        const v = obj[k];
-        const ek = encodeURIComponent(k);
-        if (Array.isArray(v)) for (const one of v) parts.push(ek + (eq || "=") + encodeURIComponent(one));
-        else parts.push(ek + (eq || "=") + encodeURIComponent(v === undefined || v === null ? "" : v));
-      }
-      return parts.join(sep || "&");
-    },
-    escape: encodeURIComponent,
-    unescape: decodeURIComponent,
+    parse: __sxnQsParse,
+    stringify: __sxnQsStringify,
+    escape: __sxnQsEscape,
+    unescape: __sxnQsUnescape,
+    decode: __sxnQsParse,
+    encode: __sxnQsStringify,
   };
   globalThis.__sxnQuerystring = querystring;
+  delete globalThis.__sxnQsParse;
+  delete globalThis.__sxnQsStringify;
+  delete globalThis.__sxnQsEscape;
+  delete globalThis.__sxnQsUnescape;
 
   // ---------------- node:url ----------------
   const url = {
