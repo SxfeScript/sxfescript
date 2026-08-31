@@ -259,7 +259,7 @@ does not have to re-derive it:
 | `url.fileURLToPath` | 0.130 us | C, was 0.475 |
 | `module.isBuiltin` | 0.045 us | C, was 0.415 |
 | `new URL` | 0.885 us | the engine's own |
-| `url.pathToFileURL` | 1.30 us | `new URL` is most of it |
+| `url.pathToFileURL` | 0.92 us | C text, was 1.30; `new URL` is 0.885 of what is left |
 | `createRequire` | 1.00 us | already C |
 
 Nothing in that list is a JavaScript loop any more. What remains in the file

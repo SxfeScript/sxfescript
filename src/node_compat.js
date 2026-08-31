@@ -1537,9 +1537,9 @@
     // Native (js_file_url_to_path in src/node.c): a scheme check, a host
     // check and a percent-decode, none of which needs a regexp.
     fileURLToPath: (u) => __sxnFileUrlToPath(typeof u === "string" ? u : String(u)),
-    pathToFileURL(p) {
-      return new URL("file://" + encodeURI(String(p)).replace(/[?#]/g, encodeURIComponent));
-    },
+    // The text is built native (js_path_to_file_url); the URL object it is
+    // handed to is the engine's own.
+    pathToFileURL: (p) => new URL(__sxnPathToFileUrl(String(p))),
     format: (u) => String(u),
     parse: (s) => { try { return new URL(s); } catch { return null; } },
   };

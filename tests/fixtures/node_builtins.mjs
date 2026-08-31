@@ -52,6 +52,10 @@ p("file url object", fileURLToPath(new URL("file:///from/object")));
 p("file url rejects http", (() => { try { fileURLToPath("http://x/y"); return "no"; }
   catch (e) { return e.constructor.name; } })());
 p("round trip", fileURLToPath(pathToFileURL("/tmp/a b.txt")));
+// pathToFileURL escapes what a URL would otherwise read as structure, and
+// leaves alone what it would not -- brackets included, which a URL keeps.
+for (const raw of ["/a b/c.txt", "/a?b#c", "/\u00e9/\u65e5\u672c", "/a%b", "/", "/a'b(c)", "/a[b]c", "/a+b&c=d,e;f"])
+  p("path url " + raw, [String(pathToFileURL(raw)), fileURLToPath(pathToFileURL(raw))]);
 
 // assert
 p("assert ok", (()=>{ assert(true); assert.ok(1); return "passed" })());

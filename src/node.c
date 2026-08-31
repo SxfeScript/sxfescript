@@ -3201,6 +3201,38 @@ static JSValue js_file_url_to_path(JSContext *ctx, JSValueConst this_val, int ar
     return path;
 }
 
+
+/* The other direction: a path into the text of a file: URL. Node percent-
+   encodes what a URL cannot carry literally and leaves the rest alone; this
+   was encodeURI plus a regexp for '?' and '#' per call. */
+static JSValue js_path_to_file_url(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "pathToFileURL expects a path");
+    size_t len = 0;
+    const char *path = JS_ToCStringLen(ctx, &len, argv[0]);
+    if (!path) return JS_EXCEPTION;
+    char *out = js_malloc(ctx, len * 3 + 8);
+    if (!out) { JS_FreeCString(ctx, path); return JS_EXCEPTION; }
+    static const char *hex = "0123456789ABCDEF";
+    size_t n = 0;
+    memcpy(out, "file://", 7);
+    n = 7;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)path[i];
+        /* encodeURI's unreserved set, less '?' and '#', which Node escapes
+           in a path because a URL would read them as query and fragment,
+           and less the brackets, which a URL keeps for IPv6 hosts. */
+        bool literal = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                       (c >= '0' && c <= '9') || strchr("-_.!~*'();/:@&=+$,", (char)c) != NULL;
+        if (literal) out[n++] = (char)c;
+        else { out[n++] = '%'; out[n++] = hex[c >> 4]; out[n++] = hex[c & 0xf]; }
+    }
+    JSValue text = JS_NewStringLen(ctx, out, n);
+    js_free(ctx, out);
+    JS_FreeCString(ctx, path);
+    return text;
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -3682,6 +3714,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnPathToFileUrl", JS_NewCFunction(ctx, js_path_to_file_url, "pathToFileURL", 1));
     JS_SetPropertyStr(ctx, global, "__sxnFileUrlToPath", JS_NewCFunction(ctx, js_file_url_to_path, "fileURLToPath", 1));
     JS_SetPropertyStr(ctx, global, "__sxnWriteCallback", JS_NewCFunction(ctx, js_write_callback, "__sxnWriteCallback", 2));
     JS_SetPropertyStr(ctx, global, "__sxnConcatBytes", JS_NewCFunction(ctx, js_concat_bytes, "__sxnConcatBytes", 2));
