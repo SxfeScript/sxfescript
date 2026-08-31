@@ -54393,7 +54393,39 @@ typedef struct JSONStringifyContext {
        is not there. */
     JSShape *no_tojson_shape;
     uint32_t no_tojson_gen;
+    /* The objects on the path from the root, for the circular-reference
+       check. It used to be a JavaScript array, so every object cost an
+       Array#includes, a push and a pop through the generic property paths.
+       Borrowed pointers: an entry is on the path only while the frame
+       holding a reference to it is running. */
+    JSObject **path;
+    int path_len, path_size;
 } JSONStringifyContext;
+
+/* Is `p` already on the path from the root -- that is, a cycle? The path is
+   a few entries deep in any real document. */
+static bool json_path_has(JSONStringifyContext *jsc, JSObject *p)
+{
+    int i;
+    for (i = 0; i < jsc->path_len; i++)
+        if (jsc->path[i] == p)
+            return true;
+    return false;
+}
+
+static int json_path_push(JSContext *ctx, JSONStringifyContext *jsc, JSObject *p)
+{
+    if (jsc->path_len >= jsc->path_size) {
+        int size = jsc->path_size ? jsc->path_size * 2 : 16;
+        JSObject **path = js_realloc(ctx, jsc->path, sizeof(*path) * size);
+        if (!path)
+            return -1;
+        jsc->path = path;
+        jsc->path_size = size;
+    }
+    jsc->path[jsc->path_len++] = p;
+    return 0;
+}
 
 static JSValue JS_ToQuotedStringFree(JSContext *ctx, JSValue val) {
     JSValue r = JS_ToQuotedString(ctx, val);
@@ -54529,10 +54561,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
             val = val1;
             goto concat_value;
         }
-        v = js_array_includes(ctx, jsc->stack, 1, vc(&val));
-        if (JS_IsException(v))
-            goto exception;
-        if (JS_ToBoolFree(ctx, v)) {
+        if (json_path_has(jsc, JS_VALUE_GET_OBJ(val))) {
             JS_ThrowTypeError(ctx, "circular reference");
             goto exception;
         }
@@ -54550,8 +54579,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
             sep = js_dup(jsc->empty);
             sep1 = js_dup(jsc->empty);
         }
-        v = js_array_push(ctx, jsc->stack, 1, vc(&val), 0);
-        if (check_exception_free(ctx, v))
+        if (json_path_push(ctx, jsc, JS_VALUE_GET_OBJ(val)))
             goto exception;
         ret = js_is_array(ctx, val);
         if (ret < 0)
@@ -54707,8 +54735,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                 atoms = NULL;
             }
         }
-        if (check_exception_free(ctx, js_array_pop(ctx, jsc->stack, 0, NULL, 0)))
-            goto exception;
+        jsc->path_len--;
         JS_FreeValue(ctx, val);
         JS_FreeValue(ctx, tab);
         JS_FreeValue(ctx, sep);
@@ -54772,6 +54799,9 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
     jsc->no_tojson_shape = NULL;
     jsc->no_tojson_gen = 0;
     jsc->stack = JS_UNDEFINED;
+    jsc->path = NULL;
+    jsc->path_len = 0;
+    jsc->path_size = 0;
     jsc->property_list = JS_UNDEFINED;
     jsc->gap = JS_UNDEFINED;
     jsc->b = &b_s;
@@ -54896,6 +54926,7 @@ done:
     JS_FreeValue(ctx, jsc->gap);
     JS_FreeValue(ctx, jsc->property_list);
     JS_FreeValue(ctx, jsc->stack);
+    js_free(ctx, jsc->path);
     return ret;
 }
 
