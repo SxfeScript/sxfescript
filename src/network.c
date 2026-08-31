@@ -3,6 +3,8 @@
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <openssl/rand.h>
+#include <openssl/hmac.h>
+#include <openssl/crypto.h>
 #include <curl/curl.h>
 #include <uv.h>
 /* UV_TCP_REUSEPORT arrived in libuv 1.49; older versions get the socket
@@ -1792,6 +1794,46 @@ static JSValue sxn_random_bytes(JSContext *ctx, JSValueConst this_val, int argc,
     return result;
 }
 
+
+/* HMAC, from the library that already does the digests. It was built here in
+   JavaScript out of two padded key buffers and three digest calls, with a
+   Uint8Array allocated per update. */
+static JSValue sxn_hmac(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    const char *algo = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+    if (!algo) return JS_EXCEPTION;
+    size_t key_len = 0, data_len = 0;
+    uint8_t *key = argc > 1 ? JS_GetUint8Array(ctx, &key_len, argv[1]) : NULL;
+    uint8_t *data = argc > 2 ? JS_GetUint8Array(ctx, &data_len, argv[2]) : NULL;
+    if (!key || !data) { JS_FreeCString(ctx, algo); return JS_ThrowTypeError(ctx, "hmac expects two Uint8Arrays"); }
+    char normalized[32]; size_t j = 0;
+    for (size_t i = 0; algo[i] && j + 1 < sizeof(normalized); i++)
+        if (algo[i] != '-') normalized[j++] = (char)tolower((unsigned char)algo[i]);
+    normalized[j] = 0;
+    const EVP_MD *md = EVP_get_digestbyname(normalized);
+    JS_FreeCString(ctx, algo);
+    if (!md) return JS_ThrowTypeError(ctx, "unsupported digest algorithm");
+    uint8_t out[EVP_MAX_MD_SIZE];
+    unsigned int out_len = 0;
+    /* An empty key is legal and HMAC() wants a non-NULL pointer for it. */
+    if (!HMAC(md, key_len ? (const void *)key : (const void *)"", (int)key_len,
+              data, data_len, out, &out_len))
+        return JS_ThrowInternalError(ctx, "hmac failed");
+    return JS_NewUint8ArrayCopy(ctx, out, out_len);
+}
+
+/* Comparison that takes the same time whether the bytes match or not, which
+   is the whole point of it and is not something JavaScript can promise. */
+static JSValue sxn_timing_safe_equal(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    size_t a_len = 0, b_len = 0;
+    uint8_t *a = argc > 0 ? JS_GetUint8Array(ctx, &a_len, argv[0]) : NULL;
+    uint8_t *b = argc > 1 ? JS_GetUint8Array(ctx, &b_len, argv[1]) : NULL;
+    if (!a || !b) return JS_ThrowTypeError(ctx, "timingSafeEqual expects two Uint8Arrays");
+    if (a_len != b_len) return JS_ThrowRangeError(ctx, "input length mismatch");
+    return JS_NewBool(ctx, CRYPTO_memcmp(a, b, a_len) == 0);
+}
+
 static JSValue sxn_digest(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
     const char *algo = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
@@ -2460,6 +2502,8 @@ int sxn_install_network(JSContext *ctx) {
                       JS_NewCFunction(ctx, sxn_abl_emit, "__ablEmit", 2));
 #endif
     JS_SetPropertyStr(ctx, global, "__sxnRandomBytes", JS_NewCFunction(ctx, sxn_random_bytes, "__sxnRandomBytes", 1));
+    JS_SetPropertyStr(ctx, global, "__sxnHmac", JS_NewCFunction(ctx, sxn_hmac, "__sxnHmac", 3));
+    JS_SetPropertyStr(ctx, global, "__sxnTimingSafeEqual", JS_NewCFunction(ctx, sxn_timing_safe_equal, "__sxnTimingSafeEqual", 2));
     JS_SetPropertyStr(ctx, global, "__sxnDigest", JS_NewCFunction(ctx, sxn_digest, "__sxnDigest", 2));
     /* Consumed only by bootstrap.js's TextEncoder/TextDecoder. */
     JS_SetPropertyStr(ctx, global, "__sxnUtf8Encode", JS_NewCFunction(ctx, sxn_utf8_encode, "__sxnUtf8Encode", 1));

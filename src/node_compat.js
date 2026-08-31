@@ -1123,7 +1123,6 @@
   // and a constant-time compare. Digests come from the same OpenSSL binding
   // WebCrypto uses; HMAC is the standard construction over it, which needs no
   // second binding and is exactly what the RFC specifies.
-  const HASH_BLOCK = { md5: 64, sha1: 64, sha224: 64, sha256: 64, sha384: 128, sha512: 128 };
   const cryptoToBytes = (d, enc) => {
     if (typeof d === "string") {
       if (enc === "hex") {
@@ -1171,26 +1170,19 @@
     return h;
   };
 
+  // Native (sxn_hmac in src/network.c): OpenSSL's own HMAC, rather than two
+  // padded key buffers and three digest calls built here.
   function Hmac(algorithm, key) {
-    const algo = String(algorithm).toLowerCase();
-    const block = HASH_BLOCK[algo.replace(/-/g, "")] || 64;
-    let k = cryptoToBytes(key);
-    if (k.length > block) k = __sxnDigest(algo, k);
-    const padded = new Uint8Array(block);
-    padded.set(k);
-    const ipad = new Uint8Array(block), opad = new Uint8Array(block);
-    for (let i = 0; i < block; i++) { ipad[i] = padded[i] ^ 0x36; opad[i] = padded[i] ^ 0x5c; }
-    this._algo = algo;
-    this._opad = opad;
-    this._parts = [ipad];
+    this._algo = String(algorithm).toLowerCase();
+    this._key = cryptoToBytes(key);
+    this._parts = [];
   }
   Hmac.prototype.update = function (data, enc) {
     this._parts.push(cryptoToBytes(data, enc));
     return this;
   };
   Hmac.prototype.digest = function (encoding) {
-    const inner = __sxnDigest(this._algo, concatBytes(this._parts));
-    return encodeDigest(__sxnDigest(this._algo, concatBytes([this._opad, inner])), encoding);
+    return encodeDigest(__sxnHmac(this._algo, this._key, concatBytes(this._parts)), encoding);
   };
 
   const nodeCrypto = {
@@ -1212,13 +1204,9 @@
       return min + (v % range);
     },
     // Compares in time independent of where the first difference is.
-    timingSafeEqual(a, b) {
-      const x = cryptoToBytes(a), y = cryptoToBytes(b);
-      if (x.length !== y.length) throw new RangeError("input length mismatch");
-      let diff = 0;
-      for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
-      return diff === 0;
-    },
+    // Native: a comparison that takes the same time either way is not
+    // something a JavaScript loop can promise.
+    timingSafeEqual: (a, b) => __sxnTimingSafeEqual(cryptoToBytes(a), cryptoToBytes(b)),
     getHashes: () => ["md5", "sha1", "sha224", "sha256", "sha384", "sha512"],
     constants: {},
     webcrypto: globalThis.crypto,
