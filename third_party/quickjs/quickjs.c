@@ -53873,8 +53873,29 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
                         JS_FreeAtom(ctx, prop_name);
                         goto fail;
                     }
-                    ret = JS_DefinePropertyValue(ctx, val, prop_name,
-                                                 prop_val, JS_PROP_C_W_E);
+                    /* The object was created by JS_NewObject just above and
+                       nothing but this loop can see it, so an own data
+                       property goes in without the descriptor machinery.
+                       A key that repeats -- legal in JSON, last one wins --
+                       is the only case that finds an existing slot. */
+                    {
+                        JSObject *po = JS_VALUE_GET_OBJ(val);
+                        JSProperty *pr1;
+                        JSShapeProperty *prs1 = find_own_property(&pr1, po, prop_name);
+                        if (prs1) {
+                            set_value(ctx, &pr1->u.value, prop_val);
+                            ret = 0;
+                        } else {
+                            pr1 = add_property(ctx, po, prop_name, JS_PROP_C_W_E);
+                            if (!pr1) {
+                                JS_FreeValue(ctx, prop_val);
+                                ret = -1;
+                            } else {
+                                pr1->u.value = prop_val;
+                                ret = 0;
+                            }
+                        }
+                    }
                     JS_FreeAtom(ctx, prop_name);
                     if (ret < 0)
                         goto fail;
@@ -53923,7 +53944,11 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
                     el = json_parse_value(s, pr1);
                     if (JS_IsException(el))
                         goto fail;
-                    ret = JS_DefinePropertyValueUint32(ctx, val, idx, el, JS_PROP_C_W_E);
+                    /* Appending to the fresh fast array this loop is
+                       filling, rather than defining an indexed property on
+                       an object that might be anything. */
+                    ret = add_fast_array_element(ctx, JS_VALUE_GET_OBJ(val),
+                                                 el, JS_PROP_THROW);
                     if (ret < 0)
                         goto fail;
                     if (s->token.val == ']')

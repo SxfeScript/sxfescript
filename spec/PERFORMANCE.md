@@ -256,18 +256,52 @@ And a plain integer is converted by the tokenizer instead of `strtod`, which
 is locale-aware -- it takes a lock to find the decimal separator -- and
 rescans the digits.
 
-On the Mac, the round trip went 165.4 -> 72 ms against Node's 26.9 and Bun's
-23.3. Separately: parsing that 1MB document 2.29 -> 1.34 ms against Node's
-1.05, writing it 7.01 -> 2.22 against Node's 0.60. Writing one long string,
-where the run scan is all there is, went 2.52 -> 0.10 ms against Node's 0.12
--- ahead, for that shape.
+Then the object model, which the profile pointed at once the scanning was
+cheap. Writing:
 
-What remains is not the scanning, and the profile no longer has a peak worth
-naming: on an object-heavy document it is spread across property
-enumeration, the atom lookup behind each property read, and one allocation
-per value -- the same interpreted-object-model cost that the rest of this
-document keeps arriving at. It is also why a faster external parser is not
-the answer here. A DOM parser would replace the part that is now cheap and
+- **An object's keys are read as atoms, not as strings.** `stringify` built
+  a JavaScript array of key strings per object and then looked each property
+  back up by string, which hashes it into an atom again. An ordinary object
+  with no replacer list now walks its own atoms, reads by atom, and takes the
+  key string from the atom rather than building one. When its keys are all
+  ordinary strings they come straight out of its shape into a stack array, so
+  the object costs no allocation at all.
+- **Integers, booleans and null go in as bytes.** Each used to be handed to
+  `JS_ToString`, which allocates a string to copy in and free. A JSON
+  document is mostly those three.
+- **`toJSON` is looked for once per shape.** Every object was searched for
+  the method, walking its prototype chain to find nothing. The last shape
+  that had none is remembered against the runtime's property-location
+  generation -- the stamp the inline caches already keep, bumped wherever a
+  property could move, which covers a getter installing `toJSON` on
+  `Object.prototype` halfway through a document.
+
+Reading:
+
+- **A property goes straight into the object being built.** The parser owns
+  the object it is filling and nothing else can see it, so a key that is not
+  already there is added directly instead of going through the descriptor
+  machinery. A repeated key -- legal, last one wins -- is the only case that
+  finds an existing slot.
+- **An array element is appended, not defined.** The array is the parser's
+  own fresh fast array; appending to it skips the indexed-property path,
+  which has to assume the target could be anything.
+
+On the Mac the round trip went 165.4 -> 51.4 ms against Node's 28.2 and
+Bun's 25.3. Separately, parsing a 1MB document 2.29 -> 1.24 ms against Node's
+1.06, and writing it 7.01 -> 1.67 against Node's 0.61. A document of 30000
+small objects parses in 4.48 ms against Node's 2.34. Reading one long string
+is 0.19 ms against Node's 0.31, and writing it 0.08 against 0.12 -- ahead,
+for that shape.
+
+What is left divides in two. Writing an object-heavy document is still around
+5x Node, spread across the remaining per-property work with no peak worth
+naming. Writing fractional numbers is the other half: `js_dtoa` is exact and
+unhurried where V8 uses a fast shortest-representation algorithm, and that is
+a self-contained piece of work nobody has done here yet.
+
+None of it is the parser's structure, which is why a faster external parser
+is not the answer. A DOM parser would replace the part that is now cheap and
 still leave every JavaScript object to be built one property at a time, with
 a second representation to copy out of on the way.
 
