@@ -240,6 +240,15 @@ that never arrived, not one per byte, which its own output settled.
 left alone: at 0.27, 0.14 and 0.55 microseconds they are already faster here
 than in Node, which spends 1.37, 1.18 and 0.82 on the same three.
 
+A third sweep, over what a server actually touches, found two corruptions
+rather than costs. `fs/promises.readFile` read the file as text and encoded
+it back to bytes, so every byte that is not valid UTF-8 came back as the
+replacement character -- a binary file was destroyed by reading it. It uses
+the same native read the synchronous side does now, which is also three times
+faster. `fs.writeFileSync` had the mirror of it: everything went through
+`JS_ToCStringLen`, so a Buffer was written as its decimal digits. Bytes are
+written as bytes now.
+
 The second sweep, over `node:util`, `node:string_decoder` and `process`,
 found something worse than any of the migrations: `process.cwd()` cost 7
 microseconds against Node's 0.01. It was calling `getcwd()` every time, and

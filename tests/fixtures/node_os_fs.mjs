@@ -4,8 +4,9 @@
 // missing, because nothing can tell a stub from the truth.
 import * as os from "node:os";
 import { networkInterfaces, hostname, cpus, totalmem, availableParallelism } from "node:os";
-import { stat, lstat } from "node:fs/promises";
-import { statSync, createReadStream, existsSync } from "node:fs";
+import { stat, lstat, readFile } from "node:fs/promises";
+import { statSync, createReadStream, existsSync, writeFileSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 let bad = 0;
 const check = (n, got, want) => { const ok = got === want; if (!ok) bad++;
@@ -52,6 +53,24 @@ check("the numbers are numbers",
         .every((k) => typeof s[k] === "number"), true);
 check("not a directory", s.isDirectory(), false);
 check("not a symlink", s.isSymbolicLink(), false);
+
+// fs/promises.readFile has to hand back the file's own bytes. It used to
+// decode as UTF-8 and re-encode, which turned every byte that is not valid
+// UTF-8 into the replacement character.
+{
+  // One fixed name, rewritten each run: this runtime has no unlinkSync yet.
+  const binary = join(os.tmpdir(), "sxn-readfile-bytes.bin");
+  const bytes = Buffer.from([0x00, 0x80, 0xff, 0xfe, 0x20, 0x41]);
+  writeFileSync(binary, bytes);
+  const back = await readFile(binary);
+  check("binary survives", Buffer.from(back).toString("hex"), bytes.toString("hex"));
+  check("same as the sync read", Buffer.from(readFileSync(binary)).toString("hex"), bytes.toString("hex"));
+  check("an encoding still gives text", typeof (await readFile(binary, "utf8")), "string");
+  writeFileSync(binary, "h\u00e9llo");
+  check("a string still writes as text", readFileSync(binary, "utf8"), "h\u00e9llo");
+  writeFileSync(binary, new Uint8Array([1, 2, 3]));
+  check("a plain array of bytes writes too", Buffer.from(readFileSync(binary)).toString("hex"), "010203");
+}
 let code = "";
 try { await stat(self + ".missing"); } catch (e) { code = e.code; }
 check("a missing file is ENOENT", code, "ENOENT");

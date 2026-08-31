@@ -192,18 +192,31 @@ static JSValue js_sxn_write_file_sync(JSContext *ctx, JSValueConst this_val, int
     (void)this_val;
     const char *path = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
     if (!path) return JS_ThrowTypeError(ctx, "expected a path");
+    /* Bytes are written as they are. Everything went through
+       JS_ToCStringLen before, which turns a Buffer into its decimal digits
+       and any byte that is not valid UTF-8 into the replacement character. */
     size_t length = 0;
-    const char *data = argc > 1 ? JS_ToCStringLen(ctx, &length, argv[1]) : NULL;
+    const char *data = NULL;
+    const char *owned = NULL;
+    if (argc > 1) {
+        uint8_t *bytes = JS_GetUint8Array(ctx, &length, argv[1]);
+        if (bytes) data = (const char *)bytes;
+        else {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            owned = JS_ToCStringLen(ctx, &length, argv[1]);
+            data = owned;
+        }
+    }
     if (!data) { JS_FreeCString(ctx, path); return JS_ThrowTypeError(ctx, "expected data"); }
     FILE *file = fopen(path, "wb");
     if (!file) {
         JSValue err = JS_ThrowInternalError(ctx, "cannot write '%s': %s", path, strerror(errno));
-        JS_FreeCString(ctx, path); JS_FreeCString(ctx, data);
+        JS_FreeCString(ctx, path); JS_FreeCString(ctx, owned);
         return err;
     }
     size_t written = fwrite(data, 1, length, file);
     bool failed = fclose(file) != 0 || written != length;
-    JS_FreeCString(ctx, path); JS_FreeCString(ctx, data);
+    JS_FreeCString(ctx, path); JS_FreeCString(ctx, owned);
     if (failed) return JS_ThrowInternalError(ctx, "file write failed");
     return JS_UNDEFINED;
 }

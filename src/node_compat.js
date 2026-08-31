@@ -458,10 +458,13 @@
   delete globalThis.__sxnExistsSync;
 
   var fsPromises = {
+    // The same native read the synchronous side uses. This went through
+    // Sxn.file().text(), which decodes the file as UTF-8 and then had to
+    // encode it back to bytes -- so any byte that is not valid UTF-8 came
+    // back as the replacement character, and a binary file was corrupted.
     readFile: function (path, encoding) {
-      return Sxn.file(path).text().then(function (text) {
-        return wantsText(encoding) ? text : Buffer.from(new TextEncoder().encode(text).buffer);
-      });
+      try { return Promise.resolve(fs.readFileSync(path, encoding)); }
+      catch (e) { return Promise.reject(e); }
     },
     writeFile: __sxnWriteFileAsync,
     stat: function (path) {
