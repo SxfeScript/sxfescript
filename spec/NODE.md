@@ -151,6 +151,12 @@ same keys and is now one pass in C, 1.74 microseconds to 0.60 for a seven-
 header request. That is 1.1 of the layer's 5.6 microseconds, taken from the
 one part of it that is string work rather than object construction.
 
+`node:crypto` had one of these left inside it: `update(data, "hex")` parsed
+the string with `parseInt` on a two-character `substr` per byte, and base64
+went through `atob`. Both now go through Buffer's native readers, which were
+already there -- 4KB of hex input fell from 168 microseconds to 4.5 including
+the digest itself.
+
 Still JavaScript, with the reason measured rather than asserted:
 
 - **`stream` and `http`.** A `node:http` request costs 13.4 us here against

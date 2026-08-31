@@ -18,3 +18,17 @@ streamed NC5RnOCtbAOja5jus/HRMNtIE7nfTRFg7aSI1xLceO4=
 equal true
 differ false
 mismatch -> RangeError
+hash hex "deadbeef" 5f78c33274e43fa9de5659265c1d917e25c03722dcb0b8d27db8d5feaa813953
+hmac hex "deadbeef" vnR0a3D0RWFcGEI8e8BOnmC59Zx/no4aDlvGyHVrpys=
+hash hex "DEADBEEF" 5f78c33274e43fa9de5659265c1d917e25c03722dcb0b8d27db8d5feaa813953
+hmac hex "DEADBEEF" vnR0a3D0RWFcGEI8e8BOnmC59Zx/no4aDlvGyHVrpys=
+hash base64 "QUJD" b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78
+hmac base64 "QUJD" R2EoX7/mTM/FUNUp5uqdKly4ge7dOi57M7ji6ypTwbI=
+hash base64url "QUJD" b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78
+hmac base64url "QUJD" R2EoX7/mTM/FUNUp5uqdKly4ge7dOi57M7ji6ypTwbI=
+hash latin1 "ÿþ" b3d510ef04275ca8e698e5b3cbb0ece3949ef9252f0cdc839e9ee347409a2209
+hmac latin1 "ÿþ" SR8auta1W/HKyIqhNX4m9h49m89Do9vWO3yTIhdbcDk=
+hash utf8 "abc" ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+hmac utf8 "abc" nBluMtwBdfhvSxy4konWYZ3mvuaZ5MN45oMJ7Zehpqs=
+hash  "abc" ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+hmac  "abc" nBluMtwBdfhvSxy4konWYZ3mvuaZ5MN45oMJ7Zehpqs=

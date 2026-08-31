@@ -1134,12 +1134,9 @@
   // second binding and is exactly what the RFC specifies.
   const cryptoToBytes = (d, enc) => {
     if (typeof d === "string") {
-      if (enc === "hex") {
-        const out = new Uint8Array(d.length >> 1);
-        for (let i = 0; i < out.length; i++) out[i] = parseInt(d.substr(i * 2, 2), 16);
-        return out;
-      }
-      if (enc === "base64") return Uint8Array.from(atob(d), (c) => c.charCodeAt(0));
+      // Buffer's readers are the native ones; this used to parse hex a byte
+      // at a time with parseInt and read base64 through atob.
+      if (enc && enc !== "utf8" && enc !== "utf-8") return bufferBytesFromString(d, enc);
       return new TextEncoder().encode(d);
     }
     if (d instanceof ArrayBuffer) return new Uint8Array(d);
