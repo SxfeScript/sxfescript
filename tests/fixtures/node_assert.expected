@@ -1,0 +1,130 @@
+strict  numbers -> ok
+loose   numbers -> ok
+isDeep  numbers -> true
+strict  number vs string -> throws
+loose   number vs string -> ok
+isDeep  number vs string -> false
+strict  zero signs -> throws
+loose   zero signs -> ok
+isDeep  zero signs -> false
+strict  NaN -> ok
+loose   NaN -> ok
+isDeep  NaN -> true
+strict  null vs undefined -> throws
+loose   null vs undefined -> ok
+isDeep  null vs undefined -> false
+strict  empty objects -> ok
+loose   empty objects -> ok
+isDeep  empty objects -> true
+strict  flat objects -> ok
+loose   flat objects -> ok
+isDeep  flat objects -> true
+strict  key order -> ok
+loose   key order -> ok
+isDeep  key order -> true
+strict  extra key -> throws
+loose   extra key -> throws
+isDeep  extra key -> false
+strict  nested -> ok
+loose   nested -> ok
+isDeep  nested -> true
+strict  nested differs -> throws
+loose   nested differs -> throws
+isDeep  nested differs -> false
+strict  array vs object -> throws
+loose   array vs object -> throws
+isDeep  array vs object -> false
+strict  array holes -> throws
+loose   array holes -> throws
+isDeep  array holes -> false
+strict  dates -> ok
+loose   dates -> ok
+isDeep  dates -> true
+strict  dates differ -> throws
+loose   dates differ -> throws
+isDeep  dates differ -> false
+strict  invalid dates -> ok
+loose   invalid dates -> ok
+isDeep  invalid dates -> true
+strict  regexps -> ok
+loose   regexps -> ok
+isDeep  regexps -> true
+strict  regexps differ -> throws
+loose   regexps differ -> throws
+isDeep  regexps differ -> false
+strict  typed arrays -> ok
+loose   typed arrays -> ok
+isDeep  typed arrays -> true
+strict  typed arrays differ -> throws
+loose   typed arrays differ -> throws
+isDeep  typed arrays differ -> false
+strict  typed array kinds -> throws
+loose   typed array kinds -> throws
+isDeep  typed array kinds -> false
+strict  maps -> ok
+loose   maps -> ok
+isDeep  maps -> true
+strict  maps differ -> throws
+loose   maps differ -> throws
+isDeep  maps differ -> false
+strict  maps nested values -> ok
+loose   maps nested values -> ok
+isDeep  maps nested values -> true
+strict  sets -> ok
+loose   sets -> ok
+isDeep  sets -> true
+strict  sets differ -> throws
+loose   sets differ -> throws
+isDeep  sets differ -> false
+strict  prototypes -> throws
+loose   prototypes -> ok
+isDeep  prototypes -> false
+strict  classes -> ok
+loose   classes -> ok
+isDeep  classes -> true
+strict  different classes -> throws
+loose   different classes -> ok
+isDeep  different classes -> false
+strict  errors -> ok
+loose   errors -> ok
+isDeep  errors -> true
+strict  symbol keys ignored -> throws
+loose   symbol keys ignored -> ok
+isDeep  symbol keys ignored -> false
+strict  non-enumerable ignored -> ok
+loose   non-enumerable ignored -> ok
+isDeep  non-enumerable ignored -> true
+strict  cycles -> ok
+loose   cycles -> ok
+isDeep  cycles -> true
+strict  cycles differ -> throws
+loose   cycles differ -> throws
+isDeep  cycles differ -> false
+strict  shared subtrees -> ok
+loose   shared subtrees -> ok
+isDeep  shared subtrees -> true
+strict  strings -> ok
+loose   strings -> ok
+isDeep  strings -> true
+strict  boxed vs primitive -> throws
+loose   boxed vs primitive -> throws
+isDeep  boxed vs primitive -> false
+strict  boxed -> ok
+loose   boxed -> ok
+isDeep  boxed -> true
+strict  booleans -> throws
+loose   booleans -> ok
+isDeep  booleans -> false
+strict  functions -> throws
+loose   functions -> throws
+isDeep  functions -> false
+ok true -> ok
+ok false -> throws
+equal loose -> ok
+strictEqual -> throws
+notStrictEqual -> ok
+notDeepStrictEqual -> ok
+throws catches -> ok
+throws misses -> throws
+match -> ok
+match fails -> throws

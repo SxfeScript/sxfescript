@@ -2565,6 +2565,216 @@ static JSValue js_util_format(JSContext *ctx, JSValueConst this_val, int argc, J
     return result;
 }
 
+
+/* ---------------- assert's deep comparison, in C ----------------
+   The whole of it is calls back into the engine -- reading properties,
+   comparing values, walking a Map -- so this is not faster than the
+   JavaScript it replaces. It is here because the compatibility layer is
+   being moved into C and this is the last piece of it that carries real
+   logic rather than glue. The measurement is in spec/NODE.md.
+
+   Cycles are handled the way the specification's SameValue-based walk is:
+   a pair already being compared higher up the stack is taken as equal,
+   which terminates and matches what Node does for two identical cycles. */
+typedef struct SxnDeepPair { JSValueConst a, b; struct SxnDeepPair *prev; } SxnDeepPair;
+
+static int sxn_deep_equal(JSContext *ctx, JSValueConst a, JSValueConst b, bool strict, SxnDeepPair *seen, int depth);
+
+static bool sxn_same_value(JSContext *ctx, JSValueConst a, JSValueConst b) {
+    /* Object.is: NaN equals itself, +0 and -0 do not. */
+    return JS_IsSameValue(ctx, a, b);
+}
+
+static int sxn_deep_keys_equal(JSContext *ctx, JSValueConst a, JSValueConst b, bool strict, SxnDeepPair *seen, int depth) {
+    JSPropertyEnum *ka = NULL, *kb = NULL;
+    uint32_t na = 0, nb = 0;
+    int result = -1;
+    /* The strict comparison counts own enumerable symbol keys; the loose one
+       does not look at them at all. */
+    int flags = JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY | (strict ? JS_GPN_SYMBOL_MASK : 0);
+    if (JS_GetOwnPropertyNames(ctx, &ka, &na, a, flags)) return -1;
+    if (JS_GetOwnPropertyNames(ctx, &kb, &nb, b, flags)) {
+        JS_FreePropertyEnum(ctx, ka, na);
+        return -1;
+    }
+    if (na != nb) { result = 0; goto done; }
+    for (uint32_t i = 0; i < na; i++) {
+        int has = JS_HasProperty(ctx, b, ka[i].atom);
+        if (has < 0) { result = -1; goto done; }
+        if (!has) { result = 0; goto done; }
+        JSValue va = JS_GetProperty(ctx, a, ka[i].atom);
+        if (JS_IsException(va)) { result = -1; goto done; }
+        JSValue vb = JS_GetProperty(ctx, b, ka[i].atom);
+        if (JS_IsException(vb)) { JS_FreeValue(ctx, va); result = -1; goto done; }
+        int same = sxn_deep_equal(ctx, va, vb, strict, seen, depth + 1);
+        JS_FreeValue(ctx, va);
+        JS_FreeValue(ctx, vb);
+        if (same <= 0) { result = same; goto done; }
+    }
+    result = 1;
+ done:
+    JS_FreePropertyEnum(ctx, ka, na);
+    JS_FreePropertyEnum(ctx, kb, nb);
+    return result;
+}
+
+/* Every entry of a Map, matched against the other Map's entry for the same
+   key. Set membership is the same walk with the value ignored. */
+static int sxn_deep_map_equal(JSContext *ctx, JSValueConst a, JSValueConst b, bool is_map, bool strict, SxnDeepPair *seen, int depth) {
+    int result = -1;
+    JSValue iterator = JS_UNDEFINED, next = JS_UNDEFINED;
+    JSValue size_a = JS_GetPropertyStr(ctx, a, "size");
+    JSValue size_b = JS_GetPropertyStr(ctx, b, "size");
+    int32_t na = 0, nb = 0;
+    JS_ToInt32(ctx, &na, size_a);
+    JS_ToInt32(ctx, &nb, size_b);
+    JS_FreeValue(ctx, size_a);
+    JS_FreeValue(ctx, size_b);
+    if (na != nb) return 0;
+
+    JSValue entries_fn = JS_GetPropertyStr(ctx, a, is_map ? "entries" : "values");
+    iterator = JS_Call(ctx, entries_fn, a, 0, NULL);
+    JS_FreeValue(ctx, entries_fn);
+    if (JS_IsException(iterator)) goto done;
+    next = JS_GetPropertyStr(ctx, iterator, "next");
+    if (JS_IsException(next)) goto done;
+    for (;;) {
+        JSValue step = JS_Call(ctx, next, iterator, 0, NULL);
+        if (JS_IsException(step)) goto done;
+        JSValue done_flag = JS_GetPropertyStr(ctx, step, "done");
+        bool finished = JS_ToBool(ctx, done_flag);
+        JS_FreeValue(ctx, done_flag);
+        if (finished) { JS_FreeValue(ctx, step); break; }
+        JSValue entry = JS_GetPropertyStr(ctx, step, "value");
+        JS_FreeValue(ctx, step);
+        JSValue key = is_map ? JS_GetPropertyUint32(ctx, entry, 0) : JS_DupValue(ctx, entry);
+        JSValue has_fn = JS_GetPropertyStr(ctx, b, "has");
+        JSValueConst args[1] = { key };
+        JSValue has = JS_Call(ctx, has_fn, b, 1, args);
+        JS_FreeValue(ctx, has_fn);
+        bool present = JS_ToBool(ctx, has);
+        JS_FreeValue(ctx, has);
+        if (!present) {
+            JS_FreeValue(ctx, key); JS_FreeValue(ctx, entry);
+            result = 0; goto done;
+        }
+        if (is_map) {
+            JSValue want = JS_GetPropertyUint32(ctx, entry, 1);
+            JSValue get_fn = JS_GetPropertyStr(ctx, b, "get");
+            JSValueConst get_args[1] = { key };
+            JSValue got = JS_Call(ctx, get_fn, b, 1, get_args);
+            JS_FreeValue(ctx, get_fn);
+            int same = sxn_deep_equal(ctx, want, got, strict, seen, depth + 1);
+            JS_FreeValue(ctx, want);
+            JS_FreeValue(ctx, got);
+            if (same <= 0) {
+                JS_FreeValue(ctx, key); JS_FreeValue(ctx, entry);
+                result = same; goto done;
+            }
+        }
+        JS_FreeValue(ctx, key);
+        JS_FreeValue(ctx, entry);
+    }
+    result = 1;
+ done:
+    JS_FreeValue(ctx, iterator);
+    JS_FreeValue(ctx, next);
+    return result;
+}
+
+static int sxn_deep_equal(JSContext *ctx, JSValueConst a, JSValueConst b, bool strict, SxnDeepPair *seen, int depth) {
+    if (depth > 512) return JS_ThrowRangeError(ctx, "deep comparison too deep"), -1;
+    if (strict ? sxn_same_value(ctx, a, b) : JS_IsStrictEqual(ctx, a, b)) return 1;
+    if (!JS_IsObject(a) || !JS_IsObject(b)) {
+        /* An object never equals a primitive, either way round: the loose
+           comparison is loose about 1 and "1", not about boxes. */
+        if (JS_IsObject(a) || JS_IsObject(b)) return 0;
+        if (strict) return sxn_same_value(ctx, a, b) ? 1 : 0;
+        /* NaN is its own match here, as it is in Node. */
+        if (JS_IsSameValueZero(ctx, a, b)) return 1;
+        int eq = JS_IsEqual(ctx, a, b);
+        return eq < 0 ? -1 : (eq > 0 ? 1 : 0);
+    }
+    /* Two different functions are never equal, whatever they carry. */
+    if (JS_IsFunction(ctx, a) || JS_IsFunction(ctx, b)) return 0;
+
+    for (SxnDeepPair *p = seen; p; p = p->prev)
+        if (JS_IsStrictEqual(ctx, p->a, a) && JS_IsStrictEqual(ctx, p->b, b))
+            return 1;   /* already being compared: a cycle */
+    SxnDeepPair pair = { a, b, seen };
+
+    if (strict) {
+        /* Only the strict comparison cares which class an object came from. */
+        JSValue proto_a = JS_GetPrototype(ctx, a);
+        JSValue proto_b = JS_GetPrototype(ctx, b);
+        bool same_proto = JS_IsStrictEqual(ctx, proto_a, proto_b);
+        JS_FreeValue(ctx, proto_a);
+        JS_FreeValue(ctx, proto_b);
+        if (!same_proto) return 0;
+    }
+
+    /* Dates, regexps, maps and sets compare by content rather than by their
+       properties. The class id is what instanceof would find and what a
+       subclass keeps, so it is read directly instead of by name. */
+    static const char *probe_src = "[new Date(), /x/, new Map(), new Set()]";
+    static JSClassID date_id, regexp_id, map_id, set_id;
+    if (!date_id) {
+        JSValue probe = JS_Eval(ctx, probe_src, strlen(probe_src), "<deep>", JS_EVAL_TYPE_GLOBAL);
+        JSValue v;
+        v = JS_GetPropertyUint32(ctx, probe, 0); date_id = JS_GetClassID(v); JS_FreeValue(ctx, v);
+        v = JS_GetPropertyUint32(ctx, probe, 1); regexp_id = JS_GetClassID(v); JS_FreeValue(ctx, v);
+        v = JS_GetPropertyUint32(ctx, probe, 2); map_id = JS_GetClassID(v); JS_FreeValue(ctx, v);
+        v = JS_GetPropertyUint32(ctx, probe, 3); set_id = JS_GetClassID(v); JS_FreeValue(ctx, v);
+        JS_FreeValue(ctx, probe);
+    }
+    JSClassID cls = JS_GetClassID(a);
+    /* Even the loose comparison keeps arrays, typed arrays and dates apart
+       from plain objects, which is what the class says. */
+    if (cls != JS_GetClassID(b)) return 0;
+    int result = -2;
+    if (cls == date_id) {
+        JSValue fa = JS_GetPropertyStr(ctx, a, "getTime");
+        JSValue va = JS_Call(ctx, fa, a, 0, NULL);
+        JSValue vb = JS_Call(ctx, fa, b, 0, NULL);
+        JS_FreeValue(ctx, fa);
+        double da = 0, db = 0;
+        JS_ToFloat64(ctx, &da, va);
+        JS_ToFloat64(ctx, &db, vb);
+        JS_FreeValue(ctx, va);
+        JS_FreeValue(ctx, vb);
+        result = (da == db || (isnan(da) && isnan(db))) ? 1 : 0;
+    } else if (cls == regexp_id) {
+        JSValue sa = JS_ToString(ctx, a), sb = JS_ToString(ctx, b);
+        result = JS_IsStrictEqual(ctx, sa, sb) ? 1 : 0;
+        JS_FreeValue(ctx, sa);
+        JS_FreeValue(ctx, sb);
+    } else if (cls == map_id) {
+        result = sxn_deep_map_equal(ctx, a, b, true, strict, &pair, depth);
+    } else if (cls == set_id) {
+        result = sxn_deep_map_equal(ctx, a, b, false, strict, &pair, depth);
+    }
+    if (result != -2) return result;
+
+    /* A typed array compares as bytes. */
+    size_t bytes_a = 0, bytes_b = 0;
+    uint8_t *raw_a = JS_GetUint8Array(ctx, &bytes_a, a);
+    if (!raw_a) JS_FreeValue(ctx, JS_GetException(ctx));
+    uint8_t *raw_b = raw_a ? JS_GetUint8Array(ctx, &bytes_b, b) : NULL;
+    if (raw_a && !raw_b) JS_FreeValue(ctx, JS_GetException(ctx));
+    if (raw_a && raw_b)
+        return (bytes_a == bytes_b && (bytes_a == 0 || memcmp(raw_a, raw_b, bytes_a) == 0)) ? 1 : 0;
+
+    return sxn_deep_keys_equal(ctx, a, b, strict, &pair, depth);
+}
+
+static JSValue js_deep_equal(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic) {
+    (void)this_val;
+    if (argc < 2) return JS_NewBool(ctx, false);
+    int result = sxn_deep_equal(ctx, argv[0], argv[1], magic != 0, NULL, 0);
+    if (result < 0) return JS_EXCEPTION;
+    return JS_NewBool(ctx, result == 1);
+}
+
 static const char *node_querystring_names[] = { "parse", "stringify", "escape", "unescape", "decode", "encode" };
 static const char *node_url_names[] = {
     "URL", "URLSearchParams", "fileURLToPath", "pathToFileURL", "format", "parse",
@@ -2836,6 +3046,8 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnDeepEqual", JS_NewCFunctionMagic(ctx, js_deep_equal, "__sxnDeepEqual", 2, JS_CFUNC_generic_magic, 1));
+    JS_SetPropertyStr(ctx, global, "__sxnLooseDeepEqual", JS_NewCFunctionMagic(ctx, js_deep_equal, "__sxnLooseDeepEqual", 2, JS_CFUNC_generic_magic, 0));
     JS_SetPropertyStr(ctx, global, "__sxnFormat", JS_NewCFunction(ctx, js_util_format, "__sxnFormat", 3));
     JS_SetPropertyStr(ctx, global, "__sxnHexBytes", JS_NewCFunction(ctx, js_hex_bytes, "__sxnHexBytes", 1));
     JS_SetPropertyStr(ctx, global, "__sxnBase64Bytes", JS_NewCFunction(ctx, js_base64_bytes, "__sxnBase64Bytes", 1));

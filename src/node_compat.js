@@ -1571,38 +1571,8 @@
   globalThis.__sxnUtil = util;
 
   // Structural equality, shared by util.isDeepStrictEqual and node:assert.
-  function deepEqual(a, b, strict) {
-    if (strict ? Object.is(a, b) : a == b) return true;
-    if (a === null || b === null || typeof a !== "object" || typeof b !== "object") {
-      return strict ? Object.is(a, b) : a == b;
-    }
-    if (Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
-    if (a instanceof Date) return a.getTime() === b.getTime();
-    if (a instanceof RegExp) return String(a) === String(b);
-    if (Array.isArray(a) !== Array.isArray(b)) return false;
-    if (ArrayBuffer.isView(a)) {
-      if (a.length !== b.length) return false;
-      for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-      return true;
-    }
-    if (a instanceof Map) {
-      if (a.size !== b.size) return false;
-      for (const [k, v] of a) { if (!b.has(k) || !deepEqual(v, b.get(k), strict)) return false; }
-      return true;
-    }
-    if (a instanceof Set) {
-      if (a.size !== b.size) return false;
-      for (const v of a) if (!b.has(v)) return false;
-      return true;
-    }
-    const ka = Object.keys(a), kb = Object.keys(b);
-    if (ka.length !== kb.length) return false;
-    for (const k of ka) {
-      if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
-      if (!deepEqual(a[k], b[k], strict)) return false;
-    }
-    return true;
-  }
+  // Native (sxn_deep_equal in src/node.c).
+  const deepEqual = (a, b, strict) => strict ? __sxnDeepEqual(a, b) : __sxnLooseDeepEqual(a, b);
 
   // ---------------- node:assert ----------------
   function AssertionError(opts) {

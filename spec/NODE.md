@@ -114,15 +114,23 @@ Native now: `path` in both halves, `querystring`, `net.isIP`, `os` in full
 (from libuv), `fs`'s `stat`/`lstat` and the read primitives, `crypto`'s
 digests, HMAC and `timingSafeEqual`, `zlib`'s deflate and inflate, Buffer's
 encodings, lenient hex/base64 readers and numeric accessors, `util.format`,
-and `EventEmitter`'s `on`/`emit` fast path.
+`EventEmitter`'s `on`/`emit` fast path, and the structural comparison behind
+`assert.deepStrictEqual`, `assert.deepEqual` and `util.isDeepStrictEqual`.
 
-The last two moves are worth reporting honestly, because they say where the
-seam is: the lenient base64 reader and `util.format` are correct and match
+The last three moves are worth reporting honestly, because they say where the
+seam is. The lenient base64 reader and `util.format` are correct and match
 Node exactly, but neither is much faster than the JavaScript it replaced --
 `format("a plain message")` went from 0.24 to 0.18 microseconds and the rest
-is a wash. The work in both had already shrunk to the JavaScript-to-C
-boundary itself. That is the shape of what is left everywhere else in this
-file.
+is a wash. The deep comparison is slower: 4.58 microseconds per compare of a
+small nested object against the JavaScript's 4.18, because every step of it
+is a call back into the engine to read a property or compare two values, and
+the interpreter does that for itself more cheaply than `JS_GetProperty` does
+from outside. It is in C because this layer is being consolidated there and
+it is the last piece of `node_compat.js` carrying real logic rather than
+glue, and it is now checked against Node's own answers for 130 pairs, which
+the JavaScript never was. Both facts belong in the same sentence. The work in
+all three had already shrunk to the JavaScript-to-C boundary itself. That is
+the shape of what is left everywhere else in this file.
 
 Still JavaScript, with the reason measured rather than asserted:
 
