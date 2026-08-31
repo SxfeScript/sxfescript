@@ -259,7 +259,7 @@ leaves off.
 
 `util.promisify` is native too. It spread the arguments, built a Promise
 around an executor closure and then a callback closure inside that, per call:
-0.62 microseconds to 0.44, against Node's 0.08. Two behaviours changed to
+0.62 microseconds to 0.29, against Node's 0.08. Two behaviours changed to
 match Node rather than what was here: a callback reporting more than one
 value resolves with the first, not with an array of them, and a function that
 throws synchronously produces a rejection rather than throwing out of the
@@ -304,7 +304,7 @@ does not have to re-derive it:
 | `url.fileURLToPath` | 0.130 us | C, was 0.475 |
 | `module.isBuiltin` | 0.045 us | C, was 0.415 |
 | `util.inspect` of an object | 2.26 us | C, was 5.26; Node is 1.56 |
-| a promisified call | 0.44 us | C, was 0.62; Node is 0.08 |
+| a promisified call | 0.29 us | C, was 0.62; Node is 0.08 |
 | `process.nextTick` | 0.143 us | C, was 0.620 |
 | `res.getHeaders` | 0.110 us | C, was 0.173 |
 | `res.getHeaderNames` | 0.110 us | C, was 0.157 |
