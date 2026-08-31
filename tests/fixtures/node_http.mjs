@@ -6,7 +6,18 @@ const check = (n, got, want) => { const ok = JSON.stringify(got) === JSON.string
 
 const server = http.createServer((req, res) => {
   const url = req.url;
-  if (url === "/body-shapes") {
+  if (url === "/socket") {
+    // The socket a request carries: the fields on-finished and finalhandler
+    // read, the setters they chain off, and destroy() emitting 'close'.
+    const sock = req.socket;
+    const before = { readable: sock.readable, writable: sock.writable, destroyed: sock.destroyed,
+                     addr: typeof sock.remoteAddress, sameAsConnection: req.connection === sock,
+                     chains: sock.setNoDelay(true) === sock && sock.setKeepAlive(true) === sock &&
+                             sock.setTimeout(0) === sock };
+    // destroy() is not exercised here: under Node it really does close the
+    // connection, and this response still has to reach the client.
+    res.end(JSON.stringify(before));
+  } else if (url === "/body-shapes") {
     // How the written chunks are joined into one body: one string, several
     // strings, bytes only, and a mix of the two.
     if (req.headers["x-shape"] === "multi") { res.write("a"); res.write("b"); res.end("c"); }
@@ -105,6 +116,10 @@ check("404", [nf.status, await nf.text()], [404, "not found"]);
 const lb = await (await fetch(base + "/late-body", { method: "POST", body: "deferred" })).json();
 check("body survives a late listener", lb,
       { complete: false, sockReadable: true, body: "deferred", doneAfter: true });
+
+check("socket", await (await fetch(base + "/socket")).json(),
+      { readable: true, writable: true, destroyed: false, addr: "string",
+        sameAsConnection: true, chains: true });
 
 for (const [shape, want] of [["one", "one"], ["multi", "abc"], ["mixed", "aBC"], ["bytes", "AB"], ["empty", ""]])
   check("body " + shape, await (await fetch(base + "/body-shapes", { headers: { "x-shape": shape } })).text(), want);

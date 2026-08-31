@@ -11,23 +11,16 @@
   // replacing node_compat.js with native C. Listener storage is still the
   // plain `this._events` object with Node's function-for-one-listener and
   // array-for-many representation; the native side reads and writes it
-  // directly. `once` stays JS: its self-removing wrapper has no natural
-  // native shape (it needs to reference itself to call `self.off(type,
-  // wrapped)`), and it's not a hot path the way emit() is.
+  // directly. `once` went native too (js_ee_once): the self-removing wrapper
+  // does have a native shape after all -- a C function carrying the emitter,
+  // the name and the listener, and one holder object it reads itself back
+  // out of. 0.55 microseconds per once-and-emit became 0.44.
   function EventEmitter() {
     this._events = Object.create(null);
   }
   EventEmitter.prototype.on = __sxnEeOn;
   EventEmitter.prototype.addListener = __sxnEeOn;
-  EventEmitter.prototype.once = function (type, listener) {
-    var self = this;
-    function wrapped() {
-      self.off(type, wrapped);
-      listener.apply(this, arguments);
-    }
-    wrapped._original = listener;
-    return this.on(type, wrapped);
-  };
+  EventEmitter.prototype.once = __sxnEeOnce;
   EventEmitter.prototype.off = __sxnEeOff;
   EventEmitter.prototype.removeListener = __sxnEeOff;
   EventEmitter.prototype.removeAllListeners = __sxnEeRemoveAllListeners;
@@ -79,6 +72,7 @@
   EventEmitter.defaultMaxListeners = 10;
   globalThis.__sxnEventEmitter = EventEmitter;
   delete globalThis.__sxnEeOn;
+  delete globalThis.__sxnEeOnce;
   delete globalThis.__sxnEeOff;
   delete globalThis.__sxnEeEmit;
   delete globalThis.__sxnEeListenerCount;
@@ -929,15 +923,10 @@
     // have to describe a request whose body has not been read yet. The socket
     // is a real emitter because on-finished subscribes to its 'error' and
     // 'close', and a plain object had no on() for it to call.
-    this.socket = Object.assign(new EE(), {
-      remoteAddress: "127.0.0.1", remotePort: 0, localAddress: "127.0.0.1",
-      encrypted: false, readable: true, writable: true, destroyed: false,
-      setTimeout() { return this; }, setNoDelay() { return this; },
-      setKeepAlive() { return this; },
-      destroy() { this.destroyed = true; this.readable = this.writable = false;
-                  this.emit("close"); return this; },
-      end() { return this.destroy(); },
-    });
+    // Native (js_http_socket in src/node.c): the shape is the same every
+    // request, so the prototype is built once rather than eleven properties
+    // being copied onto a fresh emitter each time.
+    this.socket = __sxnHttpSocket();
     this.connection = this.socket;
     this.complete = false;
     this.once("end", () => { this.complete = true; });

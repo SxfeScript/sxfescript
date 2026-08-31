@@ -165,6 +165,18 @@ chunks from 0.74 to 0.17. A mix of strings and bytes is handed back to the
 JavaScript, because concatenating strings is the engine's own job and C would
 have to re-encode them to do it.
 
+Object construction turned out to move as well, which the earlier note here
+that C "would pay more at the boundary than it saves" got wrong for two
+cases. `EventEmitter#once` allocated a closure that had to name itself in
+order to remove itself; as a C function carrying the emitter, the name and
+the listener, a once-and-emit went from 0.55 microseconds to 0.44. The socket
+hung off every `node:http` request was eleven properties copied onto a fresh
+emitter per request; the shape never varies, so the prototype is built once
+and each request gets an object pointing at it -- 0.96 microseconds to 0.085,
+another sixth of the layer's cost. The rule is not "objects stay in
+JavaScript": it is that C wins wherever the work is repeated setup and loses
+wherever it is a call back into the engine per step.
+
 Still JavaScript, with the reason measured rather than asserted:
 
 - **`stream` and `http`.** A `node:http` request costs 13.4 us here against

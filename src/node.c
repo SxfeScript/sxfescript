@@ -2820,6 +2820,101 @@ static JSValue js_join_chunks(JSContext *ctx, JSValueConst this_val, int argc, J
     return body;
 }
 
+
+/* EventEmitter#once. The JavaScript version allocated a closure that had to
+   name itself in order to remove itself; here the wrapper is a C function
+   carrying the emitter, the event name and the listener, plus one small
+   holder that is given the wrapper once it exists. */
+static JSValue sxn_once_fire(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValue *data) {
+    (void)magic;
+    JSValue wrapper = JS_GetPropertyStr(ctx, data[3], "w");
+    JSValue off = JS_GetPropertyStr(ctx, data[0], "off");
+    JSValueConst off_args[2] = { data[1], wrapper };
+    JS_FreeValue(ctx, JS_Call(ctx, off, data[0], 2, off_args));
+    JS_FreeValue(ctx, off);
+    JS_FreeValue(ctx, wrapper);
+    return JS_Call(ctx, data[2], this_val, argc, argv);
+}
+
+static JSValue js_ee_once(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 2 || !JS_IsFunction(ctx, argv[1]))
+        return JS_ThrowTypeError(ctx, "once expects an event name and a listener");
+    JSValue holder = JS_NewObjectProto(ctx, JS_NULL);
+    if (JS_IsException(holder)) return holder;
+    JSValue data[4] = { JS_DupValue(ctx, this_val), JS_DupValue(ctx, argv[0]),
+                        JS_DupValue(ctx, argv[1]), holder };
+    JSValue wrapper = JS_NewCFunctionData(ctx, sxn_once_fire, 0, 0, 4, data);
+    for (int i = 0; i < 4; i++) JS_FreeValue(ctx, data[i]);
+    if (JS_IsException(wrapper)) return wrapper;
+    JS_SetPropertyStr(ctx, holder, "w", JS_DupValue(ctx, wrapper));
+    /* Node exposes the original listener here, and removeListener(original)
+       finds the wrapper through it. */
+    JS_SetPropertyStr(ctx, wrapper, "_original", JS_DupValue(ctx, argv[1]));
+    JSValue on = JS_GetPropertyStr(ctx, this_val, "on");
+    JSValueConst on_args[2] = { argv[0], wrapper };
+    JSValue result = JS_Call(ctx, on, this_val, 2, on_args);
+    JS_FreeValue(ctx, on);
+    JS_FreeValue(ctx, wrapper);
+    return result;
+}
+
+
+/* Every node:http request carries a socket, and building it in JavaScript
+   meant a fresh EventEmitter plus eleven properties -- three of them
+   functions -- per request. The shape is the same every time, so the
+   prototype is built once here and each request gets an object pointing at
+   it. */
+static JSValue sxn_socket_self(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)ctx; (void)argc; (void)argv;
+    return JS_DupValue(ctx, this_val);
+}
+
+static JSValue sxn_socket_destroy(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)argc; (void)argv;
+    JS_SetPropertyStr(ctx, this_val, "destroyed", JS_TRUE);
+    JS_SetPropertyStr(ctx, this_val, "readable", JS_FALSE);
+    JS_SetPropertyStr(ctx, this_val, "writable", JS_FALSE);
+    JSValue emit = JS_GetPropertyStr(ctx, this_val, "emit");
+    JSValue name = JS_NewString(ctx, "close");
+    JSValueConst args[1] = { name };
+    JS_FreeValue(ctx, JS_Call(ctx, emit, this_val, 1, args));
+    JS_FreeValue(ctx, name);
+    JS_FreeValue(ctx, emit);
+    return JS_DupValue(ctx, this_val);
+}
+
+static JSValue js_http_socket(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue proto = JS_GetPropertyStr(ctx, global, "__sxnSocketProto");
+    if (JS_IsUndefined(proto)) {
+        JSValue ee = JS_GetPropertyStr(ctx, global, "__sxnEventEmitter");
+        JSValue ee_proto = JS_GetPropertyStr(ctx, ee, "prototype");
+        JS_FreeValue(ctx, ee);
+        proto = JS_NewObjectProto(ctx, ee_proto);
+        JS_FreeValue(ctx, ee_proto);
+        JS_SetPropertyStr(ctx, proto, "remoteAddress", JS_NewString(ctx, "127.0.0.1"));
+        JS_SetPropertyStr(ctx, proto, "remotePort", JS_NewInt32(ctx, 0));
+        JS_SetPropertyStr(ctx, proto, "localAddress", JS_NewString(ctx, "127.0.0.1"));
+        JS_SetPropertyStr(ctx, proto, "encrypted", JS_FALSE);
+        JS_SetPropertyStr(ctx, proto, "readable", JS_TRUE);
+        JS_SetPropertyStr(ctx, proto, "writable", JS_TRUE);
+        JS_SetPropertyStr(ctx, proto, "destroyed", JS_FALSE);
+        JS_SetPropertyStr(ctx, proto, "setTimeout", JS_NewCFunction(ctx, sxn_socket_self, "setTimeout", 0));
+        JS_SetPropertyStr(ctx, proto, "setNoDelay", JS_NewCFunction(ctx, sxn_socket_self, "setNoDelay", 0));
+        JS_SetPropertyStr(ctx, proto, "setKeepAlive", JS_NewCFunction(ctx, sxn_socket_self, "setKeepAlive", 0));
+        JS_SetPropertyStr(ctx, proto, "destroy", JS_NewCFunction(ctx, sxn_socket_destroy, "destroy", 0));
+        JS_SetPropertyStr(ctx, proto, "end", JS_NewCFunction(ctx, sxn_socket_destroy, "end", 0));
+        JS_SetPropertyStr(ctx, global, "__sxnSocketProto", JS_DupValue(ctx, proto));
+    }
+    JSValue socket = JS_NewObjectProto(ctx, proto);
+    JS_FreeValue(ctx, proto);
+    JS_FreeValue(ctx, global);
+    if (JS_IsException(socket)) return socket;
+    JS_SetPropertyStr(ctx, socket, "_events", JS_NewObjectProto(ctx, JS_NULL));
+    return socket;
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -3300,6 +3395,8 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnHttpSocket", JS_NewCFunction(ctx, js_http_socket, "__sxnHttpSocket", 0));
+    JS_SetPropertyStr(ctx, global, "__sxnEeOnce", JS_NewCFunction(ctx, js_ee_once, "once", 2));
     JS_SetPropertyStr(ctx, global, "__sxnJoinChunks", JS_NewCFunction(ctx, js_join_chunks, "__sxnJoinChunks", 1));
     JS_SetPropertyStr(ctx, global, "__sxnHttpHeaders", JS_NewCFunction(ctx, js_http_headers, "__sxnHttpHeaders", 1));
     JS_SetPropertyStr(ctx, global, "__sxnBuiltinRequire", JS_NewCFunction(ctx, js_builtin_require, "__sxnBuiltinRequire", 1));
