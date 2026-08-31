@@ -63,10 +63,19 @@ the shape the native layer speaks and `node:http` is built on directly.
 Response headers are emitted in declaration order; an array value repeats the
 header (the multi-`Set-Cookie` case), and `Content-Length`/`Connection` are
 filtered since those describe the framing rather than the payload the handler
-wrote. The returned handle reports `port`, `url`, and a `stop()` that lets a
-process serve and then do something else, rather than block forever the way a
-bare listener would; `stop()` closes the connections still open as well as
-the listener. Connections are kept alive by default, as HTTP/1.1 requires,
+wrote. `options` takes `port`, `hostname` (or `host`, Node's name for it; loopback
+by default, `"0.0.0.0"` to accept from the network, an IPv6 literal or
+`"localhost"` also work), and `reusePort`. With `reusePort: true` several
+processes bind the same port and the kernel spreads connections across them,
+which is how one program uses more than one core here -- there are no threads
+and no cluster module. The kernels that distribute this way are Linux, the
+BSDs, Solaris and AIX; on macOS the call fails with a message saying so
+rather than quietly giving the last process every connection.
+
+The returned handle reports `port`, `hostname`, `url`, and a `stop()` that
+lets a process serve and then do something else, rather than block forever
+the way a bare listener would; `stop()` closes the connections still open as
+well as the listener. Connections are kept alive by default, as HTTP/1.1 requires,
 and a request pipelined behind another is answered without waiting for a
 further read. A request larger than 64MB is refused rather than buffered.
 

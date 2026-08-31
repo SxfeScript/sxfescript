@@ -734,27 +734,79 @@ static JSValue js_serve(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     if (argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_ThrowTypeError(ctx, "serve(options, handler) requires a handler");
     JSValue port_value = JS_GetPropertyStr(ctx, argv[0], "port"); JS_ToInt32(ctx, &port, port_value); JS_FreeValue(ctx, port_value);
 
+    /* The address to bind. Loopback by default -- a server nobody asked to
+       expose should not be reachable from the network -- but a real
+       deployment needs 0.0.0.0, and until this was read the option was
+       accepted and ignored. `host` is Node's name for it, `hostname` is
+       Bun's and Deno's; both work. */
+    char host[256] = "127.0.0.1";
+    {
+        JSValue h = JS_GetPropertyStr(ctx, argv[0], "hostname");
+        if (JS_IsUndefined(h)) {
+            JS_FreeValue(ctx, h);
+            h = JS_GetPropertyStr(ctx, argv[0], "host");
+        }
+        if (!JS_IsUndefined(h) && !JS_IsNull(h)) {
+            const char *str = JS_ToCString(ctx, h);
+            if (str) {
+                snprintf(host, sizeof(host), "%s", str);
+                JS_FreeCString(ctx, str);
+            }
+        }
+        JS_FreeValue(ctx, h);
+    }
+    /* SO_REUSEPORT: several processes bind the same port and the kernel
+       spreads incoming connections across them. This runtime has no threads
+       and no cluster module, so running N copies of a server is the way to
+       use N cores, and this is what makes that possible. Linux, the BSDs,
+       Solaris and AIX only -- macOS's SO_REUSEPORT does not distribute, and
+       libuv reports ENOTSUP there rather than silently giving the last
+       binder everything. */
+    bool reuse_port = false;
+    {
+        JSValue r = JS_GetPropertyStr(ctx, argv[0], "reusePort");
+        reuse_port = JS_ToBool(ctx, r);
+        JS_FreeValue(ctx, r);
+    }
+
     ServeState *serve = calloc(1, sizeof(*serve)); serve->ctx = ctx; serve->handler = JS_DupValue(ctx, argv[1]);
     uv_tcp_t *server = malloc(sizeof(*server));
     uv_tcp_init(sxn_loop(), server); server->data = serve;
-    struct sockaddr_in address; uv_ip4_addr("127.0.0.1", port, &address);
-    int rc = uv_tcp_bind(server, (const struct sockaddr *)&address, 0);
+    struct sockaddr_storage address;
+    unsigned int bind_flags = reuse_port ? UV_TCP_REUSEPORT : 0;
+    int rc;
+    /* The one name worth resolving without a DNS lookup, and the one people
+       actually write. */
+    if (!strcmp(host, "localhost"))
+        snprintf(host, sizeof(host), "127.0.0.1");
+    if (uv_ip4_addr(host, port, (struct sockaddr_in *)&address) == 0)
+        rc = 0;
+    else if (uv_ip6_addr(host, port, (struct sockaddr_in6 *)&address) == 0)
+        rc = 0;
+    else {
+        free(server); JS_FreeValue(ctx, serve->handler); free(serve);
+        return JS_ThrowTypeError(ctx, "serve: '%s' is not an IP address to bind", host);
+    }
+    rc = uv_tcp_bind(server, (const struct sockaddr *)&address, bind_flags);
     /* 511, the same backlog Node uses: at 64 a burst of concurrent clients got
        connection-refused rather than queued. */
     if (rc == 0) rc = uv_listen((uv_stream_t *)server, 511, on_connection_cb);
     if (rc != 0) {
         free(server); JS_FreeValue(ctx, serve->handler); free(serve);
-        return JS_ThrowInternalError(ctx, "listen on %d: %s", port, uv_strerror(rc));
+        if (reuse_port && rc == UV_ENOTSUP)
+            return JS_ThrowInternalError(ctx, "listen on %s:%d: reusePort is not supported on this platform", host, port);
+        return JS_ThrowInternalError(ctx, "listen on %s:%d: %s", host, port, uv_strerror(rc));
     }
     /* `port: 0` asks the OS to choose a free port, which is the only way to
        write a test or an example that can't collide with whatever else is
        already listening. Read back what it chose: reporting the requested 0
        left `handle.port` and `handle.url` naming a port nothing can connect
        to, so the documented `Sxn.serve({ port: 0 }, ...)` was unusable. */
-    struct sockaddr_in bound;
+    struct sockaddr_storage bound;
     int bound_len = (int)sizeof(bound);
     if (uv_tcp_getsockname(server, (struct sockaddr *)&bound, &bound_len) == 0)
-        port = ntohs(bound.sin_port);
+        port = ntohs(bound.ss_family == AF_INET6 ? ((struct sockaddr_in6 *)&bound)->sin6_port
+                                                 : ((struct sockaddr_in *)&bound)->sin_port);
 
     /* Hand back a handle: without one a server can never be stopped, which
        makes it impossible to run a server and anything else in one process. */
@@ -765,9 +817,11 @@ static JSValue js_serve(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     JS_SetPropertyStr(ctx, handle, "stop",
                       JS_NewCFunctionData(ctx, js_serve_stop, 0, 0, 1, data));
     JS_SetPropertyStr(ctx, handle, "port", JS_NewInt32(ctx, port));
+    JS_SetPropertyStr(ctx, handle, "hostname", JS_NewString(ctx, host));
     {
-        char u[64];
-        snprintf(u, sizeof(u), "http://127.0.0.1:%d", port);
+        /* A bare IPv6 address needs brackets in a URL. */
+        char u[320];
+        snprintf(u, sizeof(u), strchr(host, ':') ? "http://[%s]:%d" : "http://%s:%d", host, port);
         JS_SetPropertyStr(ctx, handle, "url", JS_NewString(ctx, u));
     }
     return handle;
