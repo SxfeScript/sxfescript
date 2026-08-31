@@ -400,6 +400,10 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # process per core.
   add_test(NAME sxn-serve-bind COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_bind.mjs)
   set_tests_properties(sxn-serve-bind PROPERTIES TIMEOUT 60 FAIL_REGULAR_EXPRESSION "FAIL")
+  # A served request's headers are built on first read; they still have to
+  # behave as if they had been built up front.
+  add_test(NAME sxn-serve-lazy-headers COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_lazy_headers.mjs)
+  set_tests_properties(sxn-serve-lazy-headers PROPERTIES TIMEOUT 60 FAIL_REGULAR_EXPRESSION "FAIL")
   # JSON.parse/JSON.stringify at the edges of their fast paths: escapes,
   # surrogates, non-ASCII, control characters and every number form. The
   # expectations are Node's own output, so a divergence fails.

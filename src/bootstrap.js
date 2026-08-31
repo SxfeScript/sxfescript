@@ -1626,11 +1626,28 @@
       } else {
         href = new URL(path, "http://" + origin).href;
       }
-      var init = { method: raw.method || "GET", headers: raw.headers || {} };
+      var init = { method: raw.method || "GET" };
       // A GET/HEAD request may not carry a body, and the native layer sends
       // "" rather than nothing when there is none.
       if (raw.body !== undefined && raw.body !== null && raw.body !== "") init.body = raw.body;
-      return new Request(href, init);
+      var request = new Request(href, init);
+      // The headers are built on first read. Copying every header into a
+      // Headers list costs about a microsecond a request, and a handler that
+      // only routes on the method and the path never looks at them.
+      var rawHeaders = raw.headers || {};
+      function settle(value) {
+        Object.defineProperty(request, "headers", {
+          value: value, writable: true, enumerable: true, configurable: true,
+        });
+        return value;
+      }
+      Object.defineProperty(request, "headers", {
+        enumerable: true,
+        configurable: true,
+        get: function () { return settle(new Headers(rawHeaders)); },
+        set: settle,
+      });
+      return request;
     }
 
     function toNative(result) {
