@@ -88,6 +88,8 @@ runtime fails the fixture:
   high surrogate half masks down to `=`.
 - `Buffer.byteLength`, `compare`, `equals`, `concat`, `toJSON` (Node's
   `{type:"Buffer",data:[...]}` shape).
+- The numeric accessors — `readUInt32BE`, `writeFloatLE`, `readBigInt64LE`
+  and the rest of the forty — plus `copy`, `Buffer.compare`, `isEncoding`.
 
 ## Encoding-name and Buffer performance
 
@@ -97,3 +99,30 @@ site is recognized by pointer identity against the atom table rather than by
 hashing and comparing, and `Buffer.byteLength` computes the UTF-8 byte count
 directly rather than encoding the string to measure it. Both are covered in
 more depth, with numbers, in the README's benchmark section.
+
+## What is C and what is JavaScript
+
+This layer started as one JavaScript file and has been moving into C a piece
+at a time. What has gone over is what C is actually better at: byte and
+string work with no JavaScript state of its own.
+
+Native now: `path` in both halves, `querystring`, `net.isIP`, `os` in full
+(from libuv), `fs`'s `stat`/`lstat` and the read primitives, `crypto`'s
+digests, HMAC and `timingSafeEqual`, `zlib`'s deflate and inflate, Buffer's
+encodings and numeric accessors, and `EventEmitter`'s `on`/`emit` fast path.
+
+Still JavaScript, and staying there for a reason:
+
+- **`stream` and `http`** are state machines over callbacks and promises.
+  Their work is bookkeeping between JavaScript objects, which C would have to
+  do through the same API at more cost, not less.
+- **`util.inspect` and `assert.deepStrictEqual`** walk arbitrary JavaScript
+  values. Every step would be a `JS_*` call; the C would be longer and no
+  faster.
+- **Buffer's lenient hex and base64 readers** are defined over UTF-16 code
+  units — Node reads a string one code unit at a time and masks it, which is
+  why an emoji ends a base64 string. A C function receives UTF-8 and cannot
+  see that.
+- **Thin wrappers** — `zlib`'s callback and promise forms, `fs`'s encoding
+  branch, `process`, `os`'s method objects — are three lines each around a
+  native call, and moving them would add C without removing work.
