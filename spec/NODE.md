@@ -347,6 +347,23 @@ does not have to re-derive it:
 | `url.pathToFileURL` | 0.92 us | C text, was 1.30; `new URL` is 0.885 of what is left |
 | `createRequire` | 1.00 us | already C |
 
+And the last sweep, over what the section table above still calls
+JavaScript, so that nothing is left merely assumed:
+
+| Piece | Cost here | Why it stays |
+| --- | --- | --- |
+| `util.types.isDate` | 0.050 us | one `instanceof` |
+| `net.isIP`, `isIPv4` | 0.050 us | the wrapper around a native call |
+| `url.format` | 0.040 us | `String(url)` |
+| `readable.unpipe` | 0.700 us | Node's is 0.220; it is `off` three times, and `off` is C |
+| `url.parse` | 0.900 us | the engine's `new URL` in a try |
+| `createRequire` | 0.900 us | already native underneath |
+| `zlib.gzipSync` of 240 bytes | 2.65 us | zlib itself |
+| iterating a buffered stream | 0.380 us | a promise and a result object per item, which is the protocol |
+| `new Readable` / `new Writable` | 0.500 / 0.360 us | field stores, measured slower from C |
+| `res.writeHead` | 0.330 us | `setHeader` in a loop, and that is C |
+| `Buffer.from` an array | 0.375 us | from C it measured 1.185 |
+
 Nothing in that list is a JavaScript loop any more. What remains in the file
 around them is dispatch: argument shuffling, a check, and a call into
 something that is already native.
