@@ -115,11 +115,18 @@ Native now: `path` in both halves, `querystring`, `net.isIP`, `os` in full
 digests, HMAC and `timingSafeEqual`, `zlib`'s deflate and inflate, Buffer's
 encodings and numeric accessors, and `EventEmitter`'s `on`/`emit` fast path.
 
-Still JavaScript, and staying there for a reason:
+Still JavaScript, with the reason measured rather than asserted:
 
-- **`stream` and `http`** are state machines over callbacks and promises.
-  Their work is bookkeeping between JavaScript objects, which C would have to
-  do through the same API at more cost, not less.
+- **`stream` and `http`.** A `node:http` request costs 13.4 us here against
+  `Sxn.serve`'s 7.8 for the same reply, so the layer is 5.6 us of JavaScript
+  -- worth attacking, if C could take it. It cannot: 0.9 us of that is
+  constructing the Readable and the Writable, which are the API, not an
+  implementation detail a handler cannot see; the rest is property writes and
+  listener bookkeeping on those same objects, which C would perform through
+  `JS_SetProperty` at more cost than the interpreter's own store. The gap is
+  visible in the constructors themselves -- `new Readable` is 0.50 us here
+  and 0.036 in Node -- and that is the no-JIT tradeoff this runtime has
+  chosen, not something moving the file to C would change.
 - **`util.inspect` and `assert.deepStrictEqual`** walk arbitrary JavaScript
   values. Every step would be a `JS_*` call; the C would be longer and no
   faster.
