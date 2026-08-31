@@ -54447,6 +54447,9 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
     int64_t i, len;
     int cl, ret;
     bool has_content;
+    /* With no gap both separators are the empty string, and every one of
+       these is a call that copies nothing. */
+    bool indented = !JS_IsEmptyString(jsc->gap);
 
     indent1 = JS_UNDEFINED;
     sep = JS_UNDEFINED;
@@ -54518,7 +54521,8 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
             for(i = 0; i < len; i++) {
                 if (i > 0)
                     string_buffer_putc8_fast(jsc->b, ',');
-                string_buffer_concat_value(jsc->b, sep);
+                if (indented)
+                    string_buffer_concat_value(jsc->b, sep);
                 v = JS_GetPropertyInt64(ctx, val, i);
                 if (JS_IsException(v))
                     goto exception;
@@ -54631,13 +54635,16 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                 if (!JS_IsUndefined(v)) {
                     if (has_content)
                         string_buffer_putc8_fast(jsc->b, ',');
+                    if (indented)
+                        if (indented)
                     string_buffer_concat_value(jsc->b, sep);
                     if (string_buffer_quote(jsc->b, prop)) {
                         JS_FreeValue(ctx, v);
                         goto exception;
                     }
                     string_buffer_putc8_fast(jsc->b, ':');
-                    string_buffer_concat_value(jsc->b, sep1);
+                    if (indented)
+                        string_buffer_concat_value(jsc->b, sep1);
                     if (js_json_to_str(ctx, jsc, val, v, indent1))
                         goto exception;
                     has_content = true;
