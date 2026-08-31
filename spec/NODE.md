@@ -187,6 +187,12 @@ microseconds a request against 0.010 for the two fields that replaced them.
 that is a scan over a short string rather than a call back into the engine
 per step: 0.17 microseconds a call became 0.058.
 
+A second was tried and thrown away for a better reason than speed. A stream
+pushing a `Uint8Array` wraps it in a Buffer over the same bytes, which costs
+0.24 microseconds a chunk; giving the array Buffer's prototype in place costs
+0.11. But the array belongs to whoever pushed it, and changing its prototype
+changes what their own object is. The faster answer was the wrong one.
+
 One move was tried and thrown away, which is worth writing down because the
 number is the only thing that settles it. A `Readable`'s constructor sets ten
 own fields; done from C instead, the same ten stores cost 0.40 microseconds
