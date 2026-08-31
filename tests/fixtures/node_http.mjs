@@ -36,7 +36,15 @@ const server = http.createServer((req, res) => {
     }, 0);
   } else if (url === "/json") {
     res.writeHead(201, { "content-type": "application/json", "x-a": "1" });
-    res.end(JSON.stringify({ method: req.method, ua: !!req.headers["user-agent"] }));
+    // Header names arrive lowercased whatever the client sent, and
+    // rawHeaders is the same list flattened into name, value pairs.
+    // Node keeps the original spelling in rawHeaders, so the pairs are
+    // matched against req.headers case-insensitively.
+    let rawOk = req.rawHeaders.length === Object.keys(req.headers).length * 2;
+    for (let i = 0; rawOk && i < req.rawHeaders.length; i += 2)
+      rawOk = req.headers[req.rawHeaders[i].toLowerCase()] === req.rawHeaders[i + 1];
+    res.end(JSON.stringify({ method: req.method, ua: !!req.headers["user-agent"],
+                             xcase: req.headers["x-mixed-case"], rawOk }));
   } else if (url === "/chunks") {
     res.setHeader("content-type", "text/plain");
     res.write("one ");
@@ -66,11 +74,11 @@ await once(server, "listening");
 check("address port", server.address().port, 8961);
 
 const base = "http://127.0.0.1:8961";
-const j = await fetch(base + "/json");
+const j = await fetch(base + "/json", { headers: { "X-Mixed-Case": "kept" } });
 check("status", j.status, 201);
 check("content-type", j.headers.get("content-type"), "application/json");
 check("custom header", j.headers.get("x-a"), "1");
-check("json body", await j.json(), { method: "GET", ua: true });
+check("json body", await j.json(), { method: "GET", ua: true, xcase: "kept", rawOk: true });
 
 const c = await fetch(base + "/chunks");
 check("multiple writes", await c.text(), "one two");

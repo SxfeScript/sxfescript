@@ -918,12 +918,12 @@
     Readable.call(this, {});
     this.method = raw.method || "GET";
     this.url = raw.url || "/";
-    this.headers = {};
-    for (const k of Object.keys(raw.headers || {}))
-      this.headers[k.toLowerCase()] = raw.headers[k];
+    // Native (js_http_headers in src/node.c): lowercase every name and
+    // flatten into rawHeaders in one pass, once per request.
+    const named = __sxnHttpHeaders(raw.headers);
+    this.headers = named.headers;
     this.httpVersion = "1.1";
-    this.rawHeaders = [];
-    for (const k of Object.keys(this.headers)) this.rawHeaders.push(k, this.headers[k]);
+    this.rawHeaders = named.rawHeaders;
     // on-finished reads socket.readable and `complete` to decide whether a
     // request is spent; body-parser skips parsing when it says yes, so both
     // have to describe a request whose body has not been read yet. The socket

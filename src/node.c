@@ -2722,6 +2722,62 @@ static JSValue js_is_builtin(JSContext *ctx, JSValueConst this_val, int argc, JS
     return JS_NewBool(ctx, known);
 }
 
+
+/* node:http lowercases every request header name and then flattens the
+   result into rawHeaders, once per request. Both walks happen here in one
+   pass over the property names. */
+static JSValue js_http_headers(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    JSValue headers = JS_NewObject(ctx);
+    JSValue raw = JS_NewArray(ctx);
+    if (JS_IsException(headers) || JS_IsException(raw)) goto fail;
+    if (argc > 0 && JS_IsObject(argv[0])) {
+        JSPropertyEnum *keys = NULL;
+        uint32_t count = 0;
+        if (JS_GetOwnPropertyNames(ctx, &keys, &count, argv[0], JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY))
+            goto fail;
+        uint32_t written = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            JSValue value = JS_GetProperty(ctx, argv[0], keys[i].atom);
+            const char *name = JS_AtomToCString(ctx, keys[i].atom);
+            if (JS_IsException(value) || !name) {
+                JS_FreeValue(ctx, value);
+                if (name) JS_FreeCString(ctx, name);
+                JS_FreePropertyEnum(ctx, keys, count);
+                goto fail;
+            }
+            size_t len = strlen(name);
+            char stack[64];
+            char *lower = len < sizeof stack ? stack : js_malloc(ctx, len + 1);
+            if (!lower) {
+                JS_FreeValue(ctx, value);
+                JS_FreeCString(ctx, name);
+                JS_FreePropertyEnum(ctx, keys, count);
+                goto fail;
+            }
+            for (size_t j = 0; j < len; j++) {
+                char c = name[j];
+                lower[j] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+            }
+            lower[len] = '\0';
+            JS_SetPropertyStr(ctx, headers, lower, JS_DupValue(ctx, value));
+            JS_SetPropertyUint32(ctx, raw, written++, JS_NewStringLen(ctx, lower, len));
+            JS_SetPropertyUint32(ctx, raw, written++, value);
+            if (lower != stack) js_free(ctx, lower);
+            JS_FreeCString(ctx, name);
+        }
+        JS_FreePropertyEnum(ctx, keys, count);
+    }
+    JSValue out = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, out, "headers", headers);
+    JS_SetPropertyStr(ctx, out, "rawHeaders", raw);
+    return out;
+ fail:
+    JS_FreeValue(ctx, headers);
+    JS_FreeValue(ctx, raw);
+    return JS_EXCEPTION;
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -3202,6 +3258,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnHttpHeaders", JS_NewCFunction(ctx, js_http_headers, "__sxnHttpHeaders", 1));
     JS_SetPropertyStr(ctx, global, "__sxnBuiltinRequire", JS_NewCFunction(ctx, js_builtin_require, "__sxnBuiltinRequire", 1));
     JS_SetPropertyStr(ctx, global, "__sxnIsBuiltin", JS_NewCFunction(ctx, js_is_builtin, "__sxnIsBuiltin", 1));
     JS_SetPropertyStr(ctx, global, "__sxnLatin1Bytes", JS_NewCFunctionMagic(ctx, js_buffer_encode_units, "__sxnLatin1Bytes", 1, JS_CFUNC_generic_magic, 0));
