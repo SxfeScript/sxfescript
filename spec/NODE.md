@@ -193,6 +193,12 @@ a fresh `Stats` with a `for-in` loop and added four Dates. The native call
 takes `Stats.prototype` now and fills the object once -- 3.30 microseconds a
 stat became 2.75.
 
+The same three-loop join -- total the lengths, allocate, copy each part in --
+existed four times over: `Buffer.concat`, `node:crypto`'s digest input,
+`node:zlib`'s stream flush and `res.end()`. There is one now, in C, one
+memcpy per part: `Buffer.concat` of three 512-byte parts went from 0.77
+microseconds to 0.36.
+
 The two lenient readers finally lost their JavaScript halves. Node's hex and
 base64 readers stop or skip rather than throwing, and they read a string a
 byte at a time, so a code unit above 0xff is truncated -- which is why an

@@ -3055,6 +3055,51 @@ static JSValue js_header_op(JSContext *ctx, JSValueConst this_val, int argc, JSV
 }
 
 
+
+/* Buffer.concat, and the same walk that node:crypto and node:zlib each had
+   a copy of: total the lengths, then copy each part in. Three JavaScript
+   loops became one memcpy per part. */
+static JSValue js_concat_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1 || !JS_IsArray(argv[0])) return JS_ThrowTypeError(ctx, "concat expects a list");
+    int64_t count = 0;
+    if (JS_GetLength(ctx, argv[0], &count)) return JS_EXCEPTION;
+    size_t total = 0;
+    for (int64_t i = 0; i < count; i++) {
+        JSValue part = JS_GetPropertyUint32(ctx, argv[0], (uint32_t)i);
+        size_t len = 0;
+        uint8_t *bytes = JS_GetUint8Array(ctx, &len, part);
+        JS_FreeValue(ctx, part);
+        if (!bytes) return JS_EXCEPTION;
+        total += len;
+    }
+    /* Node's second argument is the length to produce: short parts leave
+       zeroes behind them, long ones are cut off. An empty list is empty
+       whatever length was asked for, which is Node's own answer. */
+    if (count > 0 && argc > 1 && !JS_IsUndefined(argv[1])) {
+        uint32_t wanted = 0;
+        if (JS_ToUint32(ctx, &wanted, argv[1])) return JS_EXCEPTION;
+        total = wanted;
+    }
+    uint8_t *out = js_mallocz(ctx, total ? total : 1);
+    if (!out) return JS_EXCEPTION;
+    size_t at = 0;
+    for (int64_t i = 0; i < count && at < total; i++) {
+        JSValue part = JS_GetPropertyUint32(ctx, argv[0], (uint32_t)i);
+        size_t len = 0;
+        uint8_t *bytes = JS_GetUint8Array(ctx, &len, part);
+        if (bytes) {
+            if (len > total - at) len = total - at;
+            memcpy(out + at, bytes, len);
+            at += len;
+        }
+        JS_FreeValue(ctx, part);
+    }
+    JSValue result = JS_NewUint8ArrayCopy(ctx, out, total);
+    js_free(ctx, out);
+    return result;
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -3535,6 +3580,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnConcatBytes", JS_NewCFunction(ctx, js_concat_bytes, "__sxnConcatBytes", 2));
     JS_SetPropertyStr(ctx, global, "__sxnSetHeader", JS_NewCFunctionMagic(ctx, js_header_op, "setHeader", 2, JS_CFUNC_generic_magic, 0));
     JS_SetPropertyStr(ctx, global, "__sxnGetHeader", JS_NewCFunctionMagic(ctx, js_header_op, "getHeader", 1, JS_CFUNC_generic_magic, 1));
     JS_SetPropertyStr(ctx, global, "__sxnHasHeader", JS_NewCFunctionMagic(ctx, js_header_op, "hasHeader", 1, JS_CFUNC_generic_magic, 2));

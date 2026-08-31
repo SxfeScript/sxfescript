@@ -87,6 +87,12 @@ dec ascii 010203 "\u0001\u0002\u0003"
 dec binary 010203 "\u0001\u0002\u0003"
 dec utf16le 010203 "ȁ"
 dec ucs2 010203 "ȁ"
+concat abcdefghij
+concat short abcd
+concat long 20 6162636465666768696a00000000000000000000
+concat empty 0 
+concat is a Buffer true
+concat of views 010203
 lenient hex "4a4bÿ41" 4a4b
 lenient hex "zz" 
 lenient hex "4a🎉" 4a

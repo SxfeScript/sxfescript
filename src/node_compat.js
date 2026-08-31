@@ -204,19 +204,10 @@
     }
     equals(other) { return this.length === other.length && this.compare(other) === 0; }
 
+    // Native (js_concat_bytes in src/node.c): one memcpy per part rather
+    // than a length loop, a subarray per part and a set() per part.
     static concat(list, totalLength) {
-      if (totalLength === undefined) {
-        totalLength = 0;
-        for (var i = 0; i < list.length; i++) totalLength += list[i].length;
-      }
-      var out = new Buffer(totalLength);
-      var offset = 0;
-      for (var j = 0; j < list.length && offset < totalLength; j++) {
-        var chunk = list[j].subarray(0, Math.min(list[j].length, totalLength - offset));
-        out.set(chunk, offset);
-        offset += chunk.length;
-      }
-      return out;
+      return Object.setPrototypeOf(__sxnConcatBytes(list, totalLength), Buffer.prototype);
     }
   }
   // The numeric accessors -- readUInt32BE, writeFloatLE and the rest -- and
@@ -949,13 +940,10 @@
       const anyBinary = this._chunks.some((c) => c instanceof Uint8Array || c instanceof ArrayBuffer);
       if (!anyBinary) body = this._chunks.map((c) => String(c)).join("");
       else {
-      const parts = this._chunks.map((c) =>
+      body = __sxnConcatBytes(this._chunks.map((c) =>
         c instanceof Uint8Array ? c
         : c instanceof ArrayBuffer ? new Uint8Array(c)
-        : new TextEncoder().encode(String(c)));
-      let total = 0; for (const p of parts) total += p.length;
-      body = new Uint8Array(total);
-      let at = 0; for (const p of parts) { body.set(p, at); at += p.length; }
+        : new TextEncoder().encode(String(c))));
       }
     }
     this._settle({ statusCode: this.statusCode, headers: this._headers, body });
@@ -1095,12 +1083,7 @@
     if (encoding === "base64url") return bytes.toBase64({ alphabet: "base64url", omitPadding: true });
     throw new TypeError("unsupported digest encoding: " + encoding);
   };
-  const concatBytes = (parts) => {
-    let total = 0; for (const p of parts) total += p.length;
-    const out = new Uint8Array(total);
-    let at = 0; for (const p of parts) { out.set(p, at); at += p.length; }
-    return out;
-  };
+  const concatBytes = __sxnConcatBytes;
 
   function Hash(algorithm) {
     this._algo = String(algorithm).toLowerCase();
@@ -1239,10 +1222,7 @@
         transform(chunk, enc, cb) { parts.push(toBytes(chunk)); cb(); },
         flush(cb) {
           try {
-            let total = 0; for (const p of parts) total += p.length;
-            const joined = new Uint8Array(total);
-            let at = 0; for (const p of parts) { joined.set(p, at); at += p.length; }
-            cb(null, syncFn(joined, options));
+            cb(null, syncFn(__sxnConcatBytes(parts), options));
           } catch (e) { cb(e); }
         },
       }));
