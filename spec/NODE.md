@@ -157,6 +157,14 @@ went through `atob`. Both now go through Buffer's native readers, which were
 already there -- 4KB of hex input fell from 168 microseconds to 4.5 including
 the digest itself.
 
+`res.end()` joins what was written into one body, and that walked the chunk
+list three times -- once to ask whether any of it was binary, once to convert,
+once to join. In C the three shapes every real response actually is are
+answered directly: one string went from 0.41 microseconds to 0.02, two byte
+chunks from 0.74 to 0.17. A mix of strings and bytes is handed back to the
+JavaScript, because concatenating strings is the engine's own job and C would
+have to re-encode them to do it.
+
 Still JavaScript, with the reason measured rather than asserted:
 
 - **`stream` and `http`.** A `node:http` request costs 13.4 us here against

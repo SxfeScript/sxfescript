@@ -6,7 +6,15 @@ const check = (n, got, want) => { const ok = JSON.stringify(got) === JSON.string
 
 const server = http.createServer((req, res) => {
   const url = req.url;
-  if (url === "/plumbing") {
+  if (url === "/body-shapes") {
+    // How the written chunks are joined into one body: one string, several
+    // strings, bytes only, and a mix of the two.
+    if (req.headers["x-shape"] === "multi") { res.write("a"); res.write("b"); res.end("c"); }
+    else if (req.headers["x-shape"] === "mixed") { res.write("a"); res.end(new Uint8Array([66, 67])); }
+    else if (req.headers["x-shape"] === "bytes") { res.write(new Uint8Array([65])); res.end(new Uint8Array([66])); }
+    else if (req.headers["x-shape"] === "empty") res.end();
+    else res.end("one");
+  } else if (url === "/plumbing") {
     // The shapes finalhandler and on-finished reach for when they answer a
     // request nobody read: unpipe on a stream that was never piped, and a
     // socket they can subscribe to.
@@ -97,6 +105,9 @@ check("404", [nf.status, await nf.text()], [404, "not found"]);
 const lb = await (await fetch(base + "/late-body", { method: "POST", body: "deferred" })).json();
 check("body survives a late listener", lb,
       { complete: false, sockReadable: true, body: "deferred", doneAfter: true });
+
+for (const [shape, want] of [["one", "one"], ["multi", "abc"], ["mixed", "aBC"], ["bytes", "AB"], ["empty", ""]])
+  check("body " + shape, await (await fetch(base + "/body-shapes", { headers: { "x-shape": shape } })).text(), want);
 
 const pl = await (await fetch(base + "/plumbing")).json();
 check("request plumbing", pl,

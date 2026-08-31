@@ -2778,6 +2778,48 @@ static JSValue js_http_headers(JSContext *ctx, JSValueConst this_val, int argc, 
     return JS_EXCEPTION;
 }
 
+
+/* res.end() turns the chunks written to it into one body. The common cases
+   -- nothing written, one string, all bytes -- are answered here; a mix of
+   strings and bytes is handed back undefined for the JavaScript to join,
+   because concatenating strings is the engine's own job. */
+static JSValue js_join_chunks(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1 || !JS_IsArray(argv[0])) return JS_UNDEFINED;
+    int64_t count = 0;
+    if (JS_GetLength(ctx, argv[0], &count)) return JS_EXCEPTION;
+    if (count == 0) return JS_NewStringLen(ctx, "", 0);
+    if (count == 1) {
+        JSValue only = JS_GetPropertyUint32(ctx, argv[0], 0);
+        if (JS_IsString(only)) return only;
+        JS_FreeValue(ctx, only);
+    }
+    /* All bytes: total the lengths, then copy each one in. */
+    size_t total = 0;
+    for (int64_t i = 0; i < count; i++) {
+        JSValue chunk = JS_GetPropertyUint32(ctx, argv[0], (uint32_t)i);
+        size_t len = 0;
+        uint8_t *bytes = JS_GetUint8Array(ctx, &len, chunk);
+        JS_FreeValue(ctx, chunk);
+        if (!bytes) { JS_FreeValue(ctx, JS_GetException(ctx)); return JS_UNDEFINED; }
+        total += len;
+    }
+    uint8_t *out = js_malloc(ctx, total ? total : 1);
+    if (!out) return JS_EXCEPTION;
+    size_t at = 0;
+    for (int64_t i = 0; i < count; i++) {
+        JSValue chunk = JS_GetPropertyUint32(ctx, argv[0], (uint32_t)i);
+        size_t len = 0;
+        uint8_t *bytes = JS_GetUint8Array(ctx, &len, chunk);
+        if (bytes && len) memcpy(out + at, bytes, len);
+        at += len;
+        JS_FreeValue(ctx, chunk);
+    }
+    JSValue body = JS_NewUint8ArrayCopy(ctx, out, total);
+    js_free(ctx, out);
+    return body;
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -3258,6 +3300,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnJoinChunks", JS_NewCFunction(ctx, js_join_chunks, "__sxnJoinChunks", 1));
     JS_SetPropertyStr(ctx, global, "__sxnHttpHeaders", JS_NewCFunction(ctx, js_http_headers, "__sxnHttpHeaders", 1));
     JS_SetPropertyStr(ctx, global, "__sxnBuiltinRequire", JS_NewCFunction(ctx, js_builtin_require, "__sxnBuiltinRequire", 1));
     JS_SetPropertyStr(ctx, global, "__sxnIsBuiltin", JS_NewCFunction(ctx, js_is_builtin, "__sxnIsBuiltin", 1));

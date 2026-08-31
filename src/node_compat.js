@@ -1003,10 +1003,15 @@
     if (chunk !== undefined && chunk !== null) this._chunks.push(chunk);
     this.finished = true;
     this.headersSent = true;
-    // Concatenate once: text chunks join, binary chunks merge into one array.
-    let body;
-    const anyBinary = this._chunks.some((c) => c instanceof Uint8Array || c instanceof ArrayBuffer);
-    if (anyBinary) {
+    // Concatenate once. Native (js_join_chunks in src/node.c) answers the
+    // cases every real response is -- nothing written, one string, all bytes
+    // -- and hands back undefined for a mix, where joining strings is the
+    // engine's own job.
+    let body = __sxnJoinChunks(this._chunks);
+    if (body === undefined) {
+      const anyBinary = this._chunks.some((c) => c instanceof Uint8Array || c instanceof ArrayBuffer);
+      if (!anyBinary) body = this._chunks.map((c) => String(c)).join("");
+      else {
       const parts = this._chunks.map((c) =>
         c instanceof Uint8Array ? c
         : c instanceof ArrayBuffer ? new Uint8Array(c)
@@ -1014,8 +1019,7 @@
       let total = 0; for (const p of parts) total += p.length;
       body = new Uint8Array(total);
       let at = 0; for (const p of parts) { body.set(p, at); at += p.length; }
-    } else {
-      body = this._chunks.map((c) => String(c)).join("");
+      }
     }
     this._settle({ statusCode: this.statusCode, headers: this._headers, body });
     if (cb) queueMicrotask(cb);
