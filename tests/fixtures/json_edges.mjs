@@ -62,6 +62,37 @@ check("replacer", JSON.stringify({ a: 1, b: 2 }, ["a"]), '{"a":1}');
 check("indent", JSON.stringify({ a: 1 }, null, 2), '{\n  "a": 1\n}');
 check("toJSON gets the key", JSON.stringify({ k: { toJSON: (key) => key } }), '{"k":"k"}');
 
+// stringify caches what it learns about an object's shape; anything that
+// changes where a property lives has to invalidate that.
+check("toJSON on a shape seen before", JSON.stringify([{ a: 1 }, { a: 1, toJSON: () => "x" }]), '[{"a":1},"x"]');
+{
+  // A getter installs toJSON on Object.prototype after an object of the same
+  // shape has already been written; the ones after it must pick it up.
+  const doc = {
+    first: { a: 1 },
+    hook: { get a() { Object.prototype.toJSON = function () { return "late"; }; return 0; } },
+    second: { a: 2 },
+  };
+  const out = JSON.stringify(doc);
+  delete Object.prototype.toJSON;
+  check("toJSON installed mid-run", out, '{"first":{"a":1},"hook":{"a":0},"second":"late"}');
+}
+{
+  const seen = { a: { x: 1 }, b: { x: 2 } };
+  Object.prototype.toJSON = function () { return "P"; };
+  const out = JSON.stringify(seen);
+  delete Object.prototype.toJSON;
+  check("toJSON from the prototype", out, '"P"');
+}
+check("non-enumerable keys are skipped", JSON.stringify(Object.defineProperty({ a: 1 }, "b", { value: 2 })), '{"a":1}');
+check("a getter's value is used", JSON.stringify({ get a() { return 7; } }), '{"a":7}');
+check("numeric keys sort first", JSON.stringify({ b: 1, 2: 2, a: 3, 1: 4 }), '{"1":4,"2":2,"b":1,"a":3}');
+check("symbol keys are skipped", JSON.stringify({ [Symbol("s")]: 1, a: 2 }), '{"a":2}');
+check("inherited keys are skipped", JSON.stringify(Object.create({ inherited: 1 }, { own: { value: 2, enumerable: true } })), '{"own":2}');
+check("a key deleted by a getter", JSON.stringify({ get a() { delete this.b; return 1; }, b: 2 }), '{"a":1}');
+check("array holes are null", JSON.stringify([1, , 3]), '[1,null,3]');
+check("Date uses its toJSON", JSON.stringify({ d: new Date(0) }), '{"d":"1970-01-01T00:00:00.000Z"}');
+
 for (const text of ['{"a":}', '"unterminated', '"ab"', "[1,]", "01", "1.", "+1", "'x'"]) {
   let threw = false;
   try { JSON.parse(text); } catch { threw = true; }
