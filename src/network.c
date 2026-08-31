@@ -142,6 +142,15 @@ static int sxn_strcasecmp(const char *a, const char *b) {
     return (unsigned char)*a - (unsigned char)*b;
 }
 
+/* Make room for `want` bytes in one go. A 1MB request body arriving through
+   a buffer that doubles from 256 bytes is copied about a dozen times on the
+   way in; when Content-Length says how big it will be, it is copied once. */
+static void dynbuf_reserve(DynBuf *buf, size_t want) {
+    if (want <= buf->cap) return;
+    buf->data = realloc(buf->data, want);
+    buf->cap = want;
+}
+
 static void dynbuf_append(DynBuf *buf, const void *data, size_t n) {
     if (buf->length + n > buf->cap) {
         size_t cap = buf->cap ? buf->cap * 2 : 256;
@@ -680,7 +689,11 @@ static void conn_try_dispatch(ConnState *conn) {
     long long content_length = request_content_length(conn->in.data, head_end);
     size_t head_bytes = (size_t)(head_end + 4 - conn->in.data);
     size_t body_bytes = content_length > 0 ? (size_t)content_length : 0;
-    if (conn->in.length - head_bytes < body_bytes) return;
+    if (conn->in.length - head_bytes < body_bytes) {
+        /* Now that the length is known, take the room for it at once. */
+        dynbuf_reserve(&conn->in, head_bytes + body_bytes + 1);
+        return;
+    }
 
     uv_read_stop(stream);
     conn->keep_alive = request_keeps_alive(conn->in.data, head_end);
@@ -2161,6 +2174,7 @@ int sxn_install_network(JSContext *ctx) {
     JS_SetPropertyStr(ctx, global, "__sxnFetchRaw", JS_NewCFunction(ctx, js_sxn_fetch_raw, "__sxnFetchRaw", 5));
     /* Named "now" because bootstrap.js binds this straight onto performance
        rather than wrapping it, so this is the function user code sees. */
+    JS_SetPropertyStr(ctx, global, "__sxnPid", JS_NewInt32(ctx, (int32_t)uv_os_getpid()));
     JS_SetPropertyStr(ctx, global, "__sxnWriteStderr", JS_NewCFunction(ctx, sxn_write_stderr, "__sxnWriteStderr", 1));
     JS_SetPropertyStr(ctx, global, "__sxnNow", JS_NewCFunction(ctx, sxn_now, "now", 0));
 #ifdef SXN_ABLATE_FUSION

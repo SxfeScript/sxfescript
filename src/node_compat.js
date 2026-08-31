@@ -531,7 +531,10 @@
   if (typeof __sxnDlopen === "function") process.dlopen = __sxnDlopen;
   process.emitWarning = function (w) { console.error("Warning: " + (w && w.message ? w.message : w)); };
   process.uptime = function () { return performance.now() / 1000; };
-  process.pid = 0;
+  // The real one: a program that runs several copies of itself -- which is
+  // how this runtime uses more than one core -- has nothing else to tell them
+  // apart by in a log.
+  process.pid = typeof __sxnPid === "number" ? __sxnPid : 0;
   process.cwd = function () { return __sxnCwd(); };
   process.exit = function (code) { __sxnExit(code === undefined ? 0 : code); };
   // A genuine job-queue microtask (queueMicrotask is itself a thin JS_EnqueueJob
