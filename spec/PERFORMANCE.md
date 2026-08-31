@@ -264,17 +264,25 @@ cheap. Writing:
   back up by string, which hashes it into an atom again. An ordinary object
   with no replacer list now walks its own atoms, reads by atom, and takes the
   key string from the atom rather than building one. When its keys are all
-  ordinary strings they come straight out of its shape into a stack array, so
-  the object costs no allocation at all.
+  ordinary strings they come straight out of its shape into a stack array --
+  no allocation per object at all -- and, while the shape has not changed,
+  each value is read from the slot recorded then rather than looked up.
 - **Integers, booleans and null go in as bytes.** Each used to be handed to
   `JS_ToString`, which allocates a string to copy in and free. A JSON
   document is mostly those three.
 - **`toJSON` is looked for once per shape.** Every object was searched for
   the method, walking its prototype chain to find nothing. The last shape
-  that had none is remembered against the runtime's property-location
-  generation -- the stamp the inline caches already keep, bumped wherever a
-  property could move, which covers a getter installing `toJSON` on
-  `Object.prototype` halfway through a document.
+  with none is remembered against the runtime's property-location generation
+  -- the stamp the inline caches already keep. The memo is only taken when
+  nothing on the chain is exotic and nothing on it has a `toJSON` property at
+  all: a Proxy answers from its own trap and they all share one shape, and a
+  shape records which properties exist, not what they hold.
+- **The circular-reference check left the JavaScript heap.** The path from
+  the root was a JavaScript array, so every object cost an `Array#includes`,
+  a push and a pop through the generic property machinery. It is a small
+  array of object pointers now.
+- **Nothing is written for a separator that is empty**, which is both of them
+  whenever `JSON.stringify` is called without a gap.
 
 Reading:
 
@@ -286,19 +294,38 @@ Reading:
 - **An array element is appended, not defined.** The array is the parser's
   own fresh fast array; appending to it skips the indexed-property path,
   which has to assume the target could be anything.
+- **The last few property names are remembered.** Every object in a document
+  of records repeats the same keys, and each one was hashed into the atom
+  table again.
 
-On the Mac the round trip went 165.4 -> 51.4 ms against Node's 28.2 and
-Bun's 25.3. Separately, parsing a 1MB document 2.29 -> 1.24 ms against Node's
-1.06, and writing it 7.01 -> 1.67 against Node's 0.61. A document of 30000
-small objects parses in 4.48 ms against Node's 2.34. Reading one long string
-is 0.19 ms against Node's 0.31, and writing it 0.08 against 0.12 -- ahead,
-for that shape.
+On the Mac the round trip went 165.4 -> 47.4 ms against Node's 28.5 and
+Bun's 23.1. Per operation, against Node:
 
-What is left divides in two. Writing an object-heavy document is still around
-5x Node, spread across the remaining per-property work with no peak worth
+| | this runtime | Node |
+|---|---|---|
+| parse a 1MB document | 2.29 -> 1.22 ms | 1.05 |
+| write it | 7.01 -> 1.23 ms | 0.60 |
+| parse 30000 small objects | 8.56 -> 4.44 ms | 2.36 |
+| write them | 10.6 -> 3.69 ms | 0.95 |
+| parse one long string | 0.94 -> 0.19 ms | 0.32 |
+| write one long string | 2.52 -> 0.08 ms | 0.13 |
+
+Both string rows are now ahead of Node; the rest is within 1.2x on parsing a
+document of mixed content and about 2x on writing one.
+
+What is left divides in two. Writing object-heavy documents is still around
+4x Node, spread across the remaining per-property work with no peak worth
 naming. Writing fractional numbers is the other half: `js_dtoa` is exact and
 unhurried where V8 uses a fast shortest-representation algorithm, and that is
 a self-contained piece of work nobody has done here yet.
+
+Two of these went in wrong the first time and were caught by review before
+they shipped: the `toJSON` memo carried one Proxy's answer to the next, and
+re-checking enumerability per property let a getter change what was written
+after the key list had been taken. `tests/fixtures/json_edges.mjs` covers
+both, and `json_fuzz.mjs` walks 4000 seeded-random documents through parse
+and stringify and hashes every string produced -- the expected hash is
+Node's, so a byte of divergence anywhere fails the build.
 
 None of it is the parser's structure, which is why a faster external parser
 is not the answer. A DOM parser would replace the part that is now cheap and
