@@ -392,6 +392,10 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # the head and the announced body are both in hand.
   add_test(NAME sxn-serve-large-body COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_large_body.mjs)
   set_tests_properties(sxn-serve-large-body PROPERTIES TIMEOUT 60 FAIL_REGULAR_EXPRESSION "FAIL")
+  # HTTP keep-alive: a connection is reused for the next request, and stop()
+  # closes the ones still open.
+  add_test(NAME sxn-serve-keepalive COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_keepalive.mjs)
+  set_tests_properties(sxn-serve-keepalive PROPERTIES TIMEOUT 60 FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-serve-fetch-shape PROPERTIES TIMEOUT 30 FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-performance-now PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")

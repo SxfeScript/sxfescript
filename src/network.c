@@ -225,11 +225,12 @@ static void websocket_text(DynBuf *out, const char *text) {
 
 /* Shared by every accepted connection: the JS handler is looked up once per
    Sxn.serve() call and kept alive (JS_DupValue) for the server's lifetime. */
-typedef struct ServeState { JSContext *ctx; JSValue handler; } ServeState;
+typedef struct ConnState ConnState;
+typedef struct ServeState { JSContext *ctx; JSValue handler; ConnState *conns; } ServeState;
 
 /* Per-connection state: outlives the read/parse/dispatch step so the
    assembled response survives until the uv_write completes. */
-typedef struct ConnState {
+struct ConnState {
     ServeState *serve; uv_tcp_t handle; char *write_data;
     /* Held across an async handler: the upgrade bits belong to the request
        that is still being answered, and the read buffer is long gone. */
@@ -238,7 +239,15 @@ typedef struct ConnState {
        us; only a small one fits in the first. This accumulates them until
        the head and Content-Length bytes of body are both in hand. */
     DynBuf in;
-} ConnState;
+    /* Keep-alive: whether this connection survives the response being
+       written, and how many bytes of `in` the answered request used -- what
+       is left after them is the next, pipelined request. */
+    int keep_alive; size_t consumed;
+    /* Every live connection of a server, so stop() can close them: a
+       keep-alive connection outlives the request that opened it, and would
+       otherwise hold the loop open after its server was stopped. */
+    ConnState *prev, *next;
+};
 
 /* A request bigger than this is refused rather than buffered: the whole
    thing is held in memory before the handler sees it. */
@@ -275,15 +284,46 @@ static JSValue conn_promise_fail(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/* Unlink first, then close: the close callback may run after the server it
+   belonged to is gone. */
+static void conn_shutdown(ConnState *conn, uv_close_cb cb) {
+    if (conn->serve) {
+        if (conn->prev) conn->prev->next = conn->next; else conn->serve->conns = conn->next;
+        if (conn->next) conn->next->prev = conn->prev;
+        conn->serve = NULL; conn->prev = conn->next = NULL;
+    }
+    uv_close((uv_handle_t *)&conn->handle, cb);
+}
+
 static void conn_close_cb(uv_handle_t *handle) {
     ConnState *conn = (ConnState *)handle->data;
     free(conn->write_data); free(conn->in.data); free(conn);
 }
 
+static void conn_try_dispatch(ConnState *conn);
+static void conn_alloc_cb(uv_handle_t *handle, size_t suggested, uv_buf_t *buf);
+static void conn_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf);
+
+/* One response is written. On a keep-alive exchange the connection is reused
+   for the next request rather than closed -- without this every request paid
+   for a new TCP connection, which under a load test exhausted the client's
+   ephemeral ports long before the server was the bottleneck. */
 static void conn_write_cb(uv_write_t *req, int status) {
-    (void)status;
     ConnState *conn = (ConnState *)req->data; free(req);
-    uv_close((uv_handle_t *)&conn->handle, conn_close_cb);
+    if (status < 0 || !conn->keep_alive) {
+        conn_shutdown(conn, conn_close_cb);
+        return;
+    }
+    free(conn->write_data); conn->write_data = NULL;
+    /* Whatever follows the request just answered is the next one, already
+       here: a pipelining client sends without waiting. */
+    size_t left = conn->in.length > conn->consumed ? conn->in.length - conn->consumed : 0;
+    if (left) memmove(conn->in.data, conn->in.data + conn->consumed, left);
+    conn->in.length = left;
+    if (conn->in.data) conn->in.data[left] = 0;
+    conn->consumed = 0;
+    uv_read_start((uv_stream_t *)&conn->handle, conn_alloc_cb, conn_read_cb);
+    if (left) conn_try_dispatch(conn);
 }
 
 static void conn_alloc_cb(uv_handle_t *handle, size_t suggested, uv_buf_t *buf) {
@@ -302,9 +342,13 @@ static void conn_deliver(JSContext *ctx, ConnState *conn, JSValue result,
     DynBuf out = {0};
     if (JS_IsException(result)) {
         JS_FreeValue(ctx, result);
-        dynbuf_puts(&out, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+        conn->keep_alive = 0;
+        dynbuf_puts(&out, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     } else {
         JSValue mode_value = JS_GetPropertyStr(ctx, result, "mode"); const char *mode = JS_ToCString(ctx, mode_value);
+        /* An upgrade and an SSE stream both own the connection until the
+           client goes away; neither can be followed by another request. */
+        if (mode && (!strcmp(mode, "websocket") || !strcmp(mode, "sse"))) conn->keep_alive = 0;
         if (mode && !strcmp(mode, "websocket") && upgrade && ws_key) {
             websocket_handshake(&out, ws_key);
             JSValue messages = JS_GetPropertyStr(ctx, result, "wsMessages"); uint32_t length = 0; JSValue size = JS_GetPropertyStr(ctx, messages, "length"); JS_ToUint32(ctx, &length, size); JS_FreeValue(ctx, size);
@@ -446,7 +490,7 @@ static void conn_deliver(JSContext *ctx, ConnState *conn, JSValue result,
             JS_FreeValue(ctx, hdrs);
             if (ct_override) content_type = ct_override;
 
-            char head[512]; int n = snprintf(head, sizeof(head), "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\nConnection: close\r\nContent-Type: %s\r\n", status, reason(status), body_len, content_type);
+            char head[512]; int n = snprintf(head, sizeof(head), "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\nConnection: %s\r\nContent-Type: %s\r\n", status, reason(status), body_len, conn->keep_alive ? "keep-alive" : "close", content_type);
             dynbuf_append(&out, head, (size_t)n);
             if (extra && extra_len) dynbuf_append(&out, extra, extra_len);
             dynbuf_append(&out, "\r\n", 2);
@@ -560,6 +604,25 @@ static void conn_dispatch_request(ConnState *conn, char *request, size_t length)
     conn_deliver(ctx, conn, result, upgrade, ws_key);
 }
 
+/* HTTP/1.1 keeps a connection open unless the request says otherwise;
+   HTTP/1.0 closes it unless the request asks for keep-alive. */
+static int request_keeps_alive(const char *head, const char *head_end) {
+    int one_one = strstr(head, "HTTP/1.1") != NULL && strstr(head, "HTTP/1.1") < head_end;
+    const char *line = strstr(head, "\r\n");
+    while (line && line + 2 < head_end) {
+        line += 2;
+        if (!strncasecmp(line, "Connection:", 11)) {
+            const char *value = line + 11;
+            while (*value == ' ' || *value == '\t') ++value;
+            if (!strncasecmp(value, "close", 5)) return 0;
+            if (!strncasecmp(value, "keep-alive", 10)) return 1;
+            break;
+        }
+        line = strstr(line, "\r\n");
+    }
+    return one_one;
+}
+
 /* Content-Length, or -1 when the head does not carry one. Its own scan
    rather than header_value's, which returns an interior pointer and
    overwrites the line's CRLF with a NUL -- fine once the request is complete
@@ -579,24 +642,14 @@ static long long request_content_length(const char *head, const char *head_end) 
     return -1;
 }
 
-static void conn_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
-    ConnState *conn = (ConnState *)stream->data;
-    if (nread <= 0) {
-        free(buf->base);
-        uv_read_stop(stream);
-        uv_close((uv_handle_t *)&conn->handle, conn_close_cb);
-        return;
-    }
-    dynbuf_append(&conn->in, buf->base, (size_t)nread);
-    free(buf->base);
-    /* NUL terminated for the header parsing, which is all string work; the
-       body is bounded by the length instead. */
-    dynbuf_append(&conn->in, "", 1);
-    conn->in.length--;
-    conn->in.data[conn->in.length] = 0;
-
+/* Dispatch as soon as a whole request is in the buffer; otherwise wait for
+   more reads. Called after every read, and again after a response is written
+   in case the client pipelined the next request behind the last one. */
+static void conn_try_dispatch(ConnState *conn) {
+    uv_stream_t *stream = (uv_stream_t *)&conn->handle;
     if (conn->in.length > SXN_MAX_REQUEST_BYTES) {
         uv_read_stop(stream);
+        conn->keep_alive = 0;
         conn_deliver(conn->serve->ctx, conn, JS_EXCEPTION, NULL, NULL);
         return;
     }
@@ -607,10 +660,31 @@ static void conn_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf
     if (!head_end) return;
     long long content_length = request_content_length(conn->in.data, head_end);
     size_t head_bytes = (size_t)(head_end + 4 - conn->in.data);
-    if (content_length > 0 && conn->in.length - head_bytes < (size_t)content_length) return;
+    size_t body_bytes = content_length > 0 ? (size_t)content_length : 0;
+    if (conn->in.length - head_bytes < body_bytes) return;
 
     uv_read_stop(stream);
-    conn_dispatch_request(conn, conn->in.data, conn->in.length);
+    conn->keep_alive = request_keeps_alive(conn->in.data, head_end);
+    conn->consumed = head_bytes + body_bytes;
+    conn_dispatch_request(conn, conn->in.data, conn->consumed);
+}
+
+static void conn_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
+    ConnState *conn = (ConnState *)stream->data;
+    if (nread <= 0) {
+        free(buf->base);
+        uv_read_stop(stream);
+        conn_shutdown(conn, conn_close_cb);
+        return;
+    }
+    dynbuf_append(&conn->in, buf->base, (size_t)nread);
+    free(buf->base);
+    /* NUL terminated for the header parsing, which is all string work; the
+       body is bounded by the length instead. */
+    dynbuf_append(&conn->in, "", 1);
+    conn->in.length--;
+    conn->in.data[conn->in.length] = 0;
+    conn_try_dispatch(conn);
 }
 
 static void on_connection_cb(uv_stream_t *server_handle, int status) {
@@ -618,10 +692,15 @@ static void on_connection_cb(uv_stream_t *server_handle, int status) {
     ServeState *serve = (ServeState *)server_handle->data;
     ConnState *conn = calloc(1, sizeof(*conn)); conn->serve = serve;
     uv_tcp_init(sxn_loop(), &conn->handle); conn->handle.data = conn;
-    if (uv_accept(server_handle, (uv_stream_t *)&conn->handle) == 0)
+    if (uv_accept(server_handle, (uv_stream_t *)&conn->handle) == 0) {
+        conn->next = serve->conns;
+        if (serve->conns) serve->conns->prev = conn;
+        serve->conns = conn;
         uv_read_start((uv_stream_t *)&conn->handle, conn_alloc_cb, conn_read_cb);
-    else
+    } else {
+        conn->serve = NULL;
         uv_close((uv_handle_t *)&conn->handle, conn_close_cb);
+    }
 }
 
 /* Stops the listener a serve() call created. The handle is closed
@@ -643,6 +722,8 @@ static JSValue js_serve_stop(JSContext *ctx, JSValueConst this_val,
     void *ptr = JS_GetOpaque(func_data[0], sxn_serverhandle_class_id);
     if (ptr) {
         JS_SetOpaque(func_data[0], NULL);
+        ServeState *serve = (ServeState *)((uv_handle_t *)ptr)->data;
+        while (serve && serve->conns) conn_shutdown(serve->conns, conn_close_cb);
         uv_close((uv_handle_t *)ptr, serve_close_cb);
     }
     return JS_UNDEFINED;
@@ -653,7 +734,7 @@ static JSValue js_serve(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     if (argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_ThrowTypeError(ctx, "serve(options, handler) requires a handler");
     JSValue port_value = JS_GetPropertyStr(ctx, argv[0], "port"); JS_ToInt32(ctx, &port, port_value); JS_FreeValue(ctx, port_value);
 
-    ServeState *serve = malloc(sizeof(*serve)); serve->ctx = ctx; serve->handler = JS_DupValue(ctx, argv[1]);
+    ServeState *serve = calloc(1, sizeof(*serve)); serve->ctx = ctx; serve->handler = JS_DupValue(ctx, argv[1]);
     uv_tcp_t *server = malloc(sizeof(*server));
     uv_tcp_init(sxn_loop(), server); server->data = serve;
     struct sockaddr_in address; uv_ip4_addr("127.0.0.1", port, &address);

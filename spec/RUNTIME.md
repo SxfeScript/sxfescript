@@ -65,7 +65,10 @@ header (the multi-`Set-Cookie` case), and `Content-Length`/`Connection` are
 filtered since those describe the framing rather than the payload the handler
 wrote. The returned handle reports `port`, `url`, and a `stop()` that lets a
 process serve and then do something else, rather than block forever the way a
-bare listener would.
+bare listener would; `stop()` closes the connections still open as well as
+the listener. Connections are kept alive by default, as HTTP/1.1 requires,
+and a request pipelined behind another is answered without waiting for a
+further read. A request larger than 64MB is refused rather than buffered.
 
 ## Web Streams
 
