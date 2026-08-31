@@ -313,11 +313,20 @@ Bun's 23.1. Per operation, against Node:
 Both string rows are now ahead of Node; the rest is within 1.2x on parsing a
 document of mixed content and about 2x on writing one.
 
-What is left divides in two. Writing object-heavy documents is still around
-4x Node, spread across the remaining per-property work with no peak worth
-naming. Writing fractional numbers is the other half: `js_dtoa` is exact and
-unhurried where V8 uses a fast shortest-representation algorithm, and that is
-a self-contained piece of work nobody has done here yet.
+Numbers were the other half, and are no longer. Turning a double into its
+shortest round-tripping decimal was an exact big-integer search; `dtoa.c` now
+takes Grisu3 (Loitsch, PLDI 2010) first, which computes the digits with
+64-bit arithmetic and a table of cached powers of ten and then *proves* its
+result is the unique shortest form, declining when it cannot. Every decline,
+and every other radix, format and exponent mode, still runs the exact
+algorithm. Stringifying 120000 random doubles: 22.8 -> 13.9 ms per pass. It
+is checked by a differential test against Node over millions of values --
+random bit patterns, every integer from -1e6 to 1e6, powers of ten,
+subnormals, the signed zeroes, infinities, NaN, and ULP windows around 1e21
+and 2^53 -- with no divergence.
+
+What is left is writing object-heavy documents, still around 4x Node and
+spread across the remaining per-property work with no peak worth naming.
 
 Two of these went in wrong the first time and were caught by review before
 they shipped: the `toJSON` memo carried one Proxy's answer to the next, and
