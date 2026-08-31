@@ -152,14 +152,27 @@
   }
 
   function bufferBytesFromString(str, encoding) {
+    // The native readers are lenient the way Node is -- hex stops at the
+    // first pair that is not hex, base64 skips anything outside the alphabet
+    // -- so ordinary payloads, including base64 with the newlines PEM and
+    // MIME put in it, never touch the JavaScript loops. They hand back null
+    // for a string with anything non-ASCII in it, where Node's reading of
+    // UTF-16 code units is visible, and the loops below take that.
     if (encoding === "hex") {
-      try { return Uint8Array.fromHex(str); } catch { return hexBytesLenient(str); }
+      // Strict first, because it reads the string's own bytes with no copy
+      // at all; the native lenient reader takes over when the input has
+      // something in it that the strict one refuses.
+      try { return Uint8Array.fromHex(str); } catch { /* fall through */ }
+      var hex = __sxnHexBytes(str);
+      return hex !== null ? hex : hexBytesLenient(str);
     }
     if (encoding === "base64" || encoding === "base64url") {
       try {
         return encoding === "base64" ? Uint8Array.fromBase64(str)
                                      : Uint8Array.fromBase64(str, { alphabet: "base64url" });
-      } catch { return base64BytesLenient(str); }
+      } catch { /* fall through */ }
+      var b64 = __sxnBase64Bytes(str);
+      return b64 !== null ? b64 : base64BytesLenient(str);
     }
     if (encoding === "ucs2" || encoding === "ucs-2" ||
         encoding === "utf16le" || encoding === "utf-16le") return utf16leBytes(str);

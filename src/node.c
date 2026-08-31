@@ -2373,6 +2373,84 @@ static JSValue js_buffer_write(JSContext *ctx, JSValueConst this_val, int argc, 
     return JS_NewInt64(ctx, (int64_t)n);
 }
 
+
+/* Node's lenient hex and base64 readers, which every real payload takes:
+   Uint8Array.fromHex and fromBase64 are strict and throw on the first
+   character they do not like, and base64 as it actually travels -- PEM, MIME
+   -- has newlines in it.
+
+   Both are defined over UTF-16 code units: Node reads the string one unit at
+   a time and masks it to a byte, which is why an emoji ends a base64 string.
+   A C function is handed UTF-8 and cannot see that, so these return NULL for
+   anything non-ASCII and the caller keeps the JavaScript loop for it. Every
+   valid hex or base64 string is ASCII. */
+static void sxn_free_plain_buffer(JSRuntime *rt, void *opaque, void *ptr) {
+    (void)rt; (void)opaque;
+    free(ptr);
+}
+
+static JSValue js_hex_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_NULL;
+    size_t len = 0;
+    const char *str = JS_ToCStringLen(ctx, &len, argv[0]);
+    if (!str) return JS_EXCEPTION;
+    uint8_t *out = malloc(len / 2 + 1);
+    if (!out) { JS_FreeCString(ctx, str); return JS_ThrowOutOfMemory(ctx); }
+    size_t n = 0;
+    bool ascii = true;
+    for (size_t i = 0; i + 1 < len; i += 2) {
+        unsigned char a = (unsigned char)str[i], b = (unsigned char)str[i + 1];
+        if ((a | b) & 0x80) { ascii = false; break; }
+        int hi = sxn_hex_value(a), lo = sxn_hex_value(b);
+        if (hi < 0 || lo < 0) break;          /* Node stops here rather than throwing */
+        out[n++] = (uint8_t)((hi << 4) | lo);
+    }
+    JS_FreeCString(ctx, str);
+    if (!ascii) { free(out); return JS_NULL; }
+    /* The buffer goes to JavaScript as it stands rather than being copied
+       into a fresh one. */
+    return JS_NewUint8Array(ctx, out, n, sxn_free_plain_buffer, NULL, false);
+}
+
+static JSValue js_base64_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_NULL;
+    size_t len = 0;
+    const char *str = JS_ToCStringLen(ctx, &len, argv[0]);
+    if (!str) return JS_EXCEPTION;
+    /* Both alphabets at once, which is what Node's reader accepts. */
+    static int8_t table[256];
+    static bool built = false;
+    if (!built) {
+        for (int i = 0; i < 256; i++) table[i] = -1;
+        const char *a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        for (int i = 0; a[i]; i++) table[(unsigned char)a[i]] = (int8_t)i;
+        table[(unsigned char)'+'] = 62; table[(unsigned char)'/'] = 63;
+        table[(unsigned char)'-'] = 62; table[(unsigned char)'_'] = 63;
+        built = true;
+    }
+    uint8_t *out = malloc(len * 3 / 4 + 4);
+    if (!out) { JS_FreeCString(ctx, str); return JS_ThrowOutOfMemory(ctx); }
+    size_t n = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    bool ascii = true;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)str[i];
+        if (c & 0x80) { ascii = false; break; }
+        if (c == '=') break;                  /* padding ends the data */
+        int v = table[c];
+        if (v < 0) continue;                  /* anything else is skipped */
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) { bits -= 8; out[n++] = (uint8_t)((acc >> bits) & 0xff); }
+    }
+    JS_FreeCString(ctx, str);
+    if (!ascii) { free(out); return JS_NULL; }
+    return JS_NewUint8Array(ctx, out, n, sxn_free_plain_buffer, NULL, false);
+}
+
 static const char *node_querystring_names[] = { "parse", "stringify", "escape", "unescape", "decode", "encode" };
 static const char *node_url_names[] = {
     "URL", "URLSearchParams", "fileURLToPath", "pathToFileURL", "format", "parse",
@@ -2644,6 +2722,8 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnHexBytes", JS_NewCFunction(ctx, js_hex_bytes, "__sxnHexBytes", 1));
+    JS_SetPropertyStr(ctx, global, "__sxnBase64Bytes", JS_NewCFunction(ctx, js_base64_bytes, "__sxnBase64Bytes", 1));
     JS_SetPropertyStr(ctx, global, "__sxnIsIP", JS_NewCFunction(ctx, js_net_is_ip, "isIP", 1));
     JS_SetPropertyStr(ctx, global, "__sxnQsParse", JS_NewCFunction(ctx, js_qs_parse, "parse", 4));
     JS_SetPropertyStr(ctx, global, "__sxnQsStringify", JS_NewCFunction(ctx, js_qs_stringify, "stringify", 3));
