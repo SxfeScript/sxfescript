@@ -177,6 +177,14 @@ another sixth of the layer's cost. The rule is not "objects stay in
 JavaScript": it is that C wins wherever the work is repeated setup and loses
 wherever it is a call back into the engine per step.
 
+One move was tried and thrown away, which is worth writing down because the
+number is the only thing that settles it. A `Readable`'s constructor sets ten
+own fields; done from C instead, the same ten stores cost 0.40 microseconds
+against the interpreter's 0.34. `JS_SetPropertyStr` from outside is slower
+than the interpreter's own store on a fresh object, so plain field
+initialisation stays where it is. The socket above is not a
+counter-example -- what made it fast was not setting the fields at all.
+
 Still JavaScript, with the reason measured rather than asserted:
 
 - **`stream` and `http`.** A `node:http` request costs 13.4 us here against
