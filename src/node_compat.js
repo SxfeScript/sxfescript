@@ -276,135 +276,6 @@
   globalThis.Buffer = Buffer;
 
   // ---------------- path: posix / win32 ----------------
-  // Reduces a split path into a normalized segment list: drops "." and
-  // empty segments, resolves ".." against the previous real segment, and
-  // (for relative paths) keeps a leading run of ".." since there's no root
-  // to clamp against.
-  function reduceSegments(parts, isAbsolutePath) {
-    var out = [];
-    for (var i = 0; i < parts.length; i++) {
-      var seg = parts[i];
-      if (seg === "" || seg === ".") continue;
-      if (seg === "..") {
-        if (out.length && out[out.length - 1] !== "..") out.pop();
-        else if (!isAbsolutePath) out.push("..");
-      } else {
-        out.push(seg);
-      }
-    }
-    return out;
-  }
-
-  function makePathImpl(sep, delimiter, splitRe, isAbsoluteFn, formatRoot) {
-    function normalize(p) {
-      p = String(p);
-      if (p === "") return ".";
-      var isAbs = isAbsoluteFn(p);
-      var root = formatRoot(p, isAbs);
-      var rest = p.slice(root.rootLength);
-      var trailingSep = rest.length > 0 && splitRe.test(rest.charAt(rest.length - 1));
-      var segments = reduceSegments(rest.split(splitRe), isAbs);
-      var out = root.prefix + segments.join(sep);
-      if (out === "") out = ".";
-      if (trailingSep && segments.length && out.charAt(out.length - 1) !== sep) out += sep;
-      return out;
-    }
-
-    function join() {
-      var parts = [];
-      for (var i = 0; i < arguments.length; i++) {
-        var a = arguments[i];
-        if (a === undefined || a === null) continue;
-        if (typeof a !== "string") throw new TypeError("path segments must be strings");
-        if (a.length) parts.push(a);
-      }
-      if (!parts.length) return ".";
-      return normalize(parts.join(sep));
-    }
-
-    function resolve() {
-      var resolved = "";
-      var resolvedAbsolute = false;
-      for (var i = arguments.length - 1; i >= -1 && !resolvedAbsolute; i--) {
-        var seg = i >= 0 ? arguments[i] : __sxnCwd();
-        if (!seg) continue;
-        resolved = seg + sep + resolved;
-        resolvedAbsolute = isAbsoluteFn(seg);
-      }
-      var out = normalize(resolved);
-      if (!resolvedAbsolute) out = normalize(__sxnCwd() + sep + resolved);
-      // strip a normalize()-added trailing separator, resolve() never keeps one
-      var root = formatRoot(out, true);
-      if (out.length > root.rootLength && splitRe.test(out.charAt(out.length - 1))) out = out.slice(0, -1);
-      return out;
-    }
-
-    function dirname(p) {
-      p = String(p);
-      var isAbs = isAbsoluteFn(p);
-      var root = formatRoot(p, isAbs);
-      var rest = p.slice(root.rootLength);
-      var end = -1, matchedSep = true;
-      for (var i = rest.length - 1; i >= 0; i--) {
-        if (splitRe.test(rest.charAt(i))) {
-          if (!matchedSep) { end = i; break; }
-        } else matchedSep = false;
-      }
-      if (end === -1) return root.rootLength ? (root.prefix || root.rootPath) : ".";
-      return root.prefix + rest.slice(0, end);
-    }
-
-    function basename(p, suffix) {
-      p = String(p);
-      var root = formatRoot(p, isAbsoluteFn(p));
-      var rest = p.slice(root.rootLength).replace(new RegExp("[" + (sep === "\\" ? "\\\\/" : "/") + "]+$"), "");
-      var idx = -1;
-      for (var i = rest.length - 1; i >= 0; i--) { if (splitRe.test(rest.charAt(i))) { idx = i; break; } }
-      var base = idx === -1 ? rest : rest.slice(idx + 1);
-      if (suffix && base.length > suffix.length && base.slice(-suffix.length) === suffix) {
-        base = base.slice(0, -suffix.length);
-      }
-      return base;
-    }
-
-    function extname(p) {
-      var base = basename(p);
-      var dot = base.lastIndexOf(".");
-      if (dot <= 0) return ""; // no dot, or a leading dot (e.g. ".gitignore")
-      return base.slice(dot);
-    }
-
-    function relative(from, to) {
-      from = resolve(from);
-      to = resolve(to);
-      if (from === to) return "";
-      var fromParts = from.split(sep).filter(Boolean);
-      var toParts = to.split(sep).filter(Boolean);
-      var common = 0;
-      while (common < fromParts.length && common < toParts.length &&
-             (sep === "\\" ? fromParts[common].toLowerCase() === toParts[common].toLowerCase() : fromParts[common] === toParts[common])) {
-        common++;
-      }
-      var ups = fromParts.length - common;
-      var out = [];
-      for (var i = 0; i < ups; i++) out.push("..");
-      return out.concat(toParts.slice(common)).join(sep);
-    }
-
-    return {
-      sep: sep,
-      delimiter: delimiter,
-      isAbsolute: function (p) { return isAbsoluteFn(String(p)); },
-      normalize: normalize,
-      join: join,
-      resolve: resolve,
-      dirname: dirname,
-      basename: basename,
-      extname: extname,
-      relative: relative,
-    };
-  }
-
   // Native (see js_path_posix_* in src/node.c, registered as globals above)
   // -- phase 4 of replacing node_compat.js with native C. Same
   // reduceSegments/makePathImpl algorithm, ported to walk C strings
@@ -423,27 +294,21 @@
     relative: __sxnPosixRelative,
   };
 
-  var WIN32_SPLIT_RE = /[\\/]/;
-  function win32Root(p) {
-    // UNC: \\server\share\...
-    var unc = /^[\\/]{2}[^\\/]+[\\/]+[^\\/]+/.exec(p);
-    if (unc) return { rootLength: unc[0].length, prefix: unc[0].replace(/[\\/]+$/, "\\") + "\\", rootPath: unc[0] };
-    // Drive-qualified: C:\... or C:...
-    var drive = /^[a-zA-Z]:[\\/]?/.exec(p);
-    if (drive) {
-      var withSep = /[\\/]$/.test(drive[0]);
-      return { rootLength: drive[0].length, prefix: drive[0].slice(0, 2) + (withSep ? "\\" : ""), rootPath: drive[0].slice(0, 2) + "\\" };
-    }
-    if (WIN32_SPLIT_RE.test(p.charAt(0))) return { rootLength: 1, prefix: "\\", rootPath: "\\" };
-    return { rootLength: 0, prefix: "", rootPath: "" };
-  }
-  function win32IsAbsolute(p) {
-    if (/^[\\/]{2}/.test(p)) return true; // UNC: \\server\share
-    if (/^[a-zA-Z]:[\\/]/.test(p)) return true; // drive-qualified: C:\...
-    if (/^[\\/]/.test(p)) return true; // drive-relative: \foo
-    return false;
-  }
-  var win32 = makePathImpl("\\", ";", WIN32_SPLIT_RE, win32IsAbsolute, win32Root);
+  // Native too (js_path_win_* in src/node.c). This was the last of path
+  // still written in JavaScript, and the last place here that walked a
+  // string with a regexp.
+  var win32 = {
+    sep: "\\",
+    delimiter: ";",
+    isAbsolute: __sxnWinIsAbsolute,
+    normalize: __sxnWinNormalize,
+    join: __sxnWinJoin,
+    resolve: __sxnWinResolve,
+    dirname: __sxnWinDirname,
+    basename: __sxnWinBasename,
+    extname: __sxnWinExtname,
+    relative: __sxnWinRelative,
+  };
 
   var path = __sxnIsWindows ? win32 : posix;
   path.posix = posix;
@@ -457,6 +322,14 @@
   delete globalThis.__sxnPosixBasename;
   delete globalThis.__sxnPosixExtname;
   delete globalThis.__sxnPosixRelative;
+  delete globalThis.__sxnWinJoin;
+  delete globalThis.__sxnWinResolve;
+  delete globalThis.__sxnWinNormalize;
+  delete globalThis.__sxnWinIsAbsolute;
+  delete globalThis.__sxnWinDirname;
+  delete globalThis.__sxnWinBasename;
+  delete globalThis.__sxnWinExtname;
+  delete globalThis.__sxnWinRelative;
 
   // ---------------- process ----------------
   function Process() {

@@ -845,17 +845,41 @@ static JSValue js_path_posix_basename(JSContext *ctx, JSValueConst this_val, int
     return result;
 }
 
+/* Node's own rule, which a simpler "last dot wins" gets wrong for a name
+   that is all dots: extname("..") is "", not ".". */
+static char *sxn_posix_extname_core(const char *p) {
+    size_t len = strlen(p);
+    long start_dot = -1, start_part = 0, end = -1;
+    bool matched_slash = true;
+    int pre_dot = 0;
+    for (long i = (long)len - 1; i >= 0; i--) {
+        char c = p[i];
+        if (c == '/') {
+            if (!matched_slash) { start_part = i + 1; break; }
+            continue;
+        }
+        if (end == -1) { matched_slash = false; end = i + 1; }
+        if (c == '.') {
+            if (start_dot == -1) start_dot = i;
+            else if (pre_dot != 1) pre_dot = 1;
+        } else if (start_dot != -1) {
+            pre_dot = -1;
+        }
+    }
+    if (start_dot == -1 || end == -1 || pre_dot == 0
+        || (pre_dot == 1 && start_dot == end - 1 && start_dot == start_part + 1))
+        return sxn_strndup("", 0);
+    return sxn_strndup(p + start_dot, (size_t)(end - start_dot));
+}
+
 static JSValue js_path_posix_extname(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
     const char *p = argc > 0 ? JS_ToCString(ctx, argv[0]) : JS_ToCString(ctx, JS_UNDEFINED);
     if (!p) return JS_EXCEPTION;
-    char *base = sxn_posix_basename_core(p, NULL);
+    char *ext = sxn_posix_extname_core(p);
     JS_FreeCString(ctx, p);
-    long dot = -1;
-    size_t blen = strlen(base);
-    for (long i = (long)blen - 1; i >= 0; i--) if (base[i] == '.') { dot = i; break; }
-    JSValue result = (dot <= 0) ? JS_NewString(ctx, "") : JS_NewStringLen(ctx, base + dot, blen - (size_t)dot);
-    free(base);
+    JSValue result = JS_NewString(ctx, ext);
+    free(ext);
     return result;
 }
 
@@ -1727,6 +1751,389 @@ static JSValue js_qs_unescape(JSContext *ctx, JSValueConst this_val, int argc, J
     return result;
 }
 
+
+/* ---------------- node:path's win32 half, in C ----------------
+   The last of path that was still JavaScript, and the last place in
+   node_compat.js that reached for a regexp to walk a string. Same algorithm
+   as the JS it replaces; separators are '\\' and '/', a root is a drive, a
+   UNC share or a bare separator, and comparison is case-insensitive. */
+
+static bool sxn_win_sep(char c) { return c == '\\' || c == '/'; }
+
+typedef struct SxnWinRoot {
+    size_t length;      /* how much of the path the root takes */
+    char prefix[512];   /* what a normalized path starts with */
+    char root_path[512];/* the root on its own, with a separator */
+} SxnWinRoot;
+
+static void sxn_win_root(const char *p, SxnWinRoot *root) {
+    size_t len = strlen(p);
+    root->length = 0;
+    root->prefix[0] = 0;
+    root->root_path[0] = 0;
+    /* \\server\share */
+    if (len >= 2 && sxn_win_sep(p[0]) && sxn_win_sep(p[1])) {
+        size_t i = 2;
+        while (i < len && sxn_win_sep(p[i])) i++;
+        size_t server = i;
+        while (i < len && !sxn_win_sep(p[i])) i++;
+        if (i > server && i < len) {
+            size_t after_server = i;
+            while (i < len && sxn_win_sep(p[i])) i++;
+            size_t share = i;
+            while (i < len && !sxn_win_sep(p[i])) i++;
+            if (i > share) {
+                root->length = i;
+                snprintf(root->prefix, sizeof(root->prefix), "\\\\%.*s\\%.*s\\",
+                         (int)(after_server - server), p + server,
+                         (int)(i - share), p + share);
+                snprintf(root->root_path, sizeof(root->root_path), "%.*s", (int)i, p);
+                return;
+            }
+        }
+    }
+    /* C:\ or C: */
+    if (len >= 2 && ((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')) && p[1] == ':') {
+        bool with_sep = len >= 3 && sxn_win_sep(p[2]);
+        root->length = with_sep ? 3 : 2;
+        snprintf(root->prefix, sizeof(root->prefix), "%c:%s", p[0], with_sep ? "\\" : "");
+        snprintf(root->root_path, sizeof(root->root_path), "%c:\\", p[0]);
+        return;
+    }
+    if (len >= 1 && sxn_win_sep(p[0])) {
+        root->length = 1;
+        snprintf(root->prefix, sizeof(root->prefix), "\\");
+        snprintf(root->root_path, sizeof(root->root_path), "\\");
+    }
+}
+
+static bool sxn_win_is_absolute(const char *p) {
+    size_t len = strlen(p);
+    if (len >= 2 && sxn_win_sep(p[0]) && sxn_win_sep(p[1])) return true;
+    if (len >= 3 && ((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z'))
+        && p[1] == ':' && sxn_win_sep(p[2])) return true;
+    if (len >= 1 && sxn_win_sep(p[0])) return true;
+    return false;
+}
+
+static void sxn_win_reduce(SxnStrVec *out, const char *rest, bool is_abs) {
+    const char *p = rest;
+    while (*p) {
+        const char *start = p;
+        while (*p && !sxn_win_sep(*p)) p++;
+        size_t len = (size_t)(p - start);
+        if (len == 0 || (len == 1 && start[0] == '.')) {
+            if (*p) p++;
+            continue;
+        }
+        if (len == 2 && start[0] == '.' && start[1] == '.') {
+            if (out->len && strcmp(out->items[out->len - 1], "..") != 0) free(out->items[--out->len]);
+            else if (!is_abs) sxn_strvec_push(out, sxn_strndup("..", 2));
+        } else {
+            sxn_strvec_push(out, sxn_strndup(start, len));
+        }
+        if (*p) p++;
+    }
+}
+
+static char *sxn_win_normalize(const char *path) {
+    if (!*path) return strdup(".");
+    bool abs = sxn_win_is_absolute(path);
+    SxnWinRoot root;
+    sxn_win_root(path, &root);
+    const char *rest = path + root.length;
+    size_t rest_len = strlen(rest);
+    bool trailing_sep = rest_len > 0 && sxn_win_sep(rest[rest_len - 1]);
+    SxnStrVec segs = {0};
+    sxn_win_reduce(&segs, rest, abs);
+
+    size_t total = strlen(root.prefix) + 1;
+    for (size_t i = 0; i < segs.len; i++) total += strlen(segs.items[i]) + 1;
+    char *out = malloc(total + 2);
+    strcpy(out, root.prefix);
+    for (size_t i = 0; i < segs.len; i++) {
+        if (i) strcat(out, "\\");
+        strcat(out, segs.items[i]);
+    }
+    if (!*out) { free(out); out = strdup("."); }
+    else if (trailing_sep && segs.len && out[strlen(out) - 1] != '\\') strcat(out, "\\");
+    sxn_strvec_free(&segs);
+    return out;
+}
+
+static char *sxn_win_join_core(const char *const *segs, int n) {
+    size_t total = 1;
+    for (int i = 0; i < n; i++) if (segs[i]) total += strlen(segs[i]) + 1;
+    char *joined = malloc(total + 1);
+    joined[0] = 0;
+    bool any = false;
+    for (int i = 0; i < n; i++) {
+        if (!segs[i] || !*segs[i]) continue;
+        if (any) strcat(joined, "\\");
+        strcat(joined, segs[i]);
+        any = true;
+    }
+    if (!any) { free(joined); return strdup("."); }
+    char *out = sxn_win_normalize(joined);
+    free(joined);
+    return out;
+}
+
+static char *sxn_win_resolve_core(const char *const *segs, int n) {
+    char *resolved = strdup("");
+    bool absolute = false;
+    for (int i = n - 1; i >= -1 && !absolute; i--) {
+        char *seg = i >= 0 ? (segs[i] ? strdup(segs[i]) : strdup("")) : sxn_getcwd_alloc();
+        if (!*seg) { free(seg); continue; }
+        size_t len = strlen(seg) + 1 + strlen(resolved) + 1;
+        char *next = malloc(len);
+        snprintf(next, len, "%s\\%s", seg, resolved);
+        free(resolved);
+        resolved = next;
+        absolute = sxn_win_is_absolute(seg);
+        free(seg);
+    }
+    char *out;
+    if (absolute) {
+        out = sxn_win_normalize(resolved);
+    } else {
+        char *cwd = sxn_getcwd_alloc();
+        size_t len = strlen(cwd) + 1 + strlen(resolved) + 1;
+        char *combined = malloc(len);
+        snprintf(combined, len, "%s\\%s", cwd, resolved);
+        out = sxn_win_normalize(combined);
+        free(combined);
+        free(cwd);
+    }
+    free(resolved);
+    SxnWinRoot root;
+    sxn_win_root(out, &root);
+    size_t out_len = strlen(out);
+    if (out_len > root.length && sxn_win_sep(out[out_len - 1])) out[out_len - 1] = 0;
+    return out;
+}
+
+/* basename, dirname and extname follow Node's own loops rather than a
+   root-prefix model: on Windows the interesting cases -- a UNC share, a
+   drive-relative path, a name that is all dots -- are exactly where a
+   simpler model and Node disagree. */
+
+/* Where the path proper starts: past a drive letter, if there is one. */
+static size_t sxn_win_root_start(const char *p, size_t len) {
+    if (len >= 2 && ((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')) && p[1] == ':')
+        return 2;
+    return 0;
+}
+
+static char *sxn_win_basename_core(const char *p, const char *suffix) {
+    size_t len = strlen(p);
+    size_t start = sxn_win_root_start(p, len);
+    long end = -1;
+    bool matched_slash = true;
+    size_t begin = start;
+    for (long i = (long)len - 1; i >= (long)start; i--) {
+        if (sxn_win_sep(p[i])) {
+            if (!matched_slash) { begin = (size_t)i + 1; break; }
+        } else if (end == -1) {
+            matched_slash = false;
+            end = i + 1;
+        }
+    }
+    if (end == -1) return sxn_strndup("", 0);
+    size_t base_len = (size_t)end - begin;
+    if (suffix) {
+        size_t slen = strlen(suffix);
+        if (base_len > slen && !memcmp(p + begin + base_len - slen, suffix, slen)) base_len -= slen;
+    }
+    return sxn_strndup(p + begin, base_len);
+}
+
+static char *sxn_win_dirname_core(const char *p) {
+    size_t len = strlen(p);
+    if (len == 0) return strdup(".");
+    size_t root_end = 0;
+    size_t offset = 0;
+    if (len > 1 && sxn_win_sep(p[0])) {
+        root_end = offset = 1;
+        if (sxn_win_sep(p[1])) {
+            /* \\server\share: the root runs to the end of the share name. */
+            size_t j = 2, last = j;
+            while (j < len && !sxn_win_sep(p[j])) j++;
+            if (j < len && j != last) {
+                last = j;
+                while (j < len && sxn_win_sep(p[j])) j++;
+                if (j < len && j != last) {
+                    last = j;
+                    while (j < len && !sxn_win_sep(p[j])) j++;
+                    if (j == len) return sxn_strndup(p, len);
+                    if (j != last) root_end = offset = j + 1;
+                }
+            }
+        }
+    } else if (sxn_win_root_start(p, len) == 2) {
+        root_end = len > 2 && sxn_win_sep(p[2]) ? 3 : 2;
+        offset = root_end;
+    }
+    long end = -1;
+    bool matched_slash = true;
+    for (long i = (long)len - 1; i >= (long)offset; i--) {
+        if (sxn_win_sep(p[i])) {
+            if (!matched_slash) { end = i; break; }
+        } else {
+            matched_slash = false;
+        }
+    }
+    if (end == -1) {
+        if (root_end == 0) return strdup(".");
+        return sxn_strndup(p, root_end);
+    }
+    if (end == 0) return sxn_strndup(p, 1);
+    return sxn_strndup(p, (size_t)end);
+}
+
+static char *sxn_win_extname_core(const char *p) {
+    size_t len = strlen(p);
+    size_t start = sxn_win_root_start(p, len);
+    long start_dot = -1, start_part = (long)start, end = -1;
+    bool matched_slash = true;
+    /* 0 = nothing seen yet, 1 = only dots so far, -1 = a real character. */
+    int pre_dot = 0;
+    for (long i = (long)len - 1; i >= (long)start; i--) {
+        char c = p[i];
+        if (sxn_win_sep(c)) {
+            if (!matched_slash) { start_part = i + 1; break; }
+            continue;
+        }
+        if (end == -1) { matched_slash = false; end = i + 1; }
+        if (c == '.') {
+            if (start_dot == -1) start_dot = i;
+            else if (pre_dot != 1) pre_dot = 1;
+        } else if (start_dot != -1) {
+            pre_dot = -1;
+        }
+    }
+    if (start_dot == -1 || end == -1 || pre_dot == 0
+        || (pre_dot == 1 && start_dot == end - 1 && start_dot == start_part + 1))
+        return sxn_strndup("", 0);
+    return sxn_strndup(p + start_dot, (size_t)(end - start_dot));
+}
+
+static JSValue js_path_win_normalize(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    const char *p = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+    if (!p) return JS_EXCEPTION;
+    char *out = sxn_win_normalize(p);
+    JS_FreeCString(ctx, p);
+    JSValue result = JS_NewString(ctx, out);
+    free(out);
+    return result;
+}
+
+static JSValue js_path_win_is_absolute(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    const char *p = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+    if (!p) return JS_EXCEPTION;
+    bool abs = sxn_win_is_absolute(p);
+    JS_FreeCString(ctx, p);
+    return JS_NewBool(ctx, abs);
+}
+
+static JSValue js_path_win_join(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    return sxn_cstr_list_call(ctx, argc, argv, sxn_win_join_core);
+}
+
+static JSValue js_path_win_resolve(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    return sxn_cstr_list_call(ctx, argc, argv, sxn_win_resolve_core);
+}
+
+static JSValue js_path_win_dirname(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    const char *p = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+    if (!p) return JS_EXCEPTION;
+    char *out = sxn_win_dirname_core(p);
+    JS_FreeCString(ctx, p);
+    JSValue result = JS_NewString(ctx, out);
+    free(out);
+    return result;
+}
+
+static JSValue js_path_win_basename(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    const char *p = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+    if (!p) return JS_EXCEPTION;
+    const char *suffix = argc > 1 && JS_IsString(argv[1]) ? JS_ToCString(ctx, argv[1]) : NULL;
+    char *base = sxn_win_basename_core(p, suffix);
+    JS_FreeCString(ctx, p);
+    if (suffix) JS_FreeCString(ctx, suffix);
+    JSValue result = JS_NewString(ctx, base);
+    free(base);
+    return result;
+}
+
+static JSValue js_path_win_extname(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    const char *p = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+    if (!p) return JS_EXCEPTION;
+    char *ext = sxn_win_extname_core(p);
+    JS_FreeCString(ctx, p);
+    JSValue result = JS_NewString(ctx, ext);
+    free(ext);
+    return result;
+}
+
+/* Case-insensitive, because Windows paths are. */
+static int sxn_win_casecmp(const char *a, const char *b) {
+    for (; *a && *b; a++, b++) {
+        int ca = (unsigned char)*a, cb = (unsigned char)*b;
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return ca - cb;
+    }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
+static JSValue js_path_win_relative(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    const char *from_in = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+    const char *to_in = argc > 1 ? JS_ToCString(ctx, argv[1]) : NULL;
+    if (!from_in || !to_in) {
+        if (from_in) JS_FreeCString(ctx, from_in);
+        if (to_in) JS_FreeCString(ctx, to_in);
+        return JS_EXCEPTION;
+    }
+    const char *one[1];
+    one[0] = from_in; char *from = sxn_win_resolve_core(one, 1);
+    one[0] = to_in;   char *to = sxn_win_resolve_core(one, 1);
+    JS_FreeCString(ctx, from_in);
+    JS_FreeCString(ctx, to_in);
+    if (!strcmp(from, to)) { free(from); free(to); return JS_NewString(ctx, ""); }
+
+    SxnStrVec fs_ = {0}, ts = {0};
+    sxn_win_reduce(&fs_, from, false);
+    sxn_win_reduce(&ts, to, false);
+    size_t common = 0;
+    while (common < fs_.len && common < ts.len && !sxn_win_casecmp(fs_.items[common], ts.items[common])) common++;
+
+    DynStr out = {0};
+    for (size_t i = common; i < fs_.len; i++) {
+        if (out.len) dynstr_add(&out, "\\", 1);
+        dynstr_add(&out, "..", 2);
+    }
+    for (size_t i = common; i < ts.len; i++) {
+        if (out.len) dynstr_add(&out, "\\", 1);
+        dynstr_add(&out, ts.items[i], strlen(ts.items[i]));
+    }
+    sxn_strvec_free(&fs_);
+    sxn_strvec_free(&ts);
+    free(from);
+    free(to);
+    JSValue result = JS_NewStringLen(ctx, out.data ? out.data : "", out.len);
+    free(out.data);
+    return result;
+}
+
 static const char *node_querystring_names[] = { "parse", "stringify", "escape", "unescape", "decode", "encode" };
 static const char *node_url_names[] = {
     "URL", "URLSearchParams", "fileURLToPath", "pathToFileURL", "format", "parse",
@@ -1942,6 +2349,14 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
     JS_SetPropertyStr(ctx, global, "__sxnPosixBasename", JS_NewCFunction(ctx, js_path_posix_basename, "basename", 2));
     JS_SetPropertyStr(ctx, global, "__sxnPosixExtname", JS_NewCFunction(ctx, js_path_posix_extname, "extname", 1));
     JS_SetPropertyStr(ctx, global, "__sxnPosixRelative", JS_NewCFunction(ctx, js_path_posix_relative, "relative", 2));
+    JS_SetPropertyStr(ctx, global, "__sxnWinNormalize", JS_NewCFunction(ctx, js_path_win_normalize, "normalize", 1));
+    JS_SetPropertyStr(ctx, global, "__sxnWinIsAbsolute", JS_NewCFunction(ctx, js_path_win_is_absolute, "isAbsolute", 1));
+    JS_SetPropertyStr(ctx, global, "__sxnWinJoin", JS_NewCFunction(ctx, js_path_win_join, "join", 2));
+    JS_SetPropertyStr(ctx, global, "__sxnWinResolve", JS_NewCFunction(ctx, js_path_win_resolve, "resolve", 2));
+    JS_SetPropertyStr(ctx, global, "__sxnWinDirname", JS_NewCFunction(ctx, js_path_win_dirname, "dirname", 1));
+    JS_SetPropertyStr(ctx, global, "__sxnWinBasename", JS_NewCFunction(ctx, js_path_win_basename, "basename", 2));
+    JS_SetPropertyStr(ctx, global, "__sxnWinExtname", JS_NewCFunction(ctx, js_path_win_extname, "extname", 1));
+    JS_SetPropertyStr(ctx, global, "__sxnWinRelative", JS_NewCFunction(ctx, js_path_win_relative, "relative", 2));
     JS_SetPropertyStr(ctx, global, "__sxnQsParse", JS_NewCFunction(ctx, js_qs_parse, "parse", 4));
     JS_SetPropertyStr(ctx, global, "__sxnQsStringify", JS_NewCFunction(ctx, js_qs_stringify, "stringify", 3));
     JS_SetPropertyStr(ctx, global, "__sxnQsEscape", JS_NewCFunction(ctx, js_qs_escape, "escape", 1));
