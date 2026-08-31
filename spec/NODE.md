@@ -113,7 +113,16 @@ string work with no JavaScript state of its own.
 Native now: `path` in both halves, `querystring`, `net.isIP`, `os` in full
 (from libuv), `fs`'s `stat`/`lstat` and the read primitives, `crypto`'s
 digests, HMAC and `timingSafeEqual`, `zlib`'s deflate and inflate, Buffer's
-encodings and numeric accessors, and `EventEmitter`'s `on`/`emit` fast path.
+encodings, lenient hex/base64 readers and numeric accessors, `util.format`,
+and `EventEmitter`'s `on`/`emit` fast path.
+
+The last two moves are worth reporting honestly, because they say where the
+seam is: the lenient base64 reader and `util.format` are correct and match
+Node exactly, but neither is much faster than the JavaScript it replaced --
+`format("a plain message")` went from 0.24 to 0.18 microseconds and the rest
+is a wash. The work in both had already shrunk to the JavaScript-to-C
+boundary itself. That is the shape of what is left everywhere else in this
+file.
 
 Still JavaScript, with the reason measured rather than asserted:
 
