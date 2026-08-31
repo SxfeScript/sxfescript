@@ -38,6 +38,9 @@
   pre.install-cmd {
     margin: 0 0 10px; padding: 14px 52px 14px 18px; font-size: 14px;
     display: inline-flex; align-items: center; gap: 20px; position: relative;
+    /* The command is one long unbreakable line; without this the inline-flex
+       box sizes to it and drags the whole column wider than a phone. */
+    max-width: 100%;
   }
   pre.install-cmd[hidden] { display: none; }
   pre.install-cmd code { color: var(--safe); }
@@ -45,9 +48,19 @@
      the way it does on a multi-line block. */
   pre.install-cmd .copy-btn { top: 50%; transform: translateY(-50%); }
   p.install-note { font-size: 13px; color: var(--ink-soft); margin: 0 0 44px; }
-  .hero-grid { display: grid; grid-template-columns: 1.15fr .85fr; gap: 48px; align-items: start; }
-  @media (max-width: 860px) { .hero-grid { grid-template-columns: 1fr; } }
-  .compare-hero { display: grid; grid-template-columns: 1fr; gap: 14px; }
+  /* minmax(0, ...) rather than a bare fraction, and min-width on the items:
+     a grid track's automatic minimum is its content's min-content width, and
+     a <pre> of code has no wrap opportunities, so an unqualified 1fr grew the
+     column past the viewport on a phone and the page was clipped rather than
+     laid out. The same reason .doc carries min-width: 0. */
+  .hero-grid {
+    display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, .85fr);
+    gap: 48px; align-items: start;
+  }
+  .hero-grid > * { min-width: 0; }
+  @media (max-width: 860px) { .hero-grid { grid-template-columns: minmax(0, 1fr); } }
+  .compare-hero { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+  .compare-hero > * { min-width: 0; }
   .compare-hero pre { margin: 0; font-size: 12.6px; }
   .compare-hero .highlight { margin: 0; }
   .compare-label {
@@ -94,8 +107,9 @@
   }
   p.lede-s { color: var(--ink-mid); max-width: 62ch; margin: 0 0 32px; }
 
-  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  @media (max-width: 760px) { .grid-2 { grid-template-columns: 1fr; } }
+  .grid-2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+  .grid-2 > * { min-width: 0; }
+  @media (max-width: 760px) { .grid-2 { grid-template-columns: minmax(0, 1fr); } }
 
   .card {
     background: var(--card); border: 1px solid var(--rule); border-radius: 10px;

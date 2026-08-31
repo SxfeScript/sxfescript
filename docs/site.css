@@ -45,7 +45,11 @@
 
 * { box-sizing: border-box; }
 html {
-  scroll-behavior: smooth; overflow-x: hidden;
+  /* `clip`, not `hidden`: hidden makes this element a scroll container, which
+     both swallows a too-wide child silently and re-parents position:sticky to
+     it. clip keeps the sticky nav pinned to the viewport and still contains
+     the full-bleed band section's 50vw margins. */
+  scroll-behavior: smooth; overflow-x: clip;
   scrollbar-color: color-mix(in srgb, var(--accent) 55%, var(--rule)) transparent;
   scrollbar-width: thin;
 }
@@ -63,7 +67,7 @@ html {
 }
 ::-webkit-scrollbar-thumb:hover { background: var(--accent); background-clip: padding-box; }
 body {
-  margin: 0; color: var(--ink); overflow-x: hidden;
+  margin: 0; color: var(--ink); overflow-x: clip;
   /* A bright violet-blue glow top-left, a faint warm counterpoint
      top-right, fading to the flat page color by the time content
      scrolls past them. */
