@@ -220,6 +220,32 @@ than the interpreter's own store on a fresh object, so plain field
 initialisation stays where it is. The socket above is not a
 counter-example -- what made it fast was not setting the fields at all.
 
+`Writable#write` was allocating a closure per chunk to say nothing: the
+callback it must hand `_write` was built fresh even when the caller passed
+none, and it closed over a `backpressure` flag that was never set. Callers
+with no callback of their own -- `res.write`, and every write a pipe makes --
+get a shared native no-op now, and a write went from 0.195 microseconds to
+0.130.
+
+A sweep of what is left, measured rather than guessed, so the next person
+does not have to re-derive it:
+
+| Piece | Cost here | Where it goes |
+| --- | --- | --- |
+| `path.extname` | 0.060 us | already C |
+| `Writable#write` | 0.130 us | C no-op callback; the rest is `_write` |
+| `querystring.stringify` | 0.155 us | already C |
+| `path.join` | 0.225 us | already C |
+| `querystring.parse` | 0.235 us | already C |
+| `Readable#push` + emit | 0.290 us | the emit is C; the wrap is not (see below) |
+| `PassThrough#write` | 0.600 us | two emitter hops, both already C |
+| `new URL` | 0.885 us | the engine's own |
+| `createRequire` | 1.00 us | already C |
+
+Nothing in that list is a JavaScript loop any more. What remains in the file
+around them is dispatch: argument shuffling, a check, and a call into
+something that is already native.
+
 Still JavaScript, with the reason measured rather than asserted:
 
 - **`stream` and `http`.** A `node:http` request costs 13.4 us here against

@@ -3100,6 +3100,15 @@ static JSValue js_concat_bytes(JSContext *ctx, JSValueConst this_val, int argc, 
     return result;
 }
 
+
+/* A do-nothing callback, shared. A Writable has to hand its _write one, and
+   a write with no callback of its own was allocating a closure per chunk to
+   say nothing. */
+static JSValue js_noop(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    return JS_UNDEFINED;
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -3580,6 +3589,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnNoop", JS_NewCFunction(ctx, js_noop, "noop", 0));
     JS_SetPropertyStr(ctx, global, "__sxnConcatBytes", JS_NewCFunction(ctx, js_concat_bytes, "__sxnConcatBytes", 2));
     JS_SetPropertyStr(ctx, global, "__sxnSetHeader", JS_NewCFunctionMagic(ctx, js_header_op, "setHeader", 2, JS_CFUNC_generic_magic, 0));
     JS_SetPropertyStr(ctx, global, "__sxnGetHeader", JS_NewCFunctionMagic(ctx, js_header_op, "getHeader", 1, JS_CFUNC_generic_magic, 1));

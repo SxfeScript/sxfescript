@@ -697,14 +697,15 @@
       if (cb) cb(e);
       return false;
     }
-    let sync = true, backpressure = false;
-    this._write(chunk, enc || "utf8", (err) => {
-      if (err) { this.emit("error", err); if (cb) cb(err); return; }
-      if (cb) cb(null);
-      if (backpressure) queueMicrotask(() => this.emit("drain"));
+    // A write with no callback of its own -- res.write, and every write a
+    // pipe makes -- gets the shared native no-op instead of a closure built
+    // to say nothing.
+    if (cb === undefined) this._write(chunk, enc || "utf8", __sxnNoop);
+    else this._write(chunk, enc || "utf8", (err) => {
+      if (err) { this.emit("error", err); cb(err); return; }
+      cb(null);
     });
-    sync = false; void sync;
-    return !backpressure;
+    return true;
   };
   Writable.prototype.cork = function () { this._corked++; };
   Writable.prototype.uncork = function () { if (this._corked) this._corked--; };
