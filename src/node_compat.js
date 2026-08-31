@@ -1513,29 +1513,11 @@
     return out;
   }
 
-  function format(...args) {
-    if (typeof args[0] !== "string") return args.map((a) => inspect(a)).join(" ");
-    // With nothing to substitute, Node returns the string untouched -- even
-    // "%%" stays as written.
-    if (args.length === 1) return args[0];
-    let i = 1;
-    let out = args[0].replace(/%[sdifjoOc%]/g, (m) => {
-      if (m === "%%") return "%";
-      if (i >= args.length) return m;
-      const a = args[i++];
-      switch (m) {
-        case "%s": return typeof a === "string" ? a : inspect(a);
-        case "%d": case "%f": return typeof a === "bigint" ? a + "n" : Number(a).toString();
-        case "%i": return typeof a === "bigint" ? a + "n" : parseInt(a, 10).toString();
-        case "%j": try { return JSON.stringify(a); } catch { return "[Circular]"; }
-        case "%o": case "%O": return inspect(a, { depth: 4 });
-        case "%c": return "";
-        default: return m;
-      }
-    });
-    for (; i < args.length; i++) out += " " + (typeof args[i] === "string" ? args[i] : inspect(args[i]));
-    return out;
-  }
+  // Native (js_util_format in src/node.c): the scan and the substitution are
+  // string work. Only the cases that need inspect -- %s of something that is
+  // not a string, and %o/%O -- come back into JavaScript, which is why
+  // inspect is handed over as the first argument.
+  const format = (...args) => __sxnFormat(inspect, ...args);
 
   const util = {
     inspect,

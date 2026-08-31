@@ -2451,6 +2451,120 @@ static JSValue js_base64_bytes(JSContext *ctx, JSValueConst this_val, int argc, 
     return JS_NewUint8Array(ctx, out, n, sxn_free_plain_buffer, NULL, false);
 }
 
+
+/* util.format, in C. The scan and the substitution are string work; only
+   the two cases that need util.inspect -- %s of something that is not a
+   string, and %o/%O -- call back into JavaScript, and the inspect function
+   is handed in for that. %j is JSON, which the engine already has. */
+static void sxn_format_append_value(JSContext *ctx, DynStr *out, JSValueConst value) {
+    size_t len = 0;
+    const char *text = JS_ToCStringLen(ctx, &len, value);
+    if (text) { dynstr_add(out, text, len); JS_FreeCString(ctx, text); }
+}
+
+/* Calls the JavaScript inspect that was passed as the first argument. */
+static void sxn_format_inspect(JSContext *ctx, DynStr *out, JSValueConst inspect, JSValueConst value, int depth) {
+    JSValue args[2];
+    args[0] = JS_DupValue(ctx, value);
+    if (depth >= 0) {
+        args[1] = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, args[1], "depth", JS_NewInt32(ctx, depth));
+    } else {
+        args[1] = JS_UNDEFINED;
+    }
+    JSValue text = JS_Call(ctx, inspect, JS_UNDEFINED, depth >= 0 ? 2 : 1, (JSValueConst *)args);
+    JS_FreeValue(ctx, args[0]);
+    JS_FreeValue(ctx, args[1]);
+    if (!JS_IsException(text)) sxn_format_append_value(ctx, out, text);
+    JS_FreeValue(ctx, text);
+}
+
+static JSValue js_util_format(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_NewString(ctx, "");
+    JSValueConst inspect = argv[0];
+    int first = 1;
+    DynStr out = {0};
+    /* Without a string to substitute into, everything is inspected. */
+    if (argc <= first || !JS_IsString(argv[first])) {
+        for (int i = first; i < argc; i++) {
+            if (i > first) dynstr_add(&out, " ", 1);
+            sxn_format_inspect(ctx, &out, inspect, argv[i], -1);
+        }
+        JSValue result = JS_NewStringLen(ctx, out.data ? out.data : "", out.len);
+        free(out.data);
+        return result;
+    }
+    /* One argument: Node hands the string back untouched, "%%" included. */
+    if (argc == first + 1) return JS_DupValue(ctx, argv[first]);
+
+    size_t len = 0;
+    const char *fmt = JS_ToCStringLen(ctx, &len, argv[first]);
+    if (!fmt) return JS_EXCEPTION;
+    int next = first + 1;
+    size_t i = 0;
+    while (i < len) {
+        if (fmt[i] != '%' || i + 1 >= len) { dynstr_add(&out, fmt + i, 1); i++; continue; }
+        char kind = fmt[i + 1];
+        if (kind == '%') { dynstr_add(&out, "%", 1); i += 2; continue; }
+        if (!strchr("sdifjoOc", kind) || next >= argc) { dynstr_add(&out, fmt + i, 1); i++; continue; }
+        JSValueConst value = argv[next++];
+        i += 2;
+        switch (kind) {
+        case 's':
+            if (JS_IsString(value)) sxn_format_append_value(ctx, &out, value);
+            else sxn_format_inspect(ctx, &out, inspect, value, -1);
+            break;
+        case 'd': case 'f': {
+            if (JS_IsBigInt(value)) { sxn_format_append_value(ctx, &out, value); dynstr_add(&out, "n", 1); break; }
+            double d = 0;
+            if (JS_ToFloat64(ctx, &d, value)) { JS_FreeValue(ctx, JS_GetException(ctx)); d = NAN; }
+            JSValue number = JS_NewFloat64(ctx, d);
+            sxn_format_append_value(ctx, &out, number);
+            JS_FreeValue(ctx, number);
+            break;
+        }
+        case 'i': {
+            if (JS_IsBigInt(value)) { sxn_format_append_value(ctx, &out, value); dynstr_add(&out, "n", 1); break; }
+            double d = 0;
+            if (JS_ToFloat64(ctx, &d, value)) { JS_FreeValue(ctx, JS_GetException(ctx)); d = NAN; }
+            JSValue number = JS_NewFloat64(ctx, isnan(d) ? NAN : trunc(d));
+            sxn_format_append_value(ctx, &out, number);
+            JS_FreeValue(ctx, number);
+            break;
+        }
+        case 'j': {
+            JSValue json = JS_JSONStringify(ctx, value, JS_UNDEFINED, JS_UNDEFINED);
+            if (JS_IsException(json)) {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+                dynstr_add(&out, "[Circular]", 10);
+            } else if (JS_IsUndefined(json)) {
+                dynstr_add(&out, "undefined", 9);
+            } else {
+                sxn_format_append_value(ctx, &out, json);
+            }
+            JS_FreeValue(ctx, json);
+            break;
+        }
+        case 'o': case 'O':
+            sxn_format_inspect(ctx, &out, inspect, value, 4);
+            break;
+        case 'c':
+            break;   /* a CSS directive, which has nothing to say here */
+        }
+    }
+    JS_FreeCString(ctx, fmt);
+    /* Whatever is left over follows, separated by spaces. */
+    for (; next < argc; next++) {
+        dynstr_add(&out, " ", 1);
+        if (JS_IsString(argv[next])) sxn_format_append_value(ctx, &out, argv[next]);
+        else sxn_format_inspect(ctx, &out, inspect, argv[next], -1);
+    }
+    JSValue result = JS_NewStringLen(ctx, out.data ? out.data : "", out.len);
+    free(out.data);
+    return result;
+}
+
 static const char *node_querystring_names[] = { "parse", "stringify", "escape", "unescape", "decode", "encode" };
 static const char *node_url_names[] = {
     "URL", "URLSearchParams", "fileURLToPath", "pathToFileURL", "format", "parse",
@@ -2722,6 +2836,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnFormat", JS_NewCFunction(ctx, js_util_format, "__sxnFormat", 3));
     JS_SetPropertyStr(ctx, global, "__sxnHexBytes", JS_NewCFunction(ctx, js_hex_bytes, "__sxnHexBytes", 1));
     JS_SetPropertyStr(ctx, global, "__sxnBase64Bytes", JS_NewCFunction(ctx, js_base64_bytes, "__sxnBase64Bytes", 1));
     JS_SetPropertyStr(ctx, global, "__sxnIsIP", JS_NewCFunction(ctx, js_net_is_ip, "isIP", 1));

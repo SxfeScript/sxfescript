@@ -353,6 +353,9 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # Buffer's numeric accessors and compare, against Node's own answers.
   add_test(NAME sxn-node-buffer-numbers COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_buffer_numbers.mjs)
   set_tests_properties(sxn-node-buffer-numbers PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # util.format, against Node's own output.
+  add_test(NAME sxn-node-format COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_format.mjs)
+  set_tests_properties(sxn-node-format PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   # Every Buffer encoding in both directions, including Node's lenient hex and
   # base64 readers. Expectations are Node's own output, so a divergence fails.
   add_test(NAME sxn-buffer-encodings COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/buffer_encodings.mjs)
