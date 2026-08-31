@@ -84,6 +84,26 @@ check("toJSON on a shape seen before", JSON.stringify([{ a: 1 }, { a: 1, toJSON:
   delete Object.prototype.toJSON;
   check("toJSON from the prototype", out, '"P"');
 }
+{
+  // Two proxies with different traps but the same (empty) shape: what the
+  // first one answers about toJSON must not be assumed of the second.
+  const p1 = new Proxy({ a: 1 }, { get(t, k) { return k === "toJSON" ? undefined : t[k]; } });
+  const p2 = new Proxy({ a: 1 }, { get(t, k) { return k === "toJSON" ? () => "second" : t[k]; } });
+  check("proxies are not one shape", JSON.stringify([p1, p2]), '[{"a":1},"second"]');
+}
+// The key list is taken once, before any getter runs: a getter that changes
+// another key's enumerability cannot change what is written.
+check("enumerability is a snapshot",
+      JSON.stringify({ get a() { Object.defineProperty(this, "b", { value: 2, enumerable: false }); return 1; }, b: 2 }),
+      '{"a":1,"b":2}');
+check("a key made enumerable mid-run",
+      JSON.stringify(Object.defineProperties({}, {
+        a: { enumerable: true, get() { Object.defineProperty(this, "b", { enumerable: true }); return 1; } },
+        b: { value: 2, enumerable: false, configurable: true },
+      })),
+      '{"a":1}');
+check("__proto__ is an own key", JSON.stringify(JSON.parse('{"__proto__":{"x":1}}')), '{"__proto__":{"x":1}}');
+check("__proto__ does not set the prototype", Object.getPrototypeOf(JSON.parse('{"__proto__":{"x":1}}')) === Object.prototype, true);
 check("non-enumerable keys are skipped", JSON.stringify(Object.defineProperty({ a: 1 }, "b", { value: 2 })), '{"a":1}');
 check("a getter's value is used", JSON.stringify({ get a() { return 7; } }), '{"a":7}');
 check("numeric keys sort first", JSON.stringify({ b: 1, 2: 2, a: 3, 1: 4 }), '{"1":4,"2":2,"b":1,"a":3}');

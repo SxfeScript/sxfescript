@@ -4746,6 +4746,20 @@ static no_inline int string_buffer_putc16_slow(StringBuffer *s, uint32_t c)
 }
 
 /* 0 <= c <= 0xff */
+static int string_buffer_putc8(StringBuffer *s, uint32_t c);
+
+/* The one-byte case, inline: JSON.stringify calls this for every brace,
+   comma, colon and quote -- half a dozen times per property -- and the call
+   itself was costing more than the store. */
+static inline int string_buffer_putc8_fast(StringBuffer *s, uint32_t c)
+{
+    if (likely(s->len < s->size && !s->is_wide_char)) {
+        str8(s->str)[s->len++] = c;
+        return 0;
+    }
+    return string_buffer_putc8(s, c);
+}
+
 static int string_buffer_putc8(StringBuffer *s, uint32_t c)
 {
     if (unlikely(s->len >= s->size)) {
@@ -5554,8 +5568,11 @@ const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1,
                mostly ASCII even when one accent makes the whole string
                wide, and this loop is what every JS_ToCString of such a
                string spends its time in. */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
             while (pos + 4 <= len) {
                 uint64_t v = get_u64((const uint8_t *)(src + pos));
+                /* Little-endian only: the mask says "the high byte of each
+                   16-bit unit is zero and its low byte is below 0x80". */
                 if (v & 0xff80ff80ff80ff80ULL)
                     break;
                 q[0] = (uint8_t)src[pos];
@@ -5565,6 +5582,7 @@ const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1,
                 q += 4;
                 pos += 4;
             }
+#endif
             if (pos >= len)
                 break;
             c = src[pos++];
@@ -16065,7 +16083,7 @@ static int string_buffer_quote(StringBuffer *b, JSValueConst val1)
         return -1;
     p = JS_VALUE_GET_STRING(val);
 
-    if (string_buffer_putc8(b, '\"'))
+    if (string_buffer_putc8_fast(b, '\"'))
         goto fail;
     for(i = 0; i < p->len; ) {
         /* Everything up to the next character needing an escape goes over in
@@ -16107,9 +16125,9 @@ static int string_buffer_quote(StringBuffer *b, JSValueConst val1)
         case '\"':
         case '\\':
         quote:
-            if (string_buffer_putc8(b, '\\'))
+            if (string_buffer_putc8_fast(b, '\\'))
                 goto fail;
-            if (string_buffer_putc8(b, c))
+            if (string_buffer_putc8_fast(b, c))
                 goto fail;
             break;
         default:
@@ -16124,7 +16142,7 @@ static int string_buffer_quote(StringBuffer *b, JSValueConst val1)
             break;
         }
     }
-    if (string_buffer_putc8(b, '\"'))
+    if (string_buffer_putc8_fast(b, '\"'))
         goto fail;
     JS_FreeValue(ctx, val);
     return 0;
@@ -54283,8 +54301,8 @@ static JSValue js_json_rawJSON(JSContext *ctx, JSValueConst this_val,
    references -- when anything about the object is not ordinary, and the
    caller falls back to the general path. */
 static bool json_collect_plain_keys(JSContext *ctx, JSObject *p,
-                                    JSPropertyEnum *tab, uint32_t size,
-                                    uint32_t *plen)
+                                    JSPropertyEnum *tab, uint16_t *slots,
+                                    uint32_t size, uint32_t *plen)
 {
     JSShape *sh = p->shape;
     JSShapeProperty *prs;
@@ -54297,14 +54315,22 @@ static bool json_collect_plain_keys(JSContext *ctx, JSObject *p,
         if (atom == JS_ATOM_NULL)
             continue;
         /* A numeric key would have to be sorted ahead of the others, and a
-           symbol is not a JSON key at all: leave both to the general path. */
+           symbol is not a JSON key at all: leave both to the general path,
+           along with anything that is not a plain stored value -- a getter
+           has to be called, and the caller reads the slot directly. */
         if (JS_AtomGetKind(ctx, atom) != JS_ATOM_KIND_STRING
             || JS_AtomIsArrayIndex(ctx, &num_key, atom))
             return false;
-        if ((prs->flags & JS_PROP_TMASK) == JS_PROP_VARREF)
+        if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
             return false;
+        /* Enumerability is decided here, once, the way the specification's
+           EnumerableOwnPropertyNames decides it -- not again per property
+           after a getter has had the chance to change it. */
+        if (!(prs->flags & JS_PROP_ENUMERABLE))
+            continue;
         tab[n].atom = JS_DupAtom(ctx, atom);
-        tab[n].is_enumerable = ((prs->flags & JS_PROP_ENUMERABLE) != 0);
+        tab[n].is_enumerable = true;
+        slots[n] = (uint16_t)i;
         n++;
     }
     *plen = n;
@@ -54349,9 +54375,17 @@ static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
 		f = JS_GetProperty(ctx, val, JS_ATOM_toJSON);
 		if (JS_IsException(f))
 			goto exception;
-		if (o && JS_IsUndefined(f)) {
-			jsc->no_tojson_shape = o->shape;
-			jsc->no_tojson_gen = ctx->rt->prop_cache_gen;
+		/* Only for an ordinary object with an ordinary chain. Every Proxy
+		   shares one shape and answers from its own trap, so what one of them
+		   said about toJSON says nothing about the next. */
+		if (o && JS_IsUndefined(f) && !o->is_exotic) {
+			JSObject *chain = o;
+			while ((chain = chain->shape->proto) != NULL && !chain->is_exotic)
+				;
+			if (chain == NULL) {
+				jsc->no_tojson_shape = o->shape;
+				jsc->no_tojson_gen = ctx->rt->prop_cache_gen;
+			}
 		}
 		if (JS_IsFunction(ctx, f)) {
 			v = JS_CallFree(ctx, f, val, 1, &key);
@@ -54407,7 +54441,9 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
     JSValue indent1, sep, sep1, tab, v, prop;
     JSObject *p;
     JSPropertyEnum *atoms = NULL, stack_atoms[16];
-    uint32_t atom_count = 0;
+    uint16_t stack_slots[16];
+    JSShape *keys_shape = NULL;
+    uint32_t keys_gen = 0, atom_count = 0;
     int64_t i, len;
     int cl, ret;
     bool has_content;
@@ -54478,10 +54514,10 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
         if (ret) {
             if (js_get_length64(ctx, &len, val))
                 goto exception;
-            string_buffer_putc8(jsc->b, '[');
+            string_buffer_putc8_fast(jsc->b, '[');
             for(i = 0; i < len; i++) {
                 if (i > 0)
-                    string_buffer_putc8(jsc->b, ',');
+                    string_buffer_putc8_fast(jsc->b, ',');
                 string_buffer_concat_value(jsc->b, sep);
                 v = JS_GetPropertyInt64(ctx, val, i);
                 if (JS_IsException(v))
@@ -54501,10 +54537,10 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                     goto exception;
             }
             if (len > 0 && !JS_IsEmptyString(jsc->gap)) {
-                string_buffer_putc8(jsc->b, '\n');
+                string_buffer_putc8_fast(jsc->b, '\n');
                 string_buffer_concat_value(jsc->b, indent);
             }
-            string_buffer_putc8(jsc->b, ']');
+            string_buffer_putc8_fast(jsc->b, ']');
         } else {
             /* An ordinary object with no replacer list: walk its own atoms
                rather than building an array of key strings and looking each
@@ -54516,13 +54552,38 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                 && JS_VALUE_GET_OBJ(val)->class_id == JS_CLASS_OBJECT
                 && !JS_VALUE_GET_OBJ(val)->is_exotic) {
                 if (json_collect_plain_keys(ctx, JS_VALUE_GET_OBJ(val),
-                                            stack_atoms, countof(stack_atoms),
-                                            &atom_count)) {
+                                            stack_atoms, stack_slots,
+                                            countof(stack_atoms), &atom_count)) {
                     atoms = stack_atoms;
+                    keys_shape = JS_VALUE_GET_OBJ(val)->shape;
+                    keys_gen = ctx->rt->prop_cache_gen;
                 } else if (JS_GetOwnPropertyNamesInternal(ctx, &atoms, &atom_count,
                                                           JS_VALUE_GET_OBJ(val),
                                                           JS_GPN_STRING_MASK)) {
                     goto exception;
+                } else {
+                    /* Drop what is not enumerable now, before any getter can
+                       run: the list js_object_keys would have built is a
+                       snapshot, and so is this one. */
+                    uint32_t k = 0, j;
+                    for (j = 0; j < atom_count; j++) {
+                        int desc_flags, res;
+                        res = JS_GetOwnPropertyFlagsInternal(ctx, &desc_flags,
+                                                             JS_VALUE_GET_OBJ(val),
+                                                             atoms[j].atom);
+                        if (res < 0) {
+                            for (; j < atom_count; j++)
+                                JS_FreeAtom(ctx, atoms[j].atom);
+                            atom_count = k;
+                            goto exception;
+                        }
+                        if (!res || !(desc_flags & JS_PROP_ENUMERABLE)) {
+                            JS_FreeAtom(ctx, atoms[j].atom);
+                            continue;
+                        }
+                        atoms[k++] = atoms[j];
+                    }
+                    atom_count = k;
                 }
                 len = atom_count;
             } else {
@@ -54536,24 +54597,26 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                 if (js_get_length64(ctx, &len, tab))
                     goto exception;
             }
-            string_buffer_putc8(jsc->b, '{');
+            string_buffer_putc8_fast(jsc->b, '{');
             has_content = false;
             for(i = 0; i < len; i++) {
                 JS_FreeValue(ctx, prop);
                 if (atoms) {
                     JSAtom atom = atoms[i].atom;
-                    int desc_flags, res;
-                    res = JS_GetOwnPropertyFlagsInternal(ctx, &desc_flags,
-                                                         JS_VALUE_GET_OBJ(val), atom);
-                    if (res < 0)
-                        goto exception;
-                    prop = JS_UNDEFINED;
-                    if (!res || !(desc_flags & JS_PROP_ENUMERABLE))
-                        continue;
+                    JSObject *po = JS_VALUE_GET_OBJ(val);
+                    /* Nothing has moved since the keys were collected -- same
+                       shape, and the runtime's property-location generation
+                       has not been bumped -- so the slot recorded then is
+                       still this property's. */
+                    if (po->shape == keys_shape && ctx->rt->prop_cache_gen == keys_gen)
+                        v = js_dup(po->prop[stack_slots[i]].u.value);
+                    else
+                        v = JS_GetProperty(ctx, val, atom);
                     prop = JS_AtomToValue(ctx, atom);
-                    if (JS_IsException(prop))
+                    if (JS_IsException(prop)) {
+                        JS_FreeValue(ctx, v);
                         goto exception;
-                    v = JS_GetProperty(ctx, val, atom);
+                    }
                 } else {
                     prop = JS_GetPropertyInt64(ctx, tab, i);
                     if (JS_IsException(prop))
@@ -54567,13 +54630,13 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                     goto exception;
                 if (!JS_IsUndefined(v)) {
                     if (has_content)
-                        string_buffer_putc8(jsc->b, ',');
+                        string_buffer_putc8_fast(jsc->b, ',');
                     string_buffer_concat_value(jsc->b, sep);
                     if (string_buffer_quote(jsc->b, prop)) {
                         JS_FreeValue(ctx, v);
                         goto exception;
                     }
-                    string_buffer_putc8(jsc->b, ':');
+                    string_buffer_putc8_fast(jsc->b, ':');
                     string_buffer_concat_value(jsc->b, sep1);
                     if (js_json_to_str(ctx, jsc, val, v, indent1))
                         goto exception;
@@ -54581,10 +54644,10 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                 }
             }
             if (has_content && JS_VALUE_GET_STRING(jsc->gap)->len != 0) {
-                string_buffer_putc8(jsc->b, '\n');
+                string_buffer_putc8_fast(jsc->b, '\n');
                 string_buffer_concat_value(jsc->b, indent);
             }
-            string_buffer_putc8(jsc->b, '}');
+            string_buffer_putc8_fast(jsc->b, '}');
             if (atoms) {
                 if (atoms == stack_atoms) {
                     for (i = 0; i < atom_count; i++)
