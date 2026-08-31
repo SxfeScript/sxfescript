@@ -265,6 +265,13 @@ value resolves with the first, not with an array of them, and a function that
 throws synchronously produces a rejection rather than throwing out of the
 call.
 
+`pipe` moved for completeness rather than for speed: its four closures, one
+per event, are four C functions sharing the source and the destination, and
+that is worth 1.95 microseconds to 1.83. It was already five times quicker
+than Node's, which does a great deal more bookkeeping. Kept because it is
+four fewer allocations per pipe and costs nothing, not because the number
+means much.
+
 A third sweep, over what a server actually touches, found two corruptions
 rather than costs. `fs/promises.readFile` read the file as text and encoded
 it back to bytes, so every byte that is not valid UTF-8 came back as the
@@ -305,6 +312,7 @@ does not have to re-derive it:
 | `module.isBuiltin` | 0.045 us | C, was 0.415 |
 | `util.inspect` of an object | 2.26 us | C, was 5.26; Node is 1.56 |
 | a promisified call | 0.29 us | C, was 0.62; Node is 0.08 |
+| `readable.pipe` | 1.83 us | C, was 1.95; Node is 7.21 |
 | `process.nextTick` | 0.143 us | C, was 0.620 |
 | `res.getHeaders` | 0.110 us | C, was 0.173 |
 | `res.getHeaderNames` | 0.110 us | C, was 0.157 |
@@ -336,7 +344,7 @@ alone.
 | `path` | 56 | all of it, both posix and win32 | the two tables and the platform choice between them |
 | `process` | 108 | `env`, `cwd`, `chdir`, `nextTick`, `exit`, `pid`, `platform`, `arch`, signal watching | `argv`, the stdio objects, `emitWarning`, `uptime` |
 | `fs` | 89 | reads, writes, `stat`, `exists` | the encoding branch, `Stats`' predicates, `createReadStream`'s wrapper |
-| `stream` | 372 | the chunk queue's cursor, `write`'s callback, the byte joining | the five classes, `pipe`, the async iterator, the Web Streams bridges -- listener bookkeeping, measured slower from C |
+| `stream` | 372 | the chunk queue's cursor, `write`'s callback, `pipe`, the byte joining | the five classes, `pipe`, the async iterator, the Web Streams bridges -- listener bookkeeping, measured slower from C |
 | `http` | 201 | header lowercasing, `rawHeaders`, the socket, the body join, the four header methods, the deferred body | `IncomingMessage` and `ServerResponse` themselves, and the server's promise contract |
 | `net` | 20 | `isIP` | the two wrappers around it, and the honest refusals for real sockets |
 | `crypto` | 94 | digests, HMAC, `timingSafeEqual`, random bytes, every input encoding | `Hash` and `Hmac`'s two-line classes, and the digest encoding branch |

@@ -580,19 +580,10 @@
     queueMicrotask(() => { if (err) this.emit("error", err); this.emit("close"); });
     return this;
   };
-  Readable.prototype.pipe = function (dest, options) {
-    const onData = (chunk) => { if (dest.write(chunk) === false) this.pause(); };
-    const onDrain = () => this.resume();
-    const onEnd = () => { if (!options || options.end !== false) dest.end(); };
-    const onError = (e) => dest.emit("error", e);
-    this.on("data", onData);
-    dest.on("drain", onDrain);
-    this.on("end", onEnd);
-    this.on("error", onError);
-    (this._pipes || (this._pipes = [])).push({ dest, onData, onDrain, onEnd, onError });
-    this.resume();
-    return dest;
-  };
+  // Native (js_stream_pipe in src/node.c): four closures per pipe, one per
+  // event, became four C functions sharing the source and the destination.
+  // The record kept for unpipe has the same shape it always had.
+  Readable.prototype.pipe = __sxnPipe;
   // Node's readable.unpipe([dest]). finalhandler calls it before draining a
   // request it is about to answer, so it has to exist even on a stream that
   // was never piped anywhere.

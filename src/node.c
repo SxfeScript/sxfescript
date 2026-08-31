@@ -3745,6 +3745,111 @@ static JSValue js_promisify(JSContext *ctx, JSValueConst this_val, int argc, JSV
     return wrapped;
 }
 
+
+/* Readable#pipe. Four closures per pipe in JavaScript, one for each of the
+   events involved; here they are four C functions sharing the same two
+   values -- the source and the destination -- and the fourth carries the
+   end option too. */
+static JSValue sxn_pipe_handler(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValue *data) {
+    (void)this_val;
+    JSValueConst source = data[0], dest = data[1];
+    switch (magic) {
+    case 0: {   /* data: write, and pause the source if it says to */
+        JSValue write = JS_GetPropertyStr(ctx, dest, "write");
+        JSValueConst args[1] = { argc > 0 ? argv[0] : JS_UNDEFINED };
+        JSValue ok = JS_Call(ctx, write, dest, 1, args);
+        JS_FreeValue(ctx, write);
+        if (JS_IsException(ok)) return ok;
+        bool full = JS_IsBool(ok) && !JS_ToBool(ctx, ok);
+        JS_FreeValue(ctx, ok);
+        if (full) {
+            JSValue pause = JS_GetPropertyStr(ctx, source, "pause");
+            JS_FreeValue(ctx, JS_Call(ctx, pause, source, 0, NULL));
+            JS_FreeValue(ctx, pause);
+        }
+        return JS_UNDEFINED;
+    }
+    case 1: {   /* drain: the destination wants more */
+        JSValue resume = JS_GetPropertyStr(ctx, source, "resume");
+        JS_FreeValue(ctx, JS_Call(ctx, resume, source, 0, NULL));
+        JS_FreeValue(ctx, resume);
+        return JS_UNDEFINED;
+    }
+    case 2: {   /* end: unless the caller asked for the destination to stay */
+        if (JS_ToBool(ctx, data[2])) {
+            JSValue end = JS_GetPropertyStr(ctx, dest, "end");
+            JS_FreeValue(ctx, JS_Call(ctx, end, dest, 0, NULL));
+            JS_FreeValue(ctx, end);
+        }
+        return JS_UNDEFINED;
+    }
+    default: {  /* error: forward it */
+        JSValue emit = JS_GetPropertyStr(ctx, dest, "emit");
+        JSValue name = JS_NewString(ctx, "error");
+        JSValueConst args[2] = { name, argc > 0 ? argv[0] : JS_UNDEFINED };
+        JS_FreeValue(ctx, JS_Call(ctx, emit, dest, 2, args));
+        JS_FreeValue(ctx, name);
+        JS_FreeValue(ctx, emit);
+        return JS_UNDEFINED;
+    }
+    }
+}
+
+static void sxn_pipe_listen(JSContext *ctx, JSValueConst target, const char *event, JSValueConst fn) {
+    JSValue on = JS_GetPropertyStr(ctx, target, "on");
+    JSValue name = JS_NewString(ctx, event);
+    JSValueConst args[2] = { name, fn };
+    JS_FreeValue(ctx, JS_Call(ctx, on, target, 2, args));
+    JS_FreeValue(ctx, name);
+    JS_FreeValue(ctx, on);
+}
+
+static JSValue js_stream_pipe(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 1 || !JS_IsObject(argv[0])) return JS_ThrowTypeError(ctx, "pipe expects a destination");
+    JSValueConst dest = argv[0];
+    bool end_dest = true;
+    if (argc > 1 && JS_IsObject(argv[1])) {
+        JSValue end_opt = JS_GetPropertyStr(ctx, argv[1], "end");
+        if (!JS_IsUndefined(end_opt)) end_dest = JS_ToBool(ctx, end_opt);
+        JS_FreeValue(ctx, end_opt);
+    }
+    JSValue data[3] = { JS_DupValue(ctx, this_val), JS_DupValue(ctx, dest), JS_NewBool(ctx, end_dest) };
+    JSValue on_data = JS_NewCFunctionData(ctx, sxn_pipe_handler, 1, 0, 3, data);
+    JSValue on_drain = JS_NewCFunctionData(ctx, sxn_pipe_handler, 0, 1, 3, data);
+    JSValue on_end = JS_NewCFunctionData(ctx, sxn_pipe_handler, 0, 2, 3, data);
+    JSValue on_error = JS_NewCFunctionData(ctx, sxn_pipe_handler, 1, 3, 3, data);
+    for (int i = 0; i < 3; i++) JS_FreeValue(ctx, data[i]);
+
+    sxn_pipe_listen(ctx, this_val, "data", on_data);
+    sxn_pipe_listen(ctx, dest, "drain", on_drain);
+    sxn_pipe_listen(ctx, this_val, "end", on_end);
+    sxn_pipe_listen(ctx, this_val, "error", on_error);
+
+    /* unpipe needs to find these again, so the record is the same shape the
+       JavaScript kept. */
+    JSValue record = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, record, "dest", JS_DupValue(ctx, dest));
+    JS_SetPropertyStr(ctx, record, "onData", on_data);
+    JS_SetPropertyStr(ctx, record, "onDrain", on_drain);
+    JS_SetPropertyStr(ctx, record, "onEnd", on_end);
+    JS_SetPropertyStr(ctx, record, "onError", on_error);
+    JSValue pipes = JS_GetPropertyStr(ctx, this_val, "_pipes");
+    if (!JS_IsObject(pipes)) {
+        JS_FreeValue(ctx, pipes);
+        pipes = JS_NewArray(ctx);
+        JS_SetPropertyStr(ctx, this_val, "_pipes", JS_DupValue(ctx, pipes));
+    }
+    int64_t count = 0;
+    JS_GetLength(ctx, pipes, &count);
+    JS_SetPropertyUint32(ctx, pipes, (uint32_t)count, record);
+    JS_FreeValue(ctx, pipes);
+
+    JSValue resume = JS_GetPropertyStr(ctx, this_val, "resume");
+    JS_FreeValue(ctx, JS_Call(ctx, resume, this_val, 0, NULL));
+    JS_FreeValue(ctx, resume);
+    return JS_DupValue(ctx, dest);
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -4226,6 +4331,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnPipe", JS_NewCFunction(ctx, js_stream_pipe, "pipe", 2));
     JS_SetPropertyStr(ctx, global, "__sxnPromisify", JS_NewCFunction(ctx, js_promisify, "promisify", 1));
     JS_SetPropertyStr(ctx, global, "__sxnInspect", JS_NewCFunction(ctx, js_inspect, "inspect", 2));
     JS_SetPropertyStr(ctx, global, "__sxnNextTick", JS_NewCFunction(ctx, js_next_tick, "nextTick", 1));
