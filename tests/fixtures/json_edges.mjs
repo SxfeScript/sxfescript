@@ -91,6 +91,25 @@ check("toJSON on a shape seen before", JSON.stringify([{ a: 1 }, { a: 1, toJSON:
   const p2 = new Proxy({ a: 1 }, { get(t, k) { return k === "toJSON" ? () => "second" : t[k]; } });
   check("proxies are not one shape", JSON.stringify([p1, p2]), '[{"a":1},"second"]');
 }
+{
+  // Two objects of the same shape, one of which has a toJSON value stored
+  // into the slot the other left undefined. A shape says which properties
+  // exist, not what they hold.
+  const make = () => ({ x: 1, toJSON: undefined });
+  const a = make(), b = make();
+  b.toJSON = () => "hijacked";
+  check("same shape, different toJSON", JSON.stringify([a, b]), '[{"x":1},"hijacked"]');
+}
+{
+  // The same through a prototype: the value is replaced in place, which
+  // moves nothing.
+  const proto = { toJSON: undefined };
+  const a = Object.create(proto), b = Object.create(proto);
+  a.x = 1; b.x = 2;
+  const first = JSON.stringify(a);
+  proto.toJSON = () => "from proto";
+  check("a prototype's toJSON replaced in place", first + JSON.stringify(b), '{"x":1}"from proto"');
+}
 // The key list is taken once, before any getter runs: a getter that changes
 // another key's enumerability cannot change what is written.
 check("enumerability is a snapshot",

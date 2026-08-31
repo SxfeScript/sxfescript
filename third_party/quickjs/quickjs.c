@@ -54449,16 +54449,23 @@ static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
 		f = JS_GetProperty(ctx, val, JS_ATOM_toJSON);
 		if (JS_IsException(f))
 			goto exception;
-		/* Only for an ordinary object with an ordinary chain. Every Proxy
-		   shares one shape and answers from its own trap, so what one of them
-		   said about toJSON says nothing about the next. */
+		/* Only when nothing on the chain is exotic -- every Proxy shares one
+		   shape and answers from its own trap -- and nothing on it carries a
+		   `toJSON` property at all. A shape records which properties exist,
+		   not what they hold, so a sibling object of the same shape can have a
+		   function where this one had undefined, and storing a value does not
+		   move it and so does not bump the generation. */
 		if (o && JS_IsUndefined(f) && !o->is_exotic) {
 			JSObject *chain = o;
-			while ((chain = chain->shape->proto) != NULL && !chain->is_exotic)
-				;
-			if (chain == NULL) {
-				jsc->no_tojson_shape = o->shape;
-				jsc->no_tojson_gen = ctx->rt->prop_cache_gen;
+			JSProperty *pr1;
+			while (!chain->is_exotic
+			       && !find_own_property(&pr1, chain, JS_ATOM_toJSON)) {
+				chain = chain->shape->proto;
+				if (chain == NULL) {
+					jsc->no_tojson_shape = o->shape;
+					jsc->no_tojson_gen = ctx->rt->prop_cache_gen;
+					break;
+				}
 			}
 		}
 		if (JS_IsFunction(ctx, f)) {
