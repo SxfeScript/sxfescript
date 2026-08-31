@@ -1147,13 +1147,15 @@
     if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
     throw new TypeError("expected a string, Buffer or TypedArray");
   };
+  // Uint8Array's own toHex/toBase64 are native; building the hex by hand cost
+  // a string per byte, an array and a join -- which was most of the time a
+  // digest took once the digest itself was C.
   const encodeDigest = (bytes, encoding) => {
     if (!encoding || encoding === "buffer")
       return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    if (encoding === "hex")
-      return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-    if (encoding === "base64")
-      return btoa(String.fromCharCode(...bytes));
+    if (encoding === "hex") return bytes.toHex();
+    if (encoding === "base64") return bytes.toBase64();
+    if (encoding === "base64url") return bytes.toBase64({ alphabet: "base64url", omitPadding: true });
     throw new TypeError("unsupported digest encoding: " + encoding);
   };
   const concatBytes = (parts) => {
@@ -1172,7 +1174,8 @@
     return this;
   };
   Hash.prototype.digest = function (encoding) {
-    return encodeDigest(__sxnDigest(this._algo, concatBytes(this._parts)), encoding);
+    const data = this._parts.length === 1 ? this._parts[0] : concatBytes(this._parts);
+    return encodeDigest(__sxnDigest(this._algo, data), encoding);
   };
   Hash.prototype.copy = function () {
     const h = new Hash(this._algo);
@@ -1192,7 +1195,9 @@
     return this;
   };
   Hmac.prototype.digest = function (encoding) {
-    return encodeDigest(__sxnHmac(this._algo, this._key, concatBytes(this._parts)), encoding);
+    // One update is the usual case, and then there is nothing to join.
+    const data = this._parts.length === 1 ? this._parts[0] : concatBytes(this._parts);
+    return encodeDigest(__sxnHmac(this._algo, this._key, data), encoding);
   };
 
   const nodeCrypto = {
