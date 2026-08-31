@@ -1,0 +1,31 @@
+"1.2.3.4" isIP=4 v4=true v6=false
+"0.0.0.0" isIP=4 v4=true v6=false
+"255.255.255.255" isIP=4 v4=true v6=false
+"256.1.1.1" isIP=0 v4=false v6=false
+"01.2.3.4" isIP=0 v4=false v6=false
+"1.2.3" isIP=0 v4=false v6=false
+"1.2.3.4.5" isIP=0 v4=false v6=false
+"" isIP=0 v4=false v6=false
+" " isIP=0 v4=false v6=false
+"1.2.3.04" isIP=0 v4=false v6=false
+"::1" isIP=6 v4=false v6=true
+"::" isIP=6 v4=false v6=true
+"fe80::1" isIP=6 v4=false v6=true
+"fe80::1%eth0" isIP=6 v4=false v6=true
+"2001:db8::8a2e:370:7334" isIP=6 v4=false v6=true
+"::ffff:1.2.3.4" isIP=6 v4=false v6=true
+"1::2::3" isIP=0 v4=false v6=false
+"abcd" isIP=0 v4=false v6=false
+"1.2.3.4 " isIP=0 v4=false v6=false
+" 1.2.3.4" isIP=0 v4=false v6=false
+"%eth0" isIP=0 v4=false v6=false
+"::1%" isIP=0 v4=false v6=false
+"12345::" isIP=0 v4=false v6=false
+"0:0:0:0:0:0:0:1" isIP=6 v4=false v6=true
+"1.2.3.-4" isIP=0 v4=false v6=false
+"1.2.3.4/24" isIP=0 v4=false v6=false
+"0x1.2.3.4" isIP=0 v4=false v6=false
+"999.999.999.999" isIP=0 v4=false v6=false
+"::ffff:0:0" isIP=6 v4=false v6=true
+"fe80::1%0" isIP=6 v4=false v6=true
+non-strings 0 0 0

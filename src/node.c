@@ -2134,6 +2134,42 @@ static JSValue js_path_win_relative(JSContext *ctx, JSValueConst this_val, int a
     return result;
 }
 
+
+/* net.isIP, from the system's own address parser. Express reaches for this
+   on every request that carries X-Forwarded-For, and it was two regexps and
+   a split per call. */
+static JSValue js_net_is_ip(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1 || !JS_IsString(argv[0])) return JS_NewInt32(ctx, 0);
+    const char *text = JS_ToCString(ctx, argv[0]);
+    if (!text) return JS_EXCEPTION;
+    int family = 0;
+    struct { uint8_t bytes[16]; } addr;
+    if (uv_inet_pton(AF_INET, text, &addr) == 0) {
+        family = 4;
+    } else {
+        /* A zone index (fe80::1%eth0) names an interface rather than part of
+           the address; Node accepts one and so does this, but it has to name
+           something -- and the address itself is never parsed with the "%"
+           still in it, which some platforms would accept. */
+        const char *percent = strchr(text, '%');
+        if (!percent) {
+            if (uv_inet_pton(AF_INET6, text, &addr) == 0) family = 6;
+        } else if (percent != text && percent[1] != 0) {
+            size_t len = (size_t)(percent - text);
+            char *bare = malloc(len + 1);
+            if (bare) {
+                memcpy(bare, text, len);
+                bare[len] = 0;
+                if (uv_inet_pton(AF_INET6, bare, &addr) == 0) family = 6;
+                free(bare);
+            }
+        }
+    }
+    JS_FreeCString(ctx, text);
+    return JS_NewInt32(ctx, family);
+}
+
 static const char *node_querystring_names[] = { "parse", "stringify", "escape", "unescape", "decode", "encode" };
 static const char *node_url_names[] = {
     "URL", "URLSearchParams", "fileURLToPath", "pathToFileURL", "format", "parse",
@@ -2357,6 +2393,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
     JS_SetPropertyStr(ctx, global, "__sxnWinBasename", JS_NewCFunction(ctx, js_path_win_basename, "basename", 2));
     JS_SetPropertyStr(ctx, global, "__sxnWinExtname", JS_NewCFunction(ctx, js_path_win_extname, "extname", 1));
     JS_SetPropertyStr(ctx, global, "__sxnWinRelative", JS_NewCFunction(ctx, js_path_win_relative, "relative", 2));
+    JS_SetPropertyStr(ctx, global, "__sxnIsIP", JS_NewCFunction(ctx, js_net_is_ip, "isIP", 1));
     JS_SetPropertyStr(ctx, global, "__sxnQsParse", JS_NewCFunction(ctx, js_qs_parse, "parse", 4));
     JS_SetPropertyStr(ctx, global, "__sxnQsStringify", JS_NewCFunction(ctx, js_qs_stringify, "stringify", 3));
     JS_SetPropertyStr(ctx, global, "__sxnQsEscape", JS_NewCFunction(ctx, js_qs_escape, "escape", 1));

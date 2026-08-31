@@ -1102,45 +1102,13 @@
   // Address validation is what frameworks import this for -- Express uses
   // net.isIP when parsing X-Forwarded-For. Real sockets are not implemented,
   // and say so rather than pretending to connect.
-  function isIPv4(s) {
-    if (typeof s !== "string") return false;
-    const parts = s.split(".");
-    if (parts.length !== 4) return false;
-    return parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255 &&
-                              (p === "0" || p[0] !== "0"));
-  }
-  function isIPv6(s) {
-    if (typeof s !== "string" || s.indexOf(":") < 0) return false;
-    // A zone index (fe80::1%eth0) names an interface, not part of the
-    // address; Node accepts it and so does this.
-    const pct = s.indexOf("%");
-    if (pct >= 0) s = s.slice(0, pct);
-    // At most one "::", and every group is 1-4 hex digits. A trailing IPv4
-    // form is allowed, as in ::ffff:127.0.0.1.
-    const dbl = s.split("::");
-    if (dbl.length > 2) return false;
-    let tail = s;
-    let v4extra = 0;
-    const lastColon = s.lastIndexOf(":");
-    const maybeV4 = s.slice(lastColon + 1);
-    if (maybeV4.indexOf(".") >= 0) {
-      if (!isIPv4(maybeV4)) return false;
-      tail = s.slice(0, lastColon);
-      v4extra = 2;                       // an embedded IPv4 fills two groups
-    }
-    const groups = tail.split(":").filter((g, i, a) => !(g === "" && i > 0 && i < a.length - 1) || true);
-    let count = 0;
-    for (const g of tail.split(":")) {
-      if (g === "") continue;
-      if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return false;
-      count++;
-    }
-    void groups;
-    const total = count + v4extra;
-    return dbl.length === 2 ? total <= 8 : total === 8;
-  }
+  // Native (js_net_is_ip in src/node.c): the system's own address parser,
+  // rather than two regexps and a split per call.
+  const isIPv4 = (s) => __sxnIsIP(s) === 4;
+  const isIPv6 = (s) => __sxnIsIP(s) === 6;
+
   const net = {
-    isIP: (s) => (isIPv4(s) ? 4 : isIPv6(s) ? 6 : 0),
+    isIP: __sxnIsIP,
     isIPv4, isIPv6,
     Socket: function Socket() { throw new Error("net.Socket is not implemented"); },
     Server: function Server() { throw new Error("net.Server is not implemented; use node:http"); },

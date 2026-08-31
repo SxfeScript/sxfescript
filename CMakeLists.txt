@@ -344,6 +344,9 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # node:path, posix and win32, against what Node prints for the same corpus.
   add_test(NAME sxn-node-path COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_path.mjs)
   set_tests_properties(sxn-node-path PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # net.isIP, against Node's own answers.
+  add_test(NAME sxn-node-isip COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_isip.mjs)
+  set_tests_properties(sxn-node-isip PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   # Every Buffer encoding in both directions, including Node's lenient hex and
   # base64 readers. Expectations are Node's own output, so a divergence fails.
   add_test(NAME sxn-buffer-encodings COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/buffer_encodings.mjs)
