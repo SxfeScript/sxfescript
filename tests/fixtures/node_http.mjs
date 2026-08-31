@@ -86,8 +86,18 @@ const server = http.createServer((req, res) => {
     check("hasHeader", res.hasHeader("x-set"), true);
     check("getHeader", res.getHeader("X-Set"), "yes");
     check("getHeaderNames", res.getHeaderNames(), ["x-set"]);
+    // The name is lowercased whatever spelling it arrives in, and hasHeader
+    // asks about own properties only.
+    res.setHeader("X-Mixed", "1");
+    check("mixed case set", res.getHeader("x-mixed"), "1");
+    check("hasHeader is own only", res.hasHeader("constructor"), false);
+    check("missing header", res.getHeader("x-absent"), undefined);
+    check("setHeader chains", res.setHeader("x-chain", "c") === res, true);
     res.removeHeader("x-set");
+    res.removeHeader("X-Mixed");
+    res.removeHeader("x-chain");
     check("removeHeader", res.hasHeader("x-set"), false);
+    check("removeHeader mixed case", res.getHeaderNames(), []);
     res.end("hdr");
   } else if (url === "/late") {
     setTimeout(() => res.end("after a tick"), 20);

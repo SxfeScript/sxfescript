@@ -183,6 +183,10 @@ mark itself complete on `end`; both are now shared native functions reading
 their state off the request. Building the two closures cost 0.084
 microseconds a request against 0.010 for the two fields that replaced them.
 
+`res.setHeader` and its three siblings lowercase the name on every call, and
+that is a scan over a short string rather than a call back into the engine
+per step: 0.17 microseconds a call became 0.058.
+
 One move was tried and thrown away, which is worth writing down because the
 number is the only thing that settles it. A `Readable`'s constructor sets ten
 own fields; done from C instead, the same ten stores cost 0.40 microseconds

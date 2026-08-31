@@ -956,17 +956,14 @@
   }
   ServerResponse.prototype = Object.create(Writable.prototype);
   ServerResponse.prototype.constructor = ServerResponse;
-  ServerResponse.prototype.setHeader = function (name, value) {
-    this._headers[String(name).toLowerCase()] = value;
-    return this;
-  };
-  ServerResponse.prototype.getHeader = function (name) { return this._headers[String(name).toLowerCase()]; };
+  // Native (js_header_op in src/node.c): each of these lowercases the name
+  // first, which is a scan over a short string rather than a builtin call.
+  ServerResponse.prototype.setHeader = __sxnSetHeader;
+  ServerResponse.prototype.getHeader = __sxnGetHeader;
   ServerResponse.prototype.getHeaders = function () { return Object.assign({}, this._headers); };
   ServerResponse.prototype.getHeaderNames = function () { return Object.keys(this._headers); };
-  ServerResponse.prototype.hasHeader = function (name) {
-    return Object.prototype.hasOwnProperty.call(this._headers, String(name).toLowerCase());
-  };
-  ServerResponse.prototype.removeHeader = function (name) { delete this._headers[String(name).toLowerCase()]; };
+  ServerResponse.prototype.hasHeader = __sxnHasHeader;
+  ServerResponse.prototype.removeHeader = __sxnRemoveHeader;
   ServerResponse.prototype.writeHead = function (status, reasonOrHeaders, maybeHeaders) {
     this.statusCode = status;
     let headers = maybeHeaders;
