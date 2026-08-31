@@ -1,5 +1,5 @@
 import util from "node:util";
-import { promisify, format, inherits, types } from "node:util";
+import { promisify, callbackify, format, inherits, types } from "node:util";
 import os from "node:os";
 import qs from "node:querystring";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -58,6 +58,16 @@ p("promisify turns a throw into a rejection",
   await promisify(() => { throw new TypeError("sync"); })().then(() => "no", (e) => e.constructor.name));
 p("promisify refuses a non-function", (() => { try { promisify(42); return "no"; }
   catch (e) { return e.constructor.name; } })());
+
+// util.callbackify is native: the value, an error, a falsy rejection wrapped
+// the way Node wraps it, `this`, and a resolved undefined.
+p("callbackify", await new Promise((r) => callbackify(async (x) => x * 2)(21, (e, v) => r([e, v]))));
+p("callbackify error", await new Promise((r) => callbackify(async () => { throw new Error("bad"); })((e) => r(e.message))));
+p("callbackify falsy rejection", await new Promise((r) =>
+  callbackify(async () => { throw null; })((e) => r([e.message, e.reason]))));
+p("callbackify keeps this", await new Promise((r) =>
+  callbackify(async function () { return this.v; }).call({ v: 5 }, (e, v) => r(v))));
+p("callbackify undefined", await new Promise((r) => callbackify(async () => undefined)((e, v) => r([e, v]))));
 
 // url
 p("fileURLToPath", fileURLToPath("file:///tmp/x%20y.txt"));

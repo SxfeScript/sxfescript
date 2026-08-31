@@ -3913,6 +3913,78 @@ static JSValue js_inherits(JSContext *ctx, JSValueConst this_val, int argc, JSVa
     return JS_UNDEFINED;
 }
 
+
+/* util.callbackify: the JavaScript built two closures per call for the two
+   halves of the promise. Here they are C functions carrying the callback. */
+static JSValue sxn_callbackify_settle(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValue *data) {
+    (void)this_val;
+    JSValueConst value = argc > 0 ? argv[0] : JS_UNDEFINED;
+    JSValue args[2];
+    if (magic) {   /* rejected */
+        args[0] = JS_DupValue(ctx, value);
+        if (JS_IsNull(args[0]) || JS_IsUndefined(args[0])) {
+            JS_FreeValue(ctx, args[0]);
+            /* Node wraps a falsy rejection in an Error and keeps the
+               original on `reason`, which is worth having. */
+            args[0] = JS_NewError(ctx);
+            JS_SetPropertyStr(ctx, args[0], "message",
+                              JS_NewString(ctx, "Promise was rejected with falsy value"));
+            JS_SetPropertyStr(ctx, args[0], "reason", JS_DupValue(ctx, value));
+        }
+        args[1] = JS_UNDEFINED;
+    } else {
+        args[0] = JS_NULL;
+        args[1] = JS_DupValue(ctx, value);
+    }
+    JS_FreeValue(ctx, JS_Call(ctx, data[0], JS_UNDEFINED, 2, (JSValueConst *)args));
+    JS_FreeValue(ctx, args[0]);
+    JS_FreeValue(ctx, args[1]);
+    return JS_UNDEFINED;
+}
+
+static JSValue sxn_callbackified(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValue *data) {
+    (void)magic;
+    if (argc < 1 || !JS_IsFunction(ctx, argv[argc - 1]))
+        return JS_ThrowTypeError(ctx, "the last argument must be a callback");
+    JSValueConst callback = argv[argc - 1];
+    JSValue result = JS_Call(ctx, data[0], this_val, argc - 1, argv);
+    if (JS_IsException(result)) return result;
+
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue promise_class = JS_GetPropertyStr(ctx, global, "Promise");
+    JS_FreeValue(ctx, global);
+    JSValue resolve = JS_GetPropertyStr(ctx, promise_class, "resolve");
+    JSValueConst resolve_args[1] = { result };
+    JSValue promise = JS_Call(ctx, resolve, promise_class, 1, resolve_args);
+    JS_FreeValue(ctx, resolve);
+    JS_FreeValue(ctx, promise_class);
+    JS_FreeValue(ctx, result);
+    if (JS_IsException(promise)) return promise;
+
+    JSValue handler_data[1] = { JS_DupValue(ctx, callback) };
+    JSValue on_value = JS_NewCFunctionData(ctx, sxn_callbackify_settle, 1, 0, 1, handler_data);
+    JSValue on_error = JS_NewCFunctionData(ctx, sxn_callbackify_settle, 1, 1, 1, handler_data);
+    JS_FreeValue(ctx, handler_data[0]);
+    JSValue then = JS_GetPropertyStr(ctx, promise, "then");
+    JSValueConst then_args[2] = { on_value, on_error };
+    JS_FreeValue(ctx, JS_Call(ctx, then, promise, 2, then_args));
+    JS_FreeValue(ctx, then);
+    JS_FreeValue(ctx, on_value);
+    JS_FreeValue(ctx, on_error);
+    JS_FreeValue(ctx, promise);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_callbackify(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1 || !JS_IsFunction(ctx, argv[0]))
+        return JS_ThrowTypeError(ctx, "callbackify expects a function");
+    JSValue data[1] = { JS_DupValue(ctx, argv[0]) };
+    JSValue wrapped = JS_NewCFunctionData(ctx, sxn_callbackified, 0, 0, 1, data);
+    JS_FreeValue(ctx, data[0]);
+    return wrapped;
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -4394,6 +4466,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnCallbackify", JS_NewCFunction(ctx, js_callbackify, "callbackify", 1));
     JS_SetPropertyStr(ctx, global, "__sxnInherits", JS_NewCFunction(ctx, js_inherits, "inherits", 2));
     JS_SetPropertyStr(ctx, global, "__sxnBufferFromBytes", JS_NewCFunction(ctx, js_buffer_from_bytes, "__sxnBufferFromBytes", 1));
     JS_SetPropertyStr(ctx, global, "__sxnPipe", JS_NewCFunction(ctx, js_stream_pipe, "pipe", 2));

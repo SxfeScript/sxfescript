@@ -265,6 +265,16 @@ value resolves with the first, not with an array of them, and a function that
 throws synchronously produces a rejection rather than throwing out of the
 call.
 
+`util.callbackify` built two closures per call, one for each half of the
+promise; they are C functions carrying the callback now, 1.32 microseconds to
+0.82 against Node's 0.38. It also picked up Node's handling of a falsy
+rejection along the way: an `Error` saying so, with the original on `reason`,
+where this used to invent a bare "rejected".
+
+The stream async iterator was measured and left alone: 0.38 microseconds an
+item against Node's 0.12, and what it spends is a promise and a result object
+per item, which is the iteration protocol rather than anything C could skip.
+
 `Buffer.from` split in two on the evidence. Copying a view is C now, 0.285
 microseconds to 0.210, because it was running the `Uint8Array` subclass
 constructor per call. Copying a plain array is not: reading its elements one
@@ -322,6 +332,8 @@ does not have to re-derive it:
 | `readable.pipe` | 1.83 us | C, was 1.95; Node is 7.21 |
 | `Buffer.from` a view | 0.21 us | C, was 0.285; Node is 0.035 |
 | `util.inherits` | 0.060 us | C, was 0.250; Node is 0.150 |
+| a callbackified call | 0.82 us | C, was 1.32; Node is 0.38 |
+| iterating a buffered stream | 0.38 us | JS: a promise and an object per item, which is the protocol |
 | `Buffer.from` an array | 0.37 us | JS: from C it measured 1.185 |
 | `process.nextTick` | 0.143 us | C, was 0.620 |
 | `res.getHeaders` | 0.110 us | C, was 0.173 |
@@ -360,7 +372,7 @@ alone.
 | `crypto` | 94 | digests, HMAC, `timingSafeEqual`, random bytes, every input encoding | `Hash` and `Hmac`'s two-line classes, and the digest encoding branch |
 | `zlib` | 90 | deflate and inflate | the six wrappers, the constants, the Transform streams |
 | small builtins | 95 | `StringDecoder`'s utf-8 path, the builtin table behind `require` | `tty`, `timers`, `perf_hooks`, `Module`'s shape |
-| `util` | 106 | `format`, `inspect`, `promisify`, `inherits` | `callbackify` and `types` -- one-line wrappers, and `callbackify` measured 0.14 microseconds here against Node's 1.18 |
+| `util` | 106 | `format`, `inspect`, `promisify`, `callbackify`, `inherits` | `types`, which is fourteen one-line predicates |
 | `assert` | 31 | the structural comparison | `AssertionError` and the twelve one-line entry points |
 | `os` | 37 | all of it, from libuv | the object it hangs on |
 | `querystring` | 17 | all four functions | the object it hangs on |

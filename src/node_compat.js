@@ -1365,12 +1365,9 @@
     // per call. It also resolved with an array when a callback reported
     // more than one value; Node keeps the first and drops the rest.
     promisify: __sxnPromisify,
-    callbackify(fn) {
-      return function (...args) {
-        const cb = args.pop();
-        Promise.resolve(fn.apply(this, args)).then((v) => cb(null, v), (e) => cb(e || new Error("rejected")));
-      };
-    },
+    // Native (js_callbackify in src/node.c): this built two closures per
+    // call for the two halves of the promise, 1.32 microseconds to 0.84.
+    callbackify: __sxnCallbackify,
     // Native (js_inherits in src/node.c): two property operations, 0.250
     // microseconds to 0.060.
     inherits: __sxnInherits,
