@@ -2623,6 +2623,105 @@ static JSValue js_buffer_encode_units(JSContext *ctx, JSValueConst this_val, int
     return bytes;
 }
 
+
+/* require() of a builtin. This was a 25-entry object literal in JavaScript,
+   rebuilt on every single require() call before the name was even looked at;
+   here the table is static and the answer is one property read. */
+typedef struct { const char *name, *global, *sub; } SxnBuiltinEntry;
+static const SxnBuiltinEntry sxn_builtin_table[] = {
+    { "events", "__sxnEventEmitter", NULL },
+    { "path", "__sxnPath", NULL },
+    { "process", "process", NULL },
+    { "fs", "__sxnFs", NULL },
+    { "fs/promises", "__sxnFsPromises", NULL },
+    { "util", "__sxnUtil", NULL },
+    { "os", "__sxnOs", NULL },
+    { "url", "__sxnUrl", NULL },
+    { "querystring", "__sxnQuerystring", NULL },
+    { "assert", "__sxnAssert", NULL },
+    { "assert/strict", "__sxnAssert", NULL },
+    { "stream", "__sxnStream", NULL },
+    { "stream/promises", "__sxnStream", "promises" },
+    { "http", "__sxnHttp", NULL },
+    { "tty", "__sxnTty", NULL },
+    { "string_decoder", "__sxnStringDecoder", NULL },
+    { "timers", "__sxnTimers", NULL },
+    { "timers/promises", "__sxnTimers", "promises" },
+    { "perf_hooks", "__sxnPerfHooks", NULL },
+    { "module", "__sxnModule", NULL },
+    { "zlib", "__sxnZlib", NULL },
+    { "crypto", "__sxnCrypto", NULL },
+    { "net", "__sxnNet", NULL },
+    { NULL, NULL, NULL },
+};
+
+/* Returns JS_UNINITIALIZED for a name that is not a builtin, so the caller
+   decides between throwing and answering false. */
+static JSValue sxn_builtin_lookup(JSContext *ctx, JSValueConst spec) {
+    const char *name = JS_ToCString(ctx, spec);
+    if (!name) return JS_EXCEPTION;
+    const char *bare = strncmp(name, "node:", 5) == 0 ? name + 5 : name;
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue result = JS_UNINITIALIZED;
+    if (!strcmp(bare, "buffer")) {
+        /* node:buffer is the constructor under both names, built once. */
+        result = JS_GetPropertyStr(ctx, global, "__sxnBufferModule");
+        if (JS_IsUndefined(result)) {
+            JSValue buffer = JS_GetPropertyStr(ctx, global, "Buffer");
+            result = JS_NewObject(ctx);
+            JS_SetPropertyStr(ctx, result, "Buffer", JS_DupValue(ctx, buffer));
+            JS_SetPropertyStr(ctx, result, "default", buffer);
+            JS_SetPropertyStr(ctx, global, "__sxnBufferModule", JS_DupValue(ctx, result));
+        }
+    } else {
+        for (const SxnBuiltinEntry *e = sxn_builtin_table; e->name; e++) {
+            if (strcmp(bare, e->name)) continue;
+            result = JS_GetPropertyStr(ctx, global, e->global);
+            if (e->sub && !JS_IsUndefined(result) && !JS_IsNull(result)) {
+                JSValue outer = result;
+                result = JS_GetPropertyStr(ctx, outer, e->sub);
+                JS_FreeValue(ctx, outer);
+            }
+            if (JS_IsUndefined(result)) result = JS_NULL;   /* known, not loaded */
+            break;
+        }
+    }
+    JS_FreeValue(ctx, global);
+    JS_FreeCString(ctx, name);
+    return result;
+}
+
+static JSValue js_builtin_require(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "require expects a specifier");
+    JSValue mod = sxn_builtin_lookup(ctx, argv[0]);
+    if (JS_IsException(mod)) return mod;
+    if (JS_IsUninitialized(mod)) {
+        const char *name = JS_ToCString(ctx, argv[0]);
+        JSValue err = JS_NewError(ctx);
+        JS_SetPropertyStr(ctx, err, "message", JS_NewString(ctx, name ? name : "?"));
+        JS_SetPropertyStr(ctx, err, "code", JS_NewString(ctx, "MODULE_NOT_FOUND"));
+        if (name) {
+            char msg[256];
+            snprintf(msg, sizeof msg, "Cannot find module '%s'", name);
+            JS_SetPropertyStr(ctx, err, "message", JS_NewString(ctx, msg));
+            JS_FreeCString(ctx, name);
+        }
+        return JS_Throw(ctx, err);
+    }
+    return mod;
+}
+
+static JSValue js_is_builtin(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_NewBool(ctx, false);
+    JSValue mod = sxn_builtin_lookup(ctx, argv[0]);
+    if (JS_IsException(mod)) return mod;
+    bool known = !JS_IsUninitialized(mod);
+    JS_FreeValue(ctx, mod);
+    return JS_NewBool(ctx, known);
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -3103,6 +3202,8 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnBuiltinRequire", JS_NewCFunction(ctx, js_builtin_require, "__sxnBuiltinRequire", 1));
+    JS_SetPropertyStr(ctx, global, "__sxnIsBuiltin", JS_NewCFunction(ctx, js_is_builtin, "__sxnIsBuiltin", 1));
     JS_SetPropertyStr(ctx, global, "__sxnLatin1Bytes", JS_NewCFunctionMagic(ctx, js_buffer_encode_units, "__sxnLatin1Bytes", 1, JS_CFUNC_generic_magic, 0));
     JS_SetPropertyStr(ctx, global, "__sxnUtf16leBytes", JS_NewCFunctionMagic(ctx, js_buffer_encode_units, "__sxnUtf16leBytes", 1, JS_CFUNC_generic_magic, 1));
     JS_SetPropertyStr(ctx, global, "__sxnLatin1String", JS_NewCFunctionMagic(ctx, js_buffer_decode_units, "__sxnLatin1String", 1, JS_CFUNC_generic_magic, 0));

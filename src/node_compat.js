@@ -1402,49 +1402,9 @@
   globalThis.__sxnModule = moduleModule;
 
   // CommonJS reaches the builtins through require(), which is synchronous, so
-  // it cannot go through import(). Every builtin is already a plain object on
-  // a global; this maps a specifier to it, with or without the node: prefix.
-  globalThis.__sxnBuiltinRequire = function (specifier) {
-    const name = String(specifier).replace(/^node:/, "");
-    const table = {
-      buffer: { Buffer, default: Buffer },
-      events: globalThis.__sxnEventEmitter,
-      path: globalThis.__sxnPath,
-      process: globalThis.process,
-      fs: globalThis.__sxnFs,
-      "fs/promises": globalThis.__sxnFsPromises,
-      util: globalThis.__sxnUtil,
-      os: globalThis.__sxnOs,
-      url: globalThis.__sxnUrl,
-      querystring: globalThis.__sxnQuerystring,
-      assert: globalThis.__sxnAssert,
-      "assert/strict": globalThis.__sxnAssert,
-      stream: globalThis.__sxnStream,
-      "stream/promises": globalThis.__sxnStream && globalThis.__sxnStream.promises,
-      http: globalThis.__sxnHttp,
-      tty: globalThis.__sxnTty,
-      string_decoder: globalThis.__sxnStringDecoder,
-      timers: globalThis.__sxnTimers,
-      "timers/promises": globalThis.__sxnTimers && globalThis.__sxnTimers.promises,
-      perf_hooks: globalThis.__sxnPerfHooks,
-      module: globalThis.__sxnModule,
-      zlib: globalThis.__sxnZlib,
-      crypto: globalThis.__sxnCrypto,
-      net: globalThis.__sxnNet,
-    };
-    const m = table[name];
-    if (m === undefined) {
-      const e = new Error("Cannot find module '" + specifier + "'");
-      e.code = "MODULE_NOT_FOUND";
-      throw e;
-    }
-    // events exports the constructor itself, and Node lets you reach the
-    // named helpers off it either way.
-    return m;
-  };
-  globalThis.__sxnIsBuiltin = function (specifier) {
-    try { globalThis.__sxnBuiltinRequire(specifier); return true; } catch { return false; }
-  };
+  // it cannot go through import(). The mapping from specifier to builtin is
+  // native (sxn_builtin_lookup in src/node.c), where the table is static
+  // rather than an object rebuilt on every require() call.
 
   // ---------------- node:util ----------------
   // The parts packages actually import: promisify, callbackify, inherits,

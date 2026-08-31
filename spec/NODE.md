@@ -140,6 +140,11 @@ and handing the engine one string took 4KB of latin1 from 395 microseconds to
 0.5. Nothing here is a boundary crossing per byte, which is why it moved so
 far when the deep comparison did not move at all.
 
+`require()` of a builtin moved for a third reason again: the specifier-to-
+module table was an object literal rebuilt on every call, before the name was
+even looked at. Static in C, a `require("node:path")` went from 2.30
+microseconds to 0.18.
+
 Still JavaScript, with the reason measured rather than asserted:
 
 - **`stream` and `http`.** A `node:http` request costs 13.4 us here against
