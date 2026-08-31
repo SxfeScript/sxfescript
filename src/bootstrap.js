@@ -1615,14 +1615,22 @@
 
     function toRequest(raw, origin) {
       // Node hands a handler the path; the Fetch standard requires an
-      // absolute URL, and the Host header is what makes it absolute.
-      var host = (raw.headers && raw.headers.host) || origin;
-      var url = new URL(raw.url || "/", "http://" + String(host).replace(/^https?:\/\//, ""));
+      // absolute URL, and the Host header is what makes it absolute. Built by
+      // concatenation rather than `new URL`: this runs per request, and the
+      // handler that wants the parsed form parses it itself.
+      var path = raw.url || "/";
+      var href;
+      if (path.charCodeAt(0) === 47 /* "/" */) {
+        var host = (raw.headers && raw.headers.host) || origin;
+        href = "http://" + host + path;
+      } else {
+        href = new URL(path, "http://" + origin).href;
+      }
       var init = { method: raw.method || "GET", headers: raw.headers || {} };
       // A GET/HEAD request may not carry a body, and the native layer sends
       // "" rather than nothing when there is none.
       if (raw.body !== undefined && raw.body !== null && raw.body !== "") init.body = raw.body;
-      return new Request(url.href, init);
+      return new Request(href, init);
     }
 
     function toNative(result) {
