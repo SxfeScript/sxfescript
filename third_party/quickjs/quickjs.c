@@ -5497,7 +5497,14 @@ const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1,
            strings, which is the most common case.
          */
         count = 0;
-        for (pos = 0; pos < len; pos++) {
+        pos = 0;
+        /* Eight bytes at a time while they stay ASCII, which for the common
+           case -- an ASCII string, returned below without a copy at all --
+           is the whole scan. Only a string that does contain a non-ASCII
+           byte pays the per-byte count, and only from where it starts. */
+        while (pos + 8 <= len && !(get_u64(src + pos) & 0x8080808080808080ULL))
+            pos += 8;
+        for (; pos < len; pos++) {
             count += src[pos] >> 7;
         }
         if (count == 0 && str->kind == JS_STRING_KIND_NORMAL) {
@@ -5529,6 +5536,23 @@ const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1,
         q = str8(str_new);
         pos = 0;
         while (pos < len) {
+            /* Four code points at a time while they are all ASCII: text is
+               mostly ASCII even when one accent makes the whole string
+               wide, and this loop is what every JS_ToCString of such a
+               string spends its time in. */
+            while (pos + 4 <= len) {
+                uint64_t v = get_u64((const uint8_t *)(src + pos));
+                if (v & 0xff80ff80ff80ff80ULL)
+                    break;
+                q[0] = (uint8_t)src[pos];
+                q[1] = (uint8_t)src[pos + 1];
+                q[2] = (uint8_t)src[pos + 2];
+                q[3] = (uint8_t)src[pos + 3];
+                q += 4;
+                pos += 4;
+            }
+            if (pos >= len)
+                break;
             c = src[pos++];
             if (c < 0x80) {
                 *q++ = c;
@@ -24209,6 +24233,12 @@ typedef struct JSToken {
         struct {
             JSValue str;
             int sep;
+            /* JSON only: an escape-free ASCII string is left as a slice of
+               the source here, and turned into a string -- or straight into
+               an atom, for a property name -- only once its use is known.
+               NULL when `str` already holds the value. */
+            const uint8_t *raw;
+            int raw_len;
         } str;
         struct {
             JSValue val;
@@ -25460,19 +25490,19 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
     p = *pp;
 
     /* A string with no escape and nothing above ASCII -- most strings in most
-       JSON -- is scanned once and allocated once, rather than accumulated
-       into a StringBuffer that starts at 48 characters and is then grown,
-       copied and trimmed. */
+       JSON -- is handed on as a slice of the source, with no string built at
+       all: a property name becomes an atom directly, and only a value is
+       allocated. The StringBuffer below starts at 48 characters and is then
+       grown, copied and trimmed, which is what this skips. */
     {
         const uint8_t *q = json_scan_plain(p, s->buf_end);
         if (q < s->buf_end && *q == '"') {
-            JSValue str = js_new_string8_len(s->ctx, (const char *)p, q - p);
             string_buffer_free(b);
-            if (JS_IsException(str))
-                return -1;
             s->token.val = TOK_STRING;
             s->token.u.str.sep = '"';
-            s->token.u.str.str = str;
+            s->token.u.str.str = JS_UNDEFINED;
+            s->token.u.str.raw = p;
+            s->token.u.str.raw_len = (int)(q - p);
             *pp = q + 1;
             return 0;
         }
@@ -25546,6 +25576,7 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
     s->token.val = TOK_STRING;
     s->token.u.str.sep = '"';
     s->token.u.str.str = string_buffer_end(b);
+    s->token.u.str.raw = NULL;
     *pp = p;
     return 0;
 
@@ -53796,7 +53827,11 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
             if (s->token.val != '}') {
                 for(;;) {
                     if (s->token.val == TOK_STRING) {
-                        prop_name = JS_ValueToAtom(ctx, s->token.u.str.str);
+                        if (s->token.u.str.raw)
+                            prop_name = JS_NewAtomLen(ctx, (const char *)s->token.u.str.raw,
+                                                      s->token.u.str.raw_len);
+                        else
+                            prop_name = JS_ValueToAtom(ctx, s->token.u.str.str);
                         if (prop_name == JS_ATOM_NULL)
                             goto fail;
                     } else {
@@ -53892,7 +53927,14 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
         }
         break;
     case TOK_STRING:
-        val = js_dup(s->token.u.str.str);
+        if (s->token.u.str.raw) {
+            val = js_new_string8_len(ctx, (const char *)s->token.u.str.raw,
+                                     s->token.u.str.raw_len);
+            if (JS_IsException(val))
+                goto fail;
+        } else {
+            val = js_dup(s->token.u.str.str);
+        }
         if (pr) {
             json_parse_record_init_primitive(ctx, pr, val,
                                              s->token.ptr - s->buf_start,

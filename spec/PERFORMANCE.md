@@ -238,23 +238,38 @@ value model:
   allocated a quoted copy of every key and every string value, copied it into
   its output, and freed it. It writes through now.
 
-A fourth: a plain integer is converted by the tokenizer instead of `strtod`,
-which is locale-aware -- it takes a lock to find the decimal separator -- and
+- **A parsed string is not built until its use is known.** An escape-free
+  ASCII string is handed on as a slice of the input, so a property name goes
+  straight to an atom -- a hash of bytes already in memory -- instead of
+  allocating a string, interning it and freeing it again. Only a value is
+  allocated.
+- **Getting at the input costs a scan, so the scan is a word wide.**
+  `JS_ToCString` already returns an ASCII 8-bit string's own bytes without
+  copying, but it decided that by counting non-ASCII bytes one at a time
+  across the whole string; it now clears eight at a time and only counts from
+  the first non-ASCII byte. Its wide-string transcode -- what an input pays
+  when one accent makes the whole string 16-bit -- copies four ASCII code
+  points per iteration instead of one. Both help every `JS_ToCString` caller
+  in the runtime, not only JSON.
+
+And a plain integer is converted by the tokenizer instead of `strtod`, which
+is locale-aware -- it takes a lock to find the decimal separator -- and
 rescans the digits.
 
-On the Mac, the round trip went 165.4 -> 81.5 ms against Node's 26.9 and
-Bun's 23.3. Separately: parsing that 1MB document 2.29 -> 1.88 ms against
-Node's 1.05, writing it 7.01 -> 2.26 against Node's 0.60. Writing one long
-string, where the run scan is all there is, went 2.52 -> 0.10 ms against
-Node's 0.12 -- ahead, for that shape.
+On the Mac, the round trip went 165.4 -> 72 ms against Node's 26.9 and Bun's
+23.3. Separately: parsing that 1MB document 2.29 -> 1.34 ms against Node's
+1.05, writing it 7.01 -> 2.22 against Node's 0.60. Writing one long string,
+where the run scan is all there is, went 2.52 -> 0.10 ms against Node's 0.12
+-- ahead, for that shape.
 
-What remains is not the scanning. On an object-heavy document the profile is
-spread across property enumeration, the atom lookup behind each property
-read, and one allocation per value -- the same interpreted-object-model cost
-that the rest of this document keeps arriving at, and the reason a faster
-external parser is not the answer here: a DOM parser would replace the part
-that is now cheap and still leave every JavaScript object to be built one
-property at a time, plus a second representation to copy out of.
+What remains is not the scanning, and the profile no longer has a peak worth
+naming: on an object-heavy document it is spread across property
+enumeration, the atom lookup behind each property read, and one allocation
+per value -- the same interpreted-object-model cost that the rest of this
+document keeps arriving at. It is also why a faster external parser is not
+the answer here. A DOM parser would replace the part that is now cheap and
+still leave every JavaScript object to be built one property at a time, with
+a second representation to copy out of on the way.
 
 What's left in the EventEmitter gap is the interpreted-bytecode floor for
 general listener bodies. The benchmark's numeric accumulator takes a native
