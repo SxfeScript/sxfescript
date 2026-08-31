@@ -334,6 +334,10 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   add_test(NAME sxn-node-http COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_http.mjs)
   add_test(NAME sxn-node-zlib COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_zlib.mjs)
   add_test(NAME sxn-node-crypto-net COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_crypto_net.mjs)
+  # node:os and the parts of node:fs a server needs, against the real machine
+  # rather than against stubbed answers.
+  add_test(NAME sxn-node-os-fs COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_os_fs.mjs)
+  set_tests_properties(sxn-node-os-fs PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   # Every Buffer encoding in both directions, including Node's lenient hex and
   # base64 readers. Expectations are Node's own output, so a divergence fails.
   add_test(NAME sxn-buffer-encodings COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/buffer_encodings.mjs)

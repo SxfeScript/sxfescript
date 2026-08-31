@@ -52,11 +52,12 @@ worth knowing the gap:
 | `buffer` | See below — this one gets its own section. |
 | `crypto` | `Hash`, `Hmac` (standard construction over the digest primitive), `randomBytes`, `randomUUID`, `timingSafeEqual`. |
 | `events` | `EventEmitter`, including the mixin pattern (`Object.assign(fn, EventEmitter.prototype)`) Express uses, where `_events` is created lazily on first `on()`/`emit()` rather than in a constructor that never runs. |
-| `fs`, `fs/promises` | File I/O, sync and promise-based. |
+| `fs`, `fs/promises` | `readFile`/`writeFile` and their sync forms, `existsSync`, `stat`/`lstat` and their sync forms with a real `Stats`, and `createReadStream` (which reads the file, rather than windowing a file too large to hold). |
 | `http` | `createServer`, `IncomingMessage`, `ServerResponse`, `ClientRequest`, `STATUS_CODES`, `METHODS`. The request body defers behind `_read` rather than pushing eagerly, because a body-parser attaches its listener after the handler returns — push first and it gets nothing. |
 | `module` | The `Module` constructor (what `require('module').prototype` expects), `createRequire`, `builtinModules`, `isBuiltin`. |
 | `net` | `isIP`/`isIPv4`/`isIPv6`, including IPv6 zone-index stripping (`fe80::1%eth0`). `Socket`/`Server` are not implemented and throw. |
-| `os`, `path`, `querystring`, `url`, `util` | The usual surface — `inspect`, `format`, `promisify`, `deepEqual`, POSIX/Win32 path handling, and so on. |
+| `os` | Answered by libuv, not guessed: `hostname`, `cpus`, `totalmem`/`freemem`, `loadavg`, `uptime`, `networkInterfaces`, `availableParallelism`, `homedir`/`tmpdir`, `type`/`release`/`version`/`machine`, `userInfo`. |
+| `path`, `querystring`, `url`, `util` | The usual surface — `inspect`, `format`, `promisify`, `deepEqual`, POSIX/Win32 path handling, and so on. |
 | `perf_hooks` | Enough for timing code that reads `performance.now`-equivalent values. |
 | `process` | `platform`, `arch`, `version`/`versions`, `stdout`/`stderr`/`stdin`, `hrtime`, `emitWarning`, `uptime`, `pid`, `env`, `argv`, `dlopen`. |
 | `stream`, `stream/promises` | `Readable`/`Writable`/`Duplex`/`Transform`/`PassThrough`, `pipeline`, `finished`. The module export is the `Stream` function itself (some packages `require('stream')` and call it as a constructor), and `Readable` supports real `pipe`/`unpipe` — the latter matters because `finalhandler` calls it on every response, piped or not. |

@@ -2197,6 +2197,183 @@ static JSValue sxn_file(JSContext *ctx, JSValueConst this_val, int argc, JSValue
 /* The only way to reach fd 2 from JS: console.error/warn and
    process.stderr are built on this, so a diagnostic does not land in the
    program's own stdout. */
+/* node:os, from libuv rather than from guesses. The JS layer used to answer
+   "localhost" for the hostname and 0 for the memory sizes, which is worse
+   than not answering: a program cannot tell a stub from the truth. */
+/* node:fs's stat, from libuv. The JS layer had no way to ask a file's size
+   or kind at all, so `stat` and everything built on it -- a static file
+   server, a build step that skips unchanged files -- was out of reach. */
+static JSValue sxn_stat(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    const char *path = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+    if (!path) return JS_ThrowTypeError(ctx, "stat(path) requires a path");
+    bool follow = argc < 2 || JS_ToBool(ctx, argv[1]);
+    uv_fs_t req;
+    int rc = follow ? uv_fs_stat(NULL, &req, path, NULL) : uv_fs_lstat(NULL, &req, path, NULL);
+    if (rc != 0) {
+        JSValue error = JS_ThrowInternalError(ctx, "%s: %s", uv_strerror(rc), path);
+        JSValue exception = JS_GetException(ctx);
+        JS_SetPropertyStr(ctx, exception, "code", JS_NewString(ctx, uv_err_name(rc)));
+        JS_SetPropertyStr(ctx, exception, "path", JS_NewString(ctx, path));
+        JS_Throw(ctx, exception);
+        JS_FreeCString(ctx, path);
+        uv_fs_req_cleanup(&req);
+        return error;
+    }
+    const uv_stat_t *st = &req.statbuf;
+    JSValue out = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, out, "dev", JS_NewFloat64(ctx, (double)st->st_dev));
+    JS_SetPropertyStr(ctx, out, "ino", JS_NewFloat64(ctx, (double)st->st_ino));
+    JS_SetPropertyStr(ctx, out, "mode", JS_NewInt64(ctx, (int64_t)st->st_mode));
+    JS_SetPropertyStr(ctx, out, "nlink", JS_NewFloat64(ctx, (double)st->st_nlink));
+    JS_SetPropertyStr(ctx, out, "uid", JS_NewInt64(ctx, (int64_t)st->st_uid));
+    JS_SetPropertyStr(ctx, out, "gid", JS_NewInt64(ctx, (int64_t)st->st_gid));
+    JS_SetPropertyStr(ctx, out, "size", JS_NewFloat64(ctx, (double)st->st_size));
+    JS_SetPropertyStr(ctx, out, "blksize", JS_NewFloat64(ctx, (double)st->st_blksize));
+    JS_SetPropertyStr(ctx, out, "blocks", JS_NewFloat64(ctx, (double)st->st_blocks));
+    JS_SetPropertyStr(ctx, out, "atimeMs", JS_NewFloat64(ctx, st->st_atim.tv_sec * 1000.0 + st->st_atim.tv_nsec / 1e6));
+    JS_SetPropertyStr(ctx, out, "mtimeMs", JS_NewFloat64(ctx, st->st_mtim.tv_sec * 1000.0 + st->st_mtim.tv_nsec / 1e6));
+    JS_SetPropertyStr(ctx, out, "ctimeMs", JS_NewFloat64(ctx, st->st_ctim.tv_sec * 1000.0 + st->st_ctim.tv_nsec / 1e6));
+    JS_SetPropertyStr(ctx, out, "birthtimeMs", JS_NewFloat64(ctx, st->st_birthtim.tv_sec * 1000.0 + st->st_birthtim.tv_nsec / 1e6));
+    JS_FreeCString(ctx, path);
+    uv_fs_req_cleanup(&req);
+    return out;
+}
+
+static JSValue sxn_os_hostname(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    char name[UV_MAXHOSTNAMESIZE];
+    size_t size = sizeof(name);
+    if (uv_os_gethostname(name, &size) != 0) return JS_NewString(ctx, "localhost");
+    return JS_NewString(ctx, name);
+}
+
+static JSValue sxn_os_dir(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic) {
+    (void)this_val; (void)argc; (void)argv;
+    char path[4096];
+    size_t size = sizeof(path);
+    int rc = magic == 0 ? uv_os_homedir(path, &size) : uv_os_tmpdir(path, &size);
+    if (rc != 0) return JS_NewString(ctx, magic == 0 ? "/" : "/tmp");
+    return JS_NewString(ctx, path);
+}
+
+static JSValue sxn_os_uname(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    uv_utsname_t name;
+    JSValue out = JS_NewObject(ctx);
+    if (uv_os_uname(&name) != 0) return out;
+    JS_SetPropertyStr(ctx, out, "sysname", JS_NewString(ctx, name.sysname));
+    JS_SetPropertyStr(ctx, out, "release", JS_NewString(ctx, name.release));
+    JS_SetPropertyStr(ctx, out, "version", JS_NewString(ctx, name.version));
+    JS_SetPropertyStr(ctx, out, "machine", JS_NewString(ctx, name.machine));
+    return out;
+}
+
+static JSValue sxn_os_numbers(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    double avg[3] = {0, 0, 0};
+    uv_loadavg(avg);
+    JSValue out = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, out, "totalmem", JS_NewFloat64(ctx, (double)uv_get_total_memory()));
+    JS_SetPropertyStr(ctx, out, "freemem", JS_NewFloat64(ctx, (double)uv_get_free_memory()));
+    JS_SetPropertyStr(ctx, out, "uptime", JS_NewFloat64(ctx, ({ double up = 0; uv_uptime(&up); up; })));
+    JS_SetPropertyStr(ctx, out, "parallelism", JS_NewInt32(ctx, (int32_t)uv_available_parallelism()));
+    JSValue load = JS_NewArray(ctx);
+    for (int i = 0; i < 3; i++) JS_SetPropertyUint32(ctx, load, i, JS_NewFloat64(ctx, avg[i]));
+    JS_SetPropertyStr(ctx, out, "loadavg", load);
+    return out;
+}
+
+static JSValue sxn_os_cpus(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    uv_cpu_info_t *info = NULL;
+    int count = 0;
+    JSValue out = JS_NewArray(ctx);
+    if (uv_cpu_info(&info, &count) != 0) return out;
+    for (int i = 0; i < count; i++) {
+        JSValue cpu = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, cpu, "model", JS_NewString(ctx, info[i].model));
+        JS_SetPropertyStr(ctx, cpu, "speed", JS_NewInt32(ctx, info[i].speed));
+        JSValue times = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, times, "user", JS_NewFloat64(ctx, (double)info[i].cpu_times.user));
+        JS_SetPropertyStr(ctx, times, "nice", JS_NewFloat64(ctx, (double)info[i].cpu_times.nice));
+        JS_SetPropertyStr(ctx, times, "sys", JS_NewFloat64(ctx, (double)info[i].cpu_times.sys));
+        JS_SetPropertyStr(ctx, times, "idle", JS_NewFloat64(ctx, (double)info[i].cpu_times.idle));
+        JS_SetPropertyStr(ctx, times, "irq", JS_NewFloat64(ctx, (double)info[i].cpu_times.irq));
+        JS_SetPropertyStr(ctx, cpu, "times", times);
+        JS_SetPropertyUint32(ctx, out, (uint32_t)i, cpu);
+    }
+    uv_free_cpu_info(info, count);
+    return out;
+}
+
+/* How many leading one-bits a netmask has, which is what a CIDR suffix is. */
+static int sxn_mask_prefix(const uint8_t *bytes, int len) {
+    int bits = 0;
+    for (int i = 0; i < len; i++) {
+        if (bytes[i] == 0xff) { bits += 8; continue; }
+        uint8_t b = bytes[i];
+        while (b & 0x80) { bits++; b <<= 1; }
+        break;
+    }
+    return bits;
+}
+
+static JSValue sxn_os_interfaces(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    uv_interface_address_t *addresses = NULL;
+    int count = 0;
+    JSValue out = JS_NewObject(ctx);
+    if (uv_interface_addresses(&addresses, &count) != 0) return out;
+    for (int i = 0; i < count; i++) {
+        uv_interface_address_t *a = &addresses[i];
+        bool v6 = a->address.address4.sin_family == AF_INET6;
+        char address[INET6_ADDRSTRLEN] = {0}, netmask[INET6_ADDRSTRLEN] = {0};
+        int prefix;
+        if (v6) {
+            uv_ip6_name(&a->address.address6, address, sizeof(address));
+            uv_ip6_name(&a->netmask.netmask6, netmask, sizeof(netmask));
+            prefix = sxn_mask_prefix((const uint8_t *)&a->netmask.netmask6.sin6_addr, 16);
+        } else {
+            uv_ip4_name(&a->address.address4, address, sizeof(address));
+            uv_ip4_name(&a->netmask.netmask4, netmask, sizeof(netmask));
+            prefix = sxn_mask_prefix((const uint8_t *)&a->netmask.netmask4.sin_addr, 4);
+        }
+        char mac[18];
+        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 (unsigned char)a->phys_addr[0], (unsigned char)a->phys_addr[1],
+                 (unsigned char)a->phys_addr[2], (unsigned char)a->phys_addr[3],
+                 (unsigned char)a->phys_addr[4], (unsigned char)a->phys_addr[5]);
+        char cidr[INET6_ADDRSTRLEN + 8];
+        snprintf(cidr, sizeof(cidr), "%s/%d", address, prefix);
+
+        JSValue entry = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, entry, "address", JS_NewString(ctx, address));
+        JS_SetPropertyStr(ctx, entry, "netmask", JS_NewString(ctx, netmask));
+        JS_SetPropertyStr(ctx, entry, "family", JS_NewString(ctx, v6 ? "IPv6" : "IPv4"));
+        JS_SetPropertyStr(ctx, entry, "mac", JS_NewString(ctx, mac));
+        JS_SetPropertyStr(ctx, entry, "internal", JS_NewBool(ctx, a->is_internal));
+        JS_SetPropertyStr(ctx, entry, "cidr", JS_NewString(ctx, cidr));
+        if (v6)
+            JS_SetPropertyStr(ctx, entry, "scopeid", JS_NewInt32(ctx, (int32_t)a->address.address6.sin6_scope_id));
+
+        JSValue list = JS_GetPropertyStr(ctx, out, a->name);
+        if (!JS_IsArray(list)) {
+            JS_FreeValue(ctx, list);
+            list = JS_NewArray(ctx);
+            JS_SetPropertyStr(ctx, out, a->name, JS_DupValue(ctx, list));
+        }
+        uint32_t length = 0;
+        JSValue size = JS_GetPropertyStr(ctx, list, "length");
+        JS_ToUint32(ctx, &length, size);
+        JS_FreeValue(ctx, size);
+        JS_SetPropertyUint32(ctx, list, length, entry);
+        JS_FreeValue(ctx, list);
+    }
+    uv_free_interface_addresses(addresses, count);
+    return out;
+}
+
 static JSValue sxn_write_stderr(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
     if (argc < 1) return JS_UNDEFINED;
@@ -2261,6 +2438,14 @@ int sxn_install_network(JSContext *ctx) {
     /* Named "now" because bootstrap.js binds this straight onto performance
        rather than wrapping it, so this is the function user code sees. */
     JS_SetPropertyStr(ctx, global, "__sxnParseJSONBytes", JS_NewCFunction(ctx, sxn_parse_json_bytes, "__sxnParseJSONBytes", 3));
+    JS_SetPropertyStr(ctx, global, "__sxnStat", JS_NewCFunction(ctx, sxn_stat, "__sxnStat", 2));
+    JS_SetPropertyStr(ctx, global, "__sxnOsHostname", JS_NewCFunction(ctx, sxn_os_hostname, "__sxnOsHostname", 0));
+    JS_SetPropertyStr(ctx, global, "__sxnOsHomedir", JS_NewCFunctionMagic(ctx, sxn_os_dir, "__sxnOsHomedir", 0, JS_CFUNC_generic_magic, 0));
+    JS_SetPropertyStr(ctx, global, "__sxnOsTmpdir", JS_NewCFunctionMagic(ctx, sxn_os_dir, "__sxnOsTmpdir", 0, JS_CFUNC_generic_magic, 1));
+    JS_SetPropertyStr(ctx, global, "__sxnOsUname", JS_NewCFunction(ctx, sxn_os_uname, "__sxnOsUname", 0));
+    JS_SetPropertyStr(ctx, global, "__sxnOsNumbers", JS_NewCFunction(ctx, sxn_os_numbers, "__sxnOsNumbers", 0));
+    JS_SetPropertyStr(ctx, global, "__sxnOsCpus", JS_NewCFunction(ctx, sxn_os_cpus, "__sxnOsCpus", 0));
+    JS_SetPropertyStr(ctx, global, "__sxnOsInterfaces", JS_NewCFunction(ctx, sxn_os_interfaces, "__sxnOsInterfaces", 0));
     JS_SetPropertyStr(ctx, global, "__sxnPid", JS_NewInt32(ctx, (int32_t)uv_os_getpid()));
     JS_SetPropertyStr(ctx, global, "__sxnWriteStderr", JS_NewCFunction(ctx, sxn_write_stderr, "__sxnWriteStderr", 1));
     JS_SetPropertyStr(ctx, global, "__sxnNow", JS_NewCFunction(ctx, sxn_now, "now", 0));

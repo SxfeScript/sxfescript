@@ -1481,8 +1481,10 @@ static const char *node_util_names[] = {
     "isDeepStrictEqual", "types", "TextEncoder", "TextDecoder",
 };
 static const char *node_os_names[] = {
-    "EOL", "platform", "arch", "type", "release", "hostname", "tmpdir",
-    "homedir", "endianness", "cpus", "totalmem", "freemem", "uptime", "devNull",
+    "EOL", "platform", "arch", "type", "release", "version", "machine",
+    "hostname", "tmpdir", "homedir", "endianness", "cpus",
+    "availableParallelism", "networkInterfaces", "totalmem", "freemem",
+    "loadavg", "uptime", "userInfo", "devNull", "constants",
 };
 static const char *node_querystring_names[] = { "parse", "stringify", "escape", "unescape" };
 static const char *node_url_names[] = {
@@ -1573,7 +1575,10 @@ NODE_SIMPLE_MODULE(timers_promises, "__sxnTimersPromises", node_timers_promises_
 static const char *node_stream_promises_names[] = { "pipeline", "finished" };
 NODE_SIMPLE_MODULE(stream_promises, "__sxnStreamPromises", node_stream_promises_names)
 
-static const char *node_fs_export_names[] = { "readFileSync", "writeFileSync", "existsSync" };
+static const char *node_fs_export_names[] = {
+    "readFileSync", "writeFileSync", "existsSync", "statSync", "lstatSync",
+    "createReadStream", "Stats",
+};
 
 static int node_fs_init(JSContext *ctx, JSModuleDef *m) {
     JSValue fs = node_global_lookup(ctx, "__sxnFs");
@@ -1593,7 +1598,7 @@ static JSModuleDef *sxn_init_module_node_fs(JSContext *ctx, const char *name) {
     return m;
 }
 
-static const char *node_fs_promises_export_names[] = { "readFile", "writeFile" };
+static const char *node_fs_promises_export_names[] = { "readFile", "writeFile", "stat", "lstat" };
 
 static int node_fs_promises_init(JSContext *ctx, JSModuleDef *m) {
     JSValue fsp = node_global_lookup(ctx, "__sxnFsPromises");

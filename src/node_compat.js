@@ -578,6 +578,25 @@
   function wantsText(encoding) {
     return typeof encoding === "string" || (encoding && typeof encoding.encoding === "string");
   }
+  // A file's size, kind and times. The numbers come from libuv; the methods
+  // and the Date fields are the shape Node hands back.
+  var S_IFMT = 0o170000, S_IFREG = 0o100000, S_IFDIR = 0o040000, S_IFLNK = 0o120000;
+  var S_IFCHR = 0o020000, S_IFBLK = 0o060000, S_IFIFO = 0o010000, S_IFSOCK = 0o140000;
+  function Stats(raw) {
+    for (var key in raw) this[key] = raw[key];
+    this.atime = new Date(raw.atimeMs);
+    this.mtime = new Date(raw.mtimeMs);
+    this.ctime = new Date(raw.ctimeMs);
+    this.birthtime = new Date(raw.birthtimeMs);
+  }
+  Stats.prototype.isFile = function () { return (this.mode & S_IFMT) === S_IFREG; };
+  Stats.prototype.isDirectory = function () { return (this.mode & S_IFMT) === S_IFDIR; };
+  Stats.prototype.isSymbolicLink = function () { return (this.mode & S_IFMT) === S_IFLNK; };
+  Stats.prototype.isCharacterDevice = function () { return (this.mode & S_IFMT) === S_IFCHR; };
+  Stats.prototype.isBlockDevice = function () { return (this.mode & S_IFMT) === S_IFBLK; };
+  Stats.prototype.isFIFO = function () { return (this.mode & S_IFMT) === S_IFIFO; };
+  Stats.prototype.isSocket = function () { return (this.mode & S_IFMT) === S_IFSOCK; };
+
   var fs = {
     readFileSync: function (path, encoding) {
       var bytes = __sxnReadFileSync(path);
@@ -586,6 +605,30 @@
     },
     writeFileSync: globalThis.__sxnWriteFileSync,
     existsSync: globalThis.__sxnExistsSync,
+    statSync: function (path) { return new Stats(__sxnStat(path, true)); },
+    lstatSync: function (path) { return new Stats(__sxnStat(path, false)); },
+    Stats: Stats,
+    // The whole file, handed to a Readable in one chunk. Enough for serving
+    // a file, which is what this exists for; it is not a window onto a file
+    // too large to hold.
+    createReadStream: function (path, options) {
+      var stream = new Readable();
+      queueMicrotask(function () {
+        try {
+          var bytes = __sxnReadFileSync(path);
+          var start = (options && options.start) || 0;
+          var end = options && options.end !== undefined ? options.end + 1 : bytes.byteLength;
+          var slice = bytes.subarray(start, end);
+          var encoding = options && (typeof options === "string" ? options : options.encoding);
+          stream.push(encoding ? new TextDecoder().decode(slice)
+                               : Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength));
+          stream.push(null);
+        } catch (e) {
+          stream.emit("error", e);
+        }
+      });
+      return stream;
+    },
   };
   globalThis.__sxnFs = fs;
   delete globalThis.__sxnWriteFileSync;
@@ -598,6 +641,14 @@
       });
     },
     writeFile: __sxnWriteFileAsync,
+    stat: function (path) {
+      try { return Promise.resolve(new Stats(__sxnStat(path, true))); }
+      catch (e) { return Promise.reject(e); }
+    },
+    lstat: function (path) {
+      try { return Promise.resolve(new Stats(__sxnStat(path, false))); }
+      catch (e) { return Promise.reject(e); }
+    },
   };
   globalThis.__sxnFsPromises = fsPromises;
 
@@ -1738,21 +1789,39 @@
   globalThis.__sxnAssert = assert;
 
   // ---------------- node:os ----------------
+  // Answered by libuv. These used to be guesses -- "localhost" for the
+  // hostname, 0 for the memory sizes, an empty list of CPUs -- which is worse
+  // than not answering at all, because nothing can tell a stub from the
+  // truth.
+  const uname = () => __sxnOsUname();
   const os = {
     EOL: "\n",
     platform: () => process.platform,
     arch: () => process.arch,
-    type: () => (process.platform === "darwin" ? "Darwin" : process.platform === "win32" ? "Windows_NT" : "Linux"),
-    release: () => "",
-    hostname: () => "localhost",
-    tmpdir: () => (process.env && (process.env.TMPDIR || process.env.TMP)) || "/tmp",
-    homedir: () => (process.env && process.env.HOME) || "/",
+    type: () => uname().sysname || (process.platform === "darwin" ? "Darwin" : process.platform === "win32" ? "Windows_NT" : "Linux"),
+    release: () => uname().release || "",
+    version: () => uname().version || "",
+    machine: () => uname().machine || process.arch,
+    hostname: () => __sxnOsHostname(),
+    tmpdir: () => __sxnOsTmpdir(),
+    homedir: () => __sxnOsHomedir(),
     endianness: () => "LE",
-    cpus: () => [],
-    totalmem: () => 0,
-    freemem: () => 0,
-    uptime: () => Math.floor(performance.now() / 1000),
+    cpus: () => __sxnOsCpus(),
+    availableParallelism: () => __sxnOsNumbers().parallelism,
+    networkInterfaces: () => __sxnOsInterfaces(),
+    totalmem: () => __sxnOsNumbers().totalmem,
+    freemem: () => __sxnOsNumbers().freemem,
+    loadavg: () => __sxnOsNumbers().loadavg,
+    uptime: () => Math.floor(__sxnOsNumbers().uptime),
+    userInfo: () => ({
+      username: (process.env && (process.env.USER || process.env.USERNAME)) || "",
+      homedir: __sxnOsHomedir(),
+      shell: (process.env && process.env.SHELL) || null,
+      uid: -1,
+      gid: -1,
+    }),
     devNull: "/dev/null",
+    constants: { signals: {}, errno: {}, priority: {} },
   };
   globalThis.__sxnOs = os;
 
