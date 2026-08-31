@@ -312,6 +312,34 @@ Nothing in that list is a JavaScript loop any more. What remains in the file
 around them is dispatch: argument shuffling, a check, and a call into
 something that is already native.
 
+### Section by section, what is left and why
+
+Every section of `src/node_compat.js`, with what is native under it and what
+the JavaScript around it still does. Nothing here is a loop over bytes or
+characters any more; what is left is dispatch, class shapes and event
+plumbing, and the cost of each of those was measured before it was left
+alone.
+
+| Section | Lines | What is native | What the JavaScript still does |
+| --- | --- | --- | --- |
+| `events` | 74 | `on`, `off`, `emit`, `once`, `listeners`, `listenerCount`, `removeAllListeners` | the class shape, and the two async helpers `once(emitter)` and `on(emitter)`, which are promise plumbing |
+| `buffer` | 146 | every encoding both ways, the lenient readers, `concat`, `compare`, the numeric accessors | `Buffer.from`'s dispatch on argument type, and `toString`'s on encoding name |
+| `path` | 56 | all of it, both posix and win32 | the two tables and the platform choice between them |
+| `process` | 108 | `env`, `cwd`, `chdir`, `nextTick`, `exit`, `pid`, `platform`, `arch`, signal watching | `argv`, the stdio objects, `emitWarning`, `uptime` |
+| `fs` | 89 | reads, writes, `stat`, `exists` | the encoding branch, `Stats`' predicates, `createReadStream`'s wrapper |
+| `stream` | 372 | the chunk queue's cursor, `write`'s callback, the byte joining | the five classes, `pipe`, the async iterator, the Web Streams bridges -- listener bookkeeping, measured slower from C |
+| `http` | 201 | header lowercasing, `rawHeaders`, the socket, the body join, the four header methods, the deferred body | `IncomingMessage` and `ServerResponse` themselves, and the server's promise contract |
+| `net` | 20 | `isIP` | the two wrappers around it, and the honest refusals for real sockets |
+| `crypto` | 94 | digests, HMAC, `timingSafeEqual`, random bytes, every input encoding | `Hash` and `Hmac`'s two-line classes, and the digest encoding branch |
+| `zlib` | 90 | deflate and inflate | the six wrappers, the constants, the Transform streams |
+| small builtins | 95 | `StringDecoder`'s utf-8 path, the builtin table behind `require` | `tty`, `timers`, `perf_hooks`, `Module`'s shape |
+| `util` | 106 | `format`, `inspect` | `promisify`, `callbackify`, `inherits`, `types` -- all measured faster here than in Node |
+| `assert` | 31 | the structural comparison | `AssertionError` and the twelve one-line entry points |
+| `os` | 37 | all of it, from libuv | the object it hangs on |
+| `querystring` | 17 | all four functions | the object it hangs on |
+| `url` | 16 | `fileURLToPath`, `pathToFileURL`'s text | `format` and `parse`, which are the engine's `URL` |
+
+
 Still JavaScript, with the reason measured rather than asserted:
 
 - **`stream` and `http`.** A `node:http` request costs 13.4 us here against
