@@ -1370,17 +1370,11 @@
     inspect,
     format,
     // Node keeps the custom-inspect symbol here.
-    promisify(fn) {
-      if (typeof fn !== "function") throw new TypeError("promisify expects a function");
-      const wrapped = function (...args) {
-        return new Promise((resolve, reject) => {
-          fn.call(this, ...args, (err, ...values) =>
-            err ? reject(err) : resolve(values.length > 1 ? values : values[0]));
-        });
-      };
-      Object.defineProperty(wrapped, "name", { value: fn.name, configurable: true });
-      return wrapped;
-    },
+    // Native (js_promisify in src/node.c): this spread the arguments, built
+    // a Promise with an executor closure and a callback closure inside it,
+    // per call. It also resolved with an array when a callback reported
+    // more than one value; Node keeps the first and drops the rest.
+    promisify: __sxnPromisify,
     callbackify(fn) {
       return function (...args) {
         const cb = args.pop();

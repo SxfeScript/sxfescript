@@ -257,6 +257,14 @@ used to throw out of `toISOString` at whoever tried to print it, and an
 error, which now carries the `Error: message` line this engine's `stack`
 leaves off.
 
+`util.promisify` is native too. It spread the arguments, built a Promise
+around an executor closure and then a callback closure inside that, per call:
+0.62 microseconds to 0.44, against Node's 0.08. Two behaviours changed to
+match Node rather than what was here: a callback reporting more than one
+value resolves with the first, not with an array of them, and a function that
+throws synchronously produces a rejection rather than throwing out of the
+call.
+
 A third sweep, over what a server actually touches, found two corruptions
 rather than costs. `fs/promises.readFile` read the file as text and encoded
 it back to bytes, so every byte that is not valid UTF-8 came back as the
@@ -296,6 +304,7 @@ does not have to re-derive it:
 | `url.fileURLToPath` | 0.130 us | C, was 0.475 |
 | `module.isBuiltin` | 0.045 us | C, was 0.415 |
 | `util.inspect` of an object | 2.26 us | C, was 5.26; Node is 1.56 |
+| a promisified call | 0.44 us | C, was 0.62; Node is 0.08 |
 | `process.nextTick` | 0.143 us | C, was 0.620 |
 | `res.getHeaders` | 0.110 us | C, was 0.173 |
 | `res.getHeaderNames` | 0.110 us | C, was 0.157 |
@@ -333,7 +342,7 @@ alone.
 | `crypto` | 94 | digests, HMAC, `timingSafeEqual`, random bytes, every input encoding | `Hash` and `Hmac`'s two-line classes, and the digest encoding branch |
 | `zlib` | 90 | deflate and inflate | the six wrappers, the constants, the Transform streams |
 | small builtins | 95 | `StringDecoder`'s utf-8 path, the builtin table behind `require` | `tty`, `timers`, `perf_hooks`, `Module`'s shape |
-| `util` | 106 | `format`, `inspect` | `promisify`, `callbackify`, `inherits`, `types` -- all measured faster here than in Node |
+| `util` | 106 | `format`, `inspect`, `promisify` | `callbackify`, `inherits`, `types` -- measured faster here than in Node at 0.14 and 0.18 microseconds against 1.18 and 0.15 |
 | `assert` | 31 | the structural comparison | `AssertionError` and the twelve one-line entry points |
 | `os` | 37 | all of it, from libuv | the object it hangs on |
 | `querystring` | 17 | all four functions | the object it hangs on |

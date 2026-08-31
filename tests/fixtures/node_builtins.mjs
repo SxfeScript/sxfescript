@@ -39,6 +39,20 @@ p("qs parse", { ...qs.parse("a=1&b=two&a=3") });
 p("qs stringify", qs.stringify({ a: 1, b: ["x","y"] }));
 p("qs roundtrip", { ...qs.parse(qs.stringify({ k: "a b&c" })) });
 
+// util.promisify is native: it keeps the first value a callback reports,
+// keeps `this`, keeps the function's name, and lets a synchronous throw out.
+p("promisify value", await promisify((x, cb) => cb(null, x * 2))(21));
+p("promisify first value only", await promisify((cb) => cb(null, 1, 2, 3))());
+p("promisify no value", await promisify((cb) => cb(null))());
+p("promisify rejects", await promisify((cb) => cb(new Error("nope")))().catch((e) => e.message));
+p("promisify keeps this", await (() => { const o = { v: 5, m(cb) { cb(null, this.v); } };
+  o.p = promisify(o.m); return o.p(); })());
+p("promisify keeps the name", promisify(function original(cb) { cb(null); }).name);
+p("promisify turns a throw into a rejection",
+  await promisify(() => { throw new TypeError("sync"); })().then(() => "no", (e) => e.constructor.name));
+p("promisify refuses a non-function", (() => { try { promisify(42); return "no"; }
+  catch (e) { return e.constructor.name; } })());
+
 // url
 p("fileURLToPath", fileURLToPath("file:///tmp/x%20y.txt"));
 p("pathToFileURL", String(pathToFileURL("/tmp/a b.txt")));

@@ -3671,6 +3671,80 @@ static JSValue js_inspect(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     return text;
 }
 
+
+/* util.promisify. The JavaScript version spread the arguments, built a
+   Promise with an executor closure and then a callback closure inside it,
+   all per call. Here the promise is made directly and the callback is a C
+   function carrying its two resolving functions. */
+static JSValue sxn_promisify_callback(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValue *data) {
+    (void)this_val; (void)magic;
+    JSValueConst err = argc > 0 ? argv[0] : JS_UNDEFINED;
+    if (!JS_IsUndefined(err) && !JS_IsNull(err)) {
+        JSValueConst args[1] = { err };
+        JS_FreeValue(ctx, JS_Call(ctx, data[1], JS_UNDEFINED, 1, args));
+        return JS_UNDEFINED;
+    }
+    /* Node resolves with the callback's first value and drops the rest,
+       which the JavaScript version here did not: it handed back an array.
+       Node's own answer is the one to keep. */
+    JSValue value = argc > 1 ? JS_DupValue(ctx, argv[1]) : JS_UNDEFINED;
+    JSValueConst args[1] = { value };
+    JS_FreeValue(ctx, JS_Call(ctx, data[0], JS_UNDEFINED, 1, args));
+    JS_FreeValue(ctx, value);
+    return JS_UNDEFINED;
+}
+
+static JSValue sxn_promisified(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValue *data) {
+    (void)magic;
+    JSValue resolving[2];
+    JSValue promise = JS_NewPromiseCapability(ctx, resolving);
+    if (JS_IsException(promise)) return promise;
+    JSValue callback = JS_NewCFunctionData(ctx, sxn_promisify_callback, 2, 0, 2, resolving);
+    if (JS_IsException(callback)) {
+        JS_FreeValue(ctx, resolving[0]);
+        JS_FreeValue(ctx, resolving[1]);
+        JS_FreeValue(ctx, promise);
+        return callback;
+    }
+
+    JSValue *args = js_malloc(ctx, sizeof(JSValue) * (size_t)(argc + 1));
+    if (!args) { JS_FreeValue(ctx, callback); JS_FreeValue(ctx, promise); return JS_EXCEPTION; }
+    for (int i = 0; i < argc; i++) args[i] = JS_DupValue(ctx, argv[i]);
+    args[argc] = callback;
+    JSValue result = JS_Call(ctx, data[0], this_val, argc + 1, (JSValueConst *)args);
+    for (int i = 0; i <= argc; i++) JS_FreeValue(ctx, args[i]);
+    js_free(ctx, args);
+    if (JS_IsException(result)) {
+        /* Node calls the function inside the promise, so a synchronous
+           throw comes back as a rejection rather than out of the call. */
+        JSValue error = JS_GetException(ctx);
+        JSValueConst reject_args[1] = { error };
+        JS_FreeValue(ctx, JS_Call(ctx, resolving[1], JS_UNDEFINED, 1, reject_args));
+        JS_FreeValue(ctx, error);
+    } else {
+        JS_FreeValue(ctx, result);
+    }
+    JS_FreeValue(ctx, resolving[0]);
+    JS_FreeValue(ctx, resolving[1]);
+    return promise;
+}
+
+static JSValue js_promisify(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1 || !JS_IsFunction(ctx, argv[0]))
+        return JS_ThrowTypeError(ctx, "promisify expects a function");
+    JSValue data[1] = { JS_DupValue(ctx, argv[0]) };
+    JSValue wrapped = JS_NewCFunctionData(ctx, sxn_promisified, 0, 0, 1, data);
+    JS_FreeValue(ctx, data[0]);
+    if (JS_IsException(wrapped)) return wrapped;
+    /* Node keeps the original's name on the wrapper. */
+    JSValue name = JS_GetPropertyStr(ctx, argv[0], "name");
+    JSAtom name_atom = JS_NewAtom(ctx, "name");
+    JS_DefinePropertyValue(ctx, wrapped, name_atom, name, JS_PROP_CONFIGURABLE);
+    JS_FreeAtom(ctx, name_atom);
+    return wrapped;
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -4152,6 +4226,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnPromisify", JS_NewCFunction(ctx, js_promisify, "promisify", 1));
     JS_SetPropertyStr(ctx, global, "__sxnInspect", JS_NewCFunction(ctx, js_inspect, "inspect", 2));
     JS_SetPropertyStr(ctx, global, "__sxnNextTick", JS_NewCFunction(ctx, js_next_tick, "nextTick", 1));
     JS_SetPropertyStr(ctx, global, "__sxnGetHeaders", JS_NewCFunctionMagic(ctx, js_header_list, "getHeaders", 0, JS_CFUNC_generic_magic, 0));
