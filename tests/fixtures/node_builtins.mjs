@@ -21,6 +21,12 @@ p("format extra args", format("a", 1, "b"));
 // util.inherits
 function Base(){} Base.prototype.hi = () => "hi";
 function Derived(){} inherits(Derived, Base);
+// inherits is native: it sets super_ and reparents the prototype, and it
+// refuses anything that is not a pair of constructors.
+p("inherits refuses a non-function", (() => { try { inherits(Derived, {}); return "no"; }
+  catch (e) { return e.constructor.name; } })());
+p("super_ is writable", (() => { Derived.super_ = null; const ok = Derived.super_ === null;
+  inherits(Derived, Base); return ok && Derived.super_ === Base; })());
 p("inherits", [new Derived().hi(), Derived.super_ === Base]);
 
 // util.types

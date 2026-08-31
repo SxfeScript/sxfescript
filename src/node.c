@@ -3894,6 +3894,25 @@ static JSValue js_buffer_from_bytes(JSContext *ctx, JSValueConst this_val, int a
     return out;
 }
 
+
+/* util.inherits: two property operations, done from C instead of through
+   Object.defineProperty and Object.setPrototypeOf. */
+static JSValue js_inherits(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 2 || !JS_IsFunction(ctx, argv[0]) || !JS_IsFunction(ctx, argv[1]))
+        return JS_ThrowTypeError(ctx, "inherits expects two constructors");
+    JSAtom super_atom = JS_NewAtom(ctx, "super_");
+    JS_DefinePropertyValue(ctx, argv[0], super_atom, JS_DupValue(ctx, argv[1]),
+                           JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    JS_FreeAtom(ctx, super_atom);
+    JSValue proto = JS_GetPropertyStr(ctx, argv[0], "prototype");
+    JSValue super_proto = JS_GetPropertyStr(ctx, argv[1], "prototype");
+    JS_SetPrototype(ctx, proto, super_proto);
+    JS_FreeValue(ctx, proto);
+    JS_FreeValue(ctx, super_proto);
+    return JS_UNDEFINED;
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -4375,6 +4394,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnInherits", JS_NewCFunction(ctx, js_inherits, "inherits", 2));
     JS_SetPropertyStr(ctx, global, "__sxnBufferFromBytes", JS_NewCFunction(ctx, js_buffer_from_bytes, "__sxnBufferFromBytes", 1));
     JS_SetPropertyStr(ctx, global, "__sxnPipe", JS_NewCFunction(ctx, js_stream_pipe, "pipe", 2));
     JS_SetPropertyStr(ctx, global, "__sxnPromisify", JS_NewCFunction(ctx, js_promisify, "promisify", 1));

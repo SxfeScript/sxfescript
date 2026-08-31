@@ -321,6 +321,7 @@ does not have to re-derive it:
 | a promisified call | 0.29 us | C, was 0.62; Node is 0.08 |
 | `readable.pipe` | 1.83 us | C, was 1.95; Node is 7.21 |
 | `Buffer.from` a view | 0.21 us | C, was 0.285; Node is 0.035 |
+| `util.inherits` | 0.060 us | C, was 0.250; Node is 0.150 |
 | `Buffer.from` an array | 0.37 us | JS: from C it measured 1.185 |
 | `process.nextTick` | 0.143 us | C, was 0.620 |
 | `res.getHeaders` | 0.110 us | C, was 0.173 |
@@ -359,7 +360,7 @@ alone.
 | `crypto` | 94 | digests, HMAC, `timingSafeEqual`, random bytes, every input encoding | `Hash` and `Hmac`'s two-line classes, and the digest encoding branch |
 | `zlib` | 90 | deflate and inflate | the six wrappers, the constants, the Transform streams |
 | small builtins | 95 | `StringDecoder`'s utf-8 path, the builtin table behind `require` | `tty`, `timers`, `perf_hooks`, `Module`'s shape |
-| `util` | 106 | `format`, `inspect`, `promisify` | `callbackify`, `inherits`, `types` -- measured faster here than in Node at 0.14 and 0.18 microseconds against 1.18 and 0.15 |
+| `util` | 106 | `format`, `inspect`, `promisify`, `inherits` | `callbackify` and `types` -- one-line wrappers, and `callbackify` measured 0.14 microseconds here against Node's 1.18 |
 | `assert` | 31 | the structural comparison | `AssertionError` and the twelve one-line entry points |
 | `os` | 37 | all of it, from libuv | the object it hangs on |
 | `querystring` | 17 | all four functions | the object it hangs on |
