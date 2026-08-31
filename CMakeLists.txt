@@ -401,6 +401,10 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # expectations are Node's own output, so a divergence fails.
   add_test(NAME sxn-json-edges COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/json_edges.mjs)
   set_tests_properties(sxn-json-edges PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # 4000 seeded-random documents through parse and stringify, hashed. The
+  # expected hash is Node's, so one byte of divergence anywhere fails.
+  add_test(NAME sxn-json-fuzz COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/json_fuzz.mjs)
+  set_tests_properties(sxn-json-fuzz PROPERTIES TIMEOUT 120 FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-serve-fetch-shape PROPERTIES TIMEOUT 30 FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-performance-now PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
