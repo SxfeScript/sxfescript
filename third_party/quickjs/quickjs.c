@@ -24303,6 +24303,16 @@ typedef struct JSParseState {
     const uint8_t *eol;  // most recently seen end-of-line character
     const uint8_t *mark; // first token character, invariant: eol < mark
 
+    /* JSON only: the last few property names seen, so a key that repeats
+       from one object to the next -- which is every key in a document of
+       records -- is not hashed into the atom table again. Each entry holds
+       one reference; json_free_key_cache drops them. */
+    struct {
+        const uint8_t *ptr;
+        uint32_t len;
+        JSAtom atom;
+    } json_keys[4];
+
     /* current function code */
     JSFunctionDef *cur_func;
     bool is_module; /* parsing a module */
@@ -53825,6 +53835,37 @@ static void json_free_parse_record(JSContext *ctx, JSONParseRecord *pr)
 }
 
 /* 'pr' can be NULL */
+/* The atom for a JSON property name, remembering the last few. The pointer
+   is into the document being parsed, which outlives the parse, so a hit is
+   confirmed with a compare of the bytes themselves. */
+static JSAtom json_key_atom(JSParseState *s, const uint8_t *p, uint32_t len)
+{
+    uint32_t slot = (len * 31u + (len ? p[0] : 0u)) & 3u;
+    JSAtom atom = s->json_keys[slot].atom;
+
+    if (atom != JS_ATOM_NULL && s->json_keys[slot].len == len
+        && !memcmp(s->json_keys[slot].ptr, p, len))
+        return JS_DupAtom(s->ctx, atom);
+    atom = JS_NewAtomLen(s->ctx, (const char *)p, len);
+    if (atom == JS_ATOM_NULL)
+        return JS_ATOM_NULL;
+    if (s->json_keys[slot].atom != JS_ATOM_NULL)
+        JS_FreeAtom(s->ctx, s->json_keys[slot].atom);
+    s->json_keys[slot].ptr = p;
+    s->json_keys[slot].len = len;
+    s->json_keys[slot].atom = JS_DupAtom(s->ctx, atom);
+    return atom;
+}
+
+static void json_free_key_cache(JSParseState *s)
+{
+    uint32_t i;
+    for (i = 0; i < countof(s->json_keys); i++) {
+        JS_FreeAtom(s->ctx, s->json_keys[i].atom);
+        s->json_keys[i].atom = JS_ATOM_NULL;
+    }
+}
+
 static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
 {
     JSContext *ctx = s->ctx;
@@ -53860,7 +53901,7 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
                 for(;;) {
                     if (s->token.val == TOK_STRING) {
                         if (s->token.u.str.raw)
-                            prop_name = JS_NewAtomLen(ctx, (const char *)s->token.u.str.raw,
+                            prop_name = json_key_atom(s, s->token.u.str.raw,
                                                       s->token.u.str.raw_len);
                         else
                             prop_name = JS_ValueToAtom(ctx, s->token.u.str.str);
@@ -54059,6 +54100,7 @@ static JSValue JS_ParseJSON_internal(JSContext *ctx, const char *buf, size_t buf
     if (json_next_token(s))
         goto fail;
     val = json_parse_value(s, pr);
+    json_free_key_cache(s);
     if (JS_IsException(val))
         goto fail;
     if (s->token.val != TOK_EOF) {
