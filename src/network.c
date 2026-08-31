@@ -147,16 +147,17 @@ static int sxn_strcasecmp(const char *a, const char *b) {
    way in; when Content-Length says how big it will be, it is copied once. */
 static void dynbuf_reserve(DynBuf *buf, size_t want) {
     if (want <= buf->cap) return;
-    buf->data = realloc(buf->data, want);
-    buf->cap = want;
+    /* Grow geometrically as well as to what was asked for: the read path
+       asks for "what I have plus another read", and honouring that exactly
+       would copy the whole buffer on every read. */
+    size_t cap = buf->cap ? buf->cap * 2 : 256;
+    if (cap < want) cap = want;
+    buf->data = realloc(buf->data, cap);
+    buf->cap = cap;
 }
 
 static void dynbuf_append(DynBuf *buf, const void *data, size_t n) {
-    if (buf->length + n > buf->cap) {
-        size_t cap = buf->cap ? buf->cap * 2 : 256;
-        while (cap < buf->length + n) cap *= 2;
-        buf->data = realloc(buf->data, cap); buf->cap = cap;
-    }
+    dynbuf_reserve(buf, buf->length + n);
     memcpy(buf->data + buf->length, data, n); buf->length += n;
 }
 static void dynbuf_puts(DynBuf *buf, const char *s) { dynbuf_append(buf, s, strlen(s)); }
@@ -346,9 +347,18 @@ static void conn_write_cb(uv_write_t *req, int status) {
     if (left) conn_try_dispatch(conn);
 }
 
+/* Read straight into the connection's own buffer. It used to allocate 64KB
+   for every read and copy it in afterwards: a 1MB request meant sixteen
+   allocations, sixteen frees and a megabyte of copying that the kernel could
+   have done into the right place to begin with. */
 static void conn_alloc_cb(uv_handle_t *handle, size_t suggested, uv_buf_t *buf) {
-    (void)handle; (void)suggested;
-    buf->base = malloc(65536); buf->len = buf->base ? 65535 : 0; /* room for a trailing NUL */
+    (void)suggested;
+    ConnState *conn = (ConnState *)handle->data;
+    size_t room = 65536;
+    dynbuf_reserve(&conn->in, conn->in.length + room + 1); /* +1 for a trailing NUL */
+    if (!conn->in.data) { buf->base = NULL; buf->len = 0; return; }
+    buf->base = conn->in.data + conn->in.length;
+    buf->len = conn->in.cap - conn->in.length - 1;
 }
 
 /* arcsx: turn a handler's return value into bytes and write them. Split out
@@ -703,18 +713,15 @@ static void conn_try_dispatch(ConnState *conn) {
 
 static void conn_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
     ConnState *conn = (ConnState *)stream->data;
+    (void)buf;   /* it is a window into conn->in, not a buffer of its own */
     if (nread <= 0) {
-        free(buf->base);
         uv_read_stop(stream);
         conn_shutdown(conn, conn_close_cb);
         return;
     }
-    dynbuf_append(&conn->in, buf->base, (size_t)nread);
-    free(buf->base);
+    conn->in.length += (size_t)nread;
     /* NUL terminated for the header parsing, which is all string work; the
        body is bounded by the length instead. */
-    dynbuf_append(&conn->in, "", 1);
-    conn->in.length--;
     conn->in.data[conn->in.length] = 0;
     conn_try_dispatch(conn);
 }
