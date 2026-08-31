@@ -220,12 +220,21 @@ than the interpreter's own store on a fresh object, so plain field
 initialisation stays where it is. The socket above is not a
 counter-example -- what made it fast was not setting the fields at all.
 
-`Writable#write` was allocating a closure per chunk to say nothing: the
-callback it must hand `_write` was built fresh even when the caller passed
-none, and it closed over a `backpressure` flag that was never set. Callers
-with no callback of their own -- `res.write`, and every write a pipe makes --
-get a shared native no-op now, and a write went from 0.195 microseconds to
-0.130.
+`Writable#write` built a closure per chunk for the callback it must hand
+`_write`, closing over a `backpressure` flag that nothing ever set. It is a C
+function carrying the stream and the caller's callback now. This one bought
+almost nothing -- 0.195 microseconds a write became 0.190 -- and the first
+version of it, a shared no-op for writes with no callback, was faster at
+0.130 and wrong: it swallowed the error a failing `_write` reports, which
+has to reach the stream's 'error' listeners whether anyone passed a callback
+or not.
+
+The sweep also turned up a bug rather than a cost. A `Readable` took chunks
+off its queue with `shift()`, which copies the whole queue down by one every
+time, so draining 20000 buffered chunks took 44 milliseconds against 1 for
+2000 -- quadratic in the queue's length. Chunks leave through a cursor now:
+the same 20000 take 3 milliseconds. This one is not a migration at all, and
+no amount of C would have found it.
 
 A sweep of what is left, measured rather than guessed, so the next person
 does not have to re-derive it:

@@ -54,4 +54,22 @@ p("fromWeb", await collect(Readable.fromWeb(
 // Outside objectMode a stream refuses a non-byte chunk, as Node does.
 p("rejects raw number", (() => { try { new Writable({ write(c,e,cb){cb();} }).write(5); return "no"; }
   catch (e) { return e.code; } })());
+// The read queue: chunks leave through a cursor now, so a long queue has to
+// come out in order, exactly once, and end when it is empty.
+{ const r = new Readable({ objectMode: true, read(){} });
+  for (let i = 0; i < 500; i++) r.push({ i });
+  r.push(null);
+  const seen = await collect(r);
+  p("long queue length", seen.length);
+  p("long queue in order", seen.every((v, i) => v.i === i));
+  p("long queue read after end", r.read()); }
+{ const r = new Readable({ objectMode: true, read(){} });
+  r.push("a"); r.push("b");
+  const first = r.read();
+  r.push("c");
+  p("interleaved push and read", [first, r.read(), r.read(), r.read()]); }
+{ const r = new Readable({ read(){} });
+  r.push("ab"); r.push("cd"); r.push(null);
+  p("bytes join into one read", r.read().toString()); }
+
 console.log(L.join("\n"));

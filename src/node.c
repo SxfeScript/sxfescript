@@ -3101,12 +3101,37 @@ static JSValue js_concat_bytes(JSContext *ctx, JSValueConst this_val, int argc, 
 }
 
 
-/* A do-nothing callback, shared. A Writable has to hand its _write one, and
-   a write with no callback of its own was allocating a closure per chunk to
-   say nothing. */
-static JSValue js_noop(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    (void)this_val; (void)argc; (void)argv;
+/* The callback a Writable hands its _write. It was a JavaScript closure per
+   chunk; here it is a C function carrying the stream and the caller's
+   callback, if there was one. An error still reaches the stream's 'error'
+   listeners whether or not anybody passed a callback. */
+static JSValue sxn_write_done(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValue *data) {
+    (void)this_val; (void)magic;
+    JSValueConst err = argc > 0 ? argv[0] : JS_UNDEFINED;
+    bool failed = !JS_IsUndefined(err) && !JS_IsNull(err);
+    if (failed) {
+        JSValue emit = JS_GetPropertyStr(ctx, data[0], "emit");
+        JSValue name = JS_NewString(ctx, "error");
+        JSValueConst args[2] = { name, err };
+        JS_FreeValue(ctx, JS_Call(ctx, emit, data[0], 2, args));
+        JS_FreeValue(ctx, name);
+        JS_FreeValue(ctx, emit);
+    }
+    if (JS_IsFunction(ctx, data[1])) {
+        JSValueConst args[1] = { failed ? err : JS_NULL };
+        JS_FreeValue(ctx, JS_Call(ctx, data[1], JS_UNDEFINED, 1, args));
+    }
     return JS_UNDEFINED;
+}
+
+static JSValue js_write_callback(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    JSValue data[2] = { JS_DupValue(ctx, argc > 0 ? argv[0] : JS_UNDEFINED),
+                        JS_DupValue(ctx, argc > 1 ? argv[1] : JS_UNDEFINED) };
+    JSValue fn = JS_NewCFunctionData(ctx, sxn_write_done, 1, 0, 2, data);
+    JS_FreeValue(ctx, data[0]);
+    JS_FreeValue(ctx, data[1]);
+    return fn;
 }
 
 /* ---------------- assert's deep comparison, in C ----------------
@@ -3589,7 +3614,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
-    JS_SetPropertyStr(ctx, global, "__sxnNoop", JS_NewCFunction(ctx, js_noop, "noop", 0));
+    JS_SetPropertyStr(ctx, global, "__sxnWriteCallback", JS_NewCFunction(ctx, js_write_callback, "__sxnWriteCallback", 2));
     JS_SetPropertyStr(ctx, global, "__sxnConcatBytes", JS_NewCFunction(ctx, js_concat_bytes, "__sxnConcatBytes", 2));
     JS_SetPropertyStr(ctx, global, "__sxnSetHeader", JS_NewCFunctionMagic(ctx, js_header_op, "setHeader", 2, JS_CFUNC_generic_magic, 0));
     JS_SetPropertyStr(ctx, global, "__sxnGetHeader", JS_NewCFunctionMagic(ctx, js_header_op, "getHeader", 1, JS_CFUNC_generic_magic, 1));

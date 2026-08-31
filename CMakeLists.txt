@@ -325,6 +325,9 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # node:stream: flowing and paused modes, pipe, transform, pipeline, the
   # Buffer conversion outside objectMode, and the Web Streams bridges.
   add_test(NAME sxn-node-stream COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_stream.mjs)
+  # This one prints its results in one go at the end, so silence is failure:
+  # require the last line rather than merely the absence of FAIL.
+  set_tests_properties(sxn-node-stream PROPERTIES PASS_REGULAR_EXPRESSION "bytes join into one read")
   set_tests_properties(sxn-node-stream PROPERTIES TIMEOUT 40)
   # node:http: the (req, res) server, headers, chunked writes, request bodies
   # and a response finished after the handler returns.

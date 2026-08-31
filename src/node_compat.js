@@ -489,6 +489,7 @@
     EE.call(this);
     options = options || {};
     this._buf = [];
+    this._bufAt = 0;      // read cursor: shift() on a long queue copies it
     this._flowing = false;
     this._ended = false;
     this._endEmitted = false;
@@ -521,29 +522,41 @@
     this._buf.push(chunk);
     if (this._flowing) drainReadable(this);
     else this.emit("readable");
-    return this._buf.length < 16;      // a coarse high-water mark
+    return this._buf.length - this._bufAt < 16;      // a coarse high-water mark
   };
+  // Chunks leave through a cursor rather than shift(), which copies the
+  // whole queue down by one every time and made draining a long one cost
+  // its own length squared.
+  function takeChunk(r) {
+    const chunk = r._buf[r._bufAt];
+    r._buf[r._bufAt++] = undefined;
+    if (r._bufAt === r._buf.length) { r._buf.length = 0; r._bufAt = 0; }
+    return chunk;
+  }
+  function bufferedCount(r) { return r._buf.length - r._bufAt; }
   function drainReadable(r) {
-    while (r._flowing && r._buf.length > 0) r.emit("data", r._buf.shift());
+    while (r._flowing && bufferedCount(r) > 0) r.emit("data", takeChunk(r));
     maybeEndReadable(r);
     if (r._flowing && !r._ended) r._read();
   }
   function maybeEndReadable(r) {
-    if (r._ended && r._buf.length === 0 && !r._endEmitted) {
+    if (r._ended && bufferedCount(r) === 0 && !r._endEmitted) {
       r._endEmitted = true;
       r.readable = false;
       queueMicrotask(() => { r.emit("end"); r.emit("close"); });
     }
   }
   Readable.prototype.read = function () {
-    if (this._buf.length === 0) { this._read(); }
-    if (this._buf.length === 0) { maybeEndReadable(this); return null; }
+    if (bufferedCount(this) === 0) { this._read(); }
+    if (bufferedCount(this) === 0) { maybeEndReadable(this); return null; }
     let c;
-    if (this._readableObjectMode || this._encoding || this._buf.length === 1) {
-      c = this._buf.shift();
+    if (this._readableObjectMode || this._encoding || bufferedCount(this) === 1) {
+      c = takeChunk(this);
     } else {
       // Node hands back everything buffered as one Buffer.
-      c = Buffer.concat(this._buf.splice(0));
+      c = Buffer.concat(this._buf.splice(this._bufAt));
+      this._buf.length = 0;
+      this._bufAt = 0;
     }
     maybeEndReadable(this);
     return c;
@@ -605,7 +618,7 @@
     const self = this;
     return {
       next() {
-        if (self._buf.length > 0) return Promise.resolve({ value: self._buf.shift(), done: false });
+        if (bufferedCount(self) > 0) return Promise.resolve({ value: takeChunk(self), done: false });
         if (self._ended) return Promise.resolve({ value: undefined, done: true });
         return new Promise((resolve, reject) => {
           const onData = (c) => { cleanup(); resolve({ value: c, done: false }); };
@@ -697,14 +710,10 @@
       if (cb) cb(e);
       return false;
     }
-    // A write with no callback of its own -- res.write, and every write a
-    // pipe makes -- gets the shared native no-op instead of a closure built
-    // to say nothing.
-    if (cb === undefined) this._write(chunk, enc || "utf8", __sxnNoop);
-    else this._write(chunk, enc || "utf8", (err) => {
-      if (err) { this.emit("error", err); cb(err); return; }
-      cb(null);
-    });
+    // Native (sxn_write_done in src/node.c): the callback _write is handed
+    // was a JavaScript closure per chunk. An error still reaches the
+    // stream's 'error' listeners whether or not a callback was passed.
+    this._write(chunk, enc || "utf8", __sxnWriteCallback(this, cb));
     return true;
   };
   Writable.prototype.cork = function () { this._corked++; };
