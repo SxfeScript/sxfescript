@@ -234,7 +234,15 @@ typedef struct ConnState {
     /* Held across an async handler: the upgrade bits belong to the request
        that is still being answered, and the read buffer is long gone. */
     char *pending_upgrade; char *pending_ws_key;
+    /* A request arrives over as many reads as the kernel feels like giving
+       us; only a small one fits in the first. This accumulates them until
+       the head and Content-Length bytes of body are both in hand. */
+    DynBuf in;
 } ConnState;
+
+/* A request bigger than this is refused rather than buffered: the whole
+   thing is held in memory before the handler sees it. */
+#define SXN_MAX_REQUEST_BYTES (64u * 1024u * 1024u)
 
 static void conn_deliver(JSContext *ctx, ConnState *conn, JSValue result,
                          const char *upgrade, const char *ws_key);
@@ -269,7 +277,7 @@ static JSValue conn_promise_fail(JSContext *ctx, JSValueConst this_val,
 
 static void conn_close_cb(uv_handle_t *handle) {
     ConnState *conn = (ConnState *)handle->data;
-    free(conn->write_data); free(conn);
+    free(conn->write_data); free(conn->in.data); free(conn);
 }
 
 static void conn_write_cb(uv_write_t *req, int status) {
@@ -469,20 +477,22 @@ static void conn_deliver(JSContext *ctx, ConnState *conn, JSValue result,
     uv_write(write_req, stream, &write_buf, 1, conn_write_cb);
 }
 
-static void conn_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
-    ConnState *conn = (ConnState *)stream->data;
-    uv_read_stop(stream);
-    if (nread <= 0) { free(buf->base); uv_close((uv_handle_t *)&conn->handle, conn_close_cb); return; }
+/* One complete request, parsed and handed to the handler. `request` is NUL
+   terminated for the header scanning below, and `length` is what bounds the
+   body -- a body may legitimately contain a NUL byte, so its length never
+   comes from strlen. */
+static void conn_dispatch_request(ConnState *conn, char *request, size_t length) {
     JSContext *ctx = conn->serve->ctx;
-    char *request = buf->base; request[nread] = 0;
     char method[16] = {0}, url[4096] = {0}; sscanf(request, "%15s %4095s", method, url);
-    char *body = strstr(request, "\r\n\r\n"); body = body ? body + 4 : request + nread;
+    char *head_end = strstr(request, "\r\n\r\n");
+    char *body = head_end ? head_end + 4 : request + length;
+    size_t body_len = (size_t)((request + length) - body);
     char *ws_key = header_value(request, "Sec-WebSocket-Key");
     char *upgrade = header_value(request, "Upgrade");
     JSValue req_obj = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, req_obj, "method", JS_NewString(ctx, method));
     JS_SetPropertyStr(ctx, req_obj, "url", JS_NewString(ctx, url));
-    JS_SetPropertyStr(ctx, req_obj, "body", JS_NewString(ctx, body));
+    JS_SetPropertyStr(ctx, req_obj, "body", JS_NewStringLen(ctx, body, body_len));
     /* Every request header, lowercased, the way Node presents them. Only
        `upgrade` used to be exposed, so a handler could not read an
        Authorization, Content-Type or Cookie header at all. */
@@ -545,11 +555,62 @@ static void conn_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf
         JS_FreeValue(ctx, caught); JS_FreeValue(ctx, chained);
         JS_FreeValue(ctx, on_ok); JS_FreeValue(ctx, on_err);
         JS_FreeValue(ctx, data); JS_FreeValue(ctx, result);
-        free(buf->base);
         return;
     }
-    free(buf->base);
     conn_deliver(ctx, conn, result, upgrade, ws_key);
+}
+
+/* Content-Length, or -1 when the head does not carry one. Its own scan
+   rather than header_value's, which returns an interior pointer and
+   overwrites the line's CRLF with a NUL -- fine once the request is complete
+   and about to be parsed, wrong while it is still being read. */
+static long long request_content_length(const char *head, const char *head_end) {
+    const char *line = strstr(head, "\r\n");
+    while (line && line + 2 < head_end) {
+        line += 2;
+        if (!strncasecmp(line, "Content-Length:", 15)) {
+            const char *value = line + 15;
+            while (*value == ' ' || *value == '\t') ++value;
+            long long length = strtoll(value, NULL, 10);
+            return length < 0 ? -1 : length;
+        }
+        line = strstr(line, "\r\n");
+    }
+    return -1;
+}
+
+static void conn_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
+    ConnState *conn = (ConnState *)stream->data;
+    if (nread <= 0) {
+        free(buf->base);
+        uv_read_stop(stream);
+        uv_close((uv_handle_t *)&conn->handle, conn_close_cb);
+        return;
+    }
+    dynbuf_append(&conn->in, buf->base, (size_t)nread);
+    free(buf->base);
+    /* NUL terminated for the header parsing, which is all string work; the
+       body is bounded by the length instead. */
+    dynbuf_append(&conn->in, "", 1);
+    conn->in.length--;
+    conn->in.data[conn->in.length] = 0;
+
+    if (conn->in.length > SXN_MAX_REQUEST_BYTES) {
+        uv_read_stop(stream);
+        conn_deliver(conn->serve->ctx, conn, JS_EXCEPTION, NULL, NULL);
+        return;
+    }
+    /* Wait for the whole head, then for the whole body it announces. Without
+       this a request larger than one read -- anything past about 64KB -- was
+       handed to the handler truncated. */
+    char *head_end = strstr(conn->in.data, "\r\n\r\n");
+    if (!head_end) return;
+    long long content_length = request_content_length(conn->in.data, head_end);
+    size_t head_bytes = (size_t)(head_end + 4 - conn->in.data);
+    if (content_length > 0 && conn->in.length - head_bytes < (size_t)content_length) return;
+
+    uv_read_stop(stream);
+    conn_dispatch_request(conn, conn->in.data, conn->in.length);
 }
 
 static void on_connection_cb(uv_stream_t *server_handle, int status) {
@@ -597,7 +658,9 @@ static JSValue js_serve(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     uv_tcp_init(sxn_loop(), server); server->data = serve;
     struct sockaddr_in address; uv_ip4_addr("127.0.0.1", port, &address);
     int rc = uv_tcp_bind(server, (const struct sockaddr *)&address, 0);
-    if (rc == 0) rc = uv_listen((uv_stream_t *)server, 64, on_connection_cb);
+    /* 511, the same backlog Node uses: at 64 a burst of concurrent clients got
+       connection-refused rather than queued. */
+    if (rc == 0) rc = uv_listen((uv_stream_t *)server, 511, on_connection_cb);
     if (rc != 0) {
         free(server); JS_FreeValue(ctx, serve->handler); free(serve);
         return JS_ThrowInternalError(ctx, "listen on %d: %s", port, uv_strerror(rc));
@@ -700,7 +763,7 @@ typedef struct FetchState {
     JSContext *ctx;
     CURL *easy;
     struct curl_slist *req_headers;
-    char *request_body;
+    char *request_body; size_t request_body_len;
     char *url;
 
     long status;
@@ -1270,10 +1333,14 @@ static JSValue js_sxn_fetch_raw(JSContext *ctx, JSValueConst this_val, int argc,
         }
     }
 
-    char *request_body = NULL;
+    char *request_body = NULL; size_t request_body_len = 0;
     if (argc > 3 && !JS_IsUndefined(argv[3]) && !JS_IsNull(argv[3])) {
-        const char *b = JS_ToCString(ctx, argv[3]);
-        if (b) request_body = strdup(b);
+        /* Counted, not NUL terminated: a request body may contain a 0x00
+           byte, and strlen would send everything before it and drop the
+           rest. */
+        size_t len = 0;
+        const char *b = JS_ToCStringLen(ctx, &len, argv[3]);
+        if (b) { request_body = malloc(len + 1); memcpy(request_body, b, len); request_body[len] = 0; request_body_len = len; }
         JS_FreeCString(ctx, b);
     }
 
@@ -1288,7 +1355,7 @@ static JSValue js_sxn_fetch_raw(JSContext *ctx, JSValueConst this_val, int argc,
     fs->ctx = ctx; fs->easy = easy; fs->refcount = 1;
     fs->url = strdup(url);
     fs->req_headers = headers;
-    fs->request_body = request_body;
+    fs->request_body = request_body; fs->request_body_len = request_body_len;
     fs->header_pairs = JS_UNDEFINED;
     fs->pending_read_resolve = JS_UNDEFINED; fs->pending_read_reject = JS_UNDEFINED;
 
@@ -1308,7 +1375,7 @@ static JSValue js_sxn_fetch_raw(JSContext *ctx, JSValueConst this_val, int argc,
            left curl expecting an upload it had no read callback for, so it
            connected and then sent nothing at all -- every POST, PUT and PATCH
            hung until it timed out. */
-        curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, (long)strlen(request_body));
+        curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, (long)request_body_len);
         curl_easy_setopt(easy, CURLOPT_COPYPOSTFIELDS, request_body);
     }
     JS_FreeCString(ctx, url); JS_FreeCString(ctx, method);
