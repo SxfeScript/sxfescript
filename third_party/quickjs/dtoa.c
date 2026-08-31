@@ -200,7 +200,7 @@ static no_inline limb_t mp_div1norm(limb_t *tabr, const limb_t *taba, limb_t n,
 static __maybe_unused void mpb_dump(const char *str, const mpb_t *a)
 {
     int i;
-    
+
     printf("%s= 0x", str);
     for(i = a->len - 1; i >= 0; i--) {
         printf("%08x", a->tab[i]);
@@ -299,7 +299,7 @@ enum {
 static int mpb_get_bit(const mpb_t *r, int k)
 {
     int l;
-    
+
     l = (unsigned)k / LIMB_BITS;
     k = k & (LIMB_BITS - 1);
     if (l >= r->len)
@@ -511,7 +511,7 @@ static void build_mul_log2_radix_table(void)
 static void mul_log2_radix_test(void)
 {
     int radix, i, ref, r;
-    
+
     for(radix = 2; radix <= 36; radix++) {
         for(i = -2048; i <= 2047; i++) {
             ref = (int)floor((double)i / log2(radix));
@@ -590,7 +590,7 @@ size_t u32toa(char *buf, uint32_t n)
 {
     char buf1[10], *q;
     size_t len;
-    
+
     q = buf1 + sizeof(buf1);
     do {
         *--q = n % 10 + '0';
@@ -753,7 +753,7 @@ static const int16_t min_exponent[JS_RADIX_MAX - 1] = {
 void build_tables(void)
 {
     int r, j, radix, n, col, i;
-    
+
     /* radix_base_table */
     for(radix = 2; radix <= 36; radix++) {
         r = 1;
@@ -1104,15 +1104,14 @@ static void dtoa_free(void *ptr)
 #endif
 
 /*
- * Grisu2 fast path for the overwhelmingly common Number::toString case.
+ * Grisu3 fast path for the overwhelmingly common Number::toString case.
  *
  * This is deliberately kept as a leaf which only returns a decimal mantissa
  * and exponent.  js_dtoa's existing output code still decides between fixed
  * and exponential notation, and the exact bignum implementation below remains
- * the fallback for every other radix/format.  Grisu2 emits digits only after
- * the interval between the adjacent doubles proves that they round back to the
- * input.  The algorithm is from Florian Loitsch, "Printing Floating-Point
- * Numbers Quickly and Accurately with Integers" (PLDI 2010).
+ * the fallback for every other radix/format and whenever the fast path cannot
+ * prove its candidate.  The algorithm is from Florian Loitsch, "Printing
+ * Floating-Point Numbers Quickly and Accurately with Integers" (PLDI 2010).
  */
 typedef struct {
     uint64_t f;
@@ -1121,6 +1120,18 @@ typedef struct {
 
 static DtoaDiyFp dtoa_diy_mul(DtoaDiyFp a, DtoaDiyFp b)
 {
+#if defined(__SIZEOF_INT128__)
+    __extension__ typedef unsigned __int128 dtoa_uint128_t;
+    dtoa_uint128_t p = (dtoa_uint128_t)a.f * b.f;
+    uint64_t high = p >> 64;
+    DtoaDiyFp r;
+
+    if ((uint64_t)p & (UINT64_C(1) << 63))
+        high++;
+    r.f = high;
+    r.e = a.e + b.e + 64;
+    return r;
+#else
     uint64_t a_hi = a.f >> 32, a_lo = (uint32_t)a.f;
     uint64_t b_hi = b.f >> 32, b_lo = (uint32_t)b.f;
     uint64_t ac = a_hi * b_hi;
@@ -1135,6 +1146,7 @@ static DtoaDiyFp dtoa_diy_mul(DtoaDiyFp a, DtoaDiyFp b)
     r.f = ac + (ad >> 32) + (bc >> 32) + (t >> 32);
     r.e = a.e + b.e + 64;
     return r;
+#endif
 }
 
 static DtoaDiyFp dtoa_diy_normalize(DtoaDiyFp v)
@@ -1264,20 +1276,31 @@ static int dtoa_decimal_digits32(uint32_t n)
     return 9;
 }
 
-static void dtoa_grisu_round(char *digits, int len, uint64_t delta,
-                             uint64_t rest, uint64_t ten_kappa,
-                             uint64_t upper_distance)
+static bool dtoa_grisu_round(char *digits, int len,
+                             uint64_t upper_distance,
+                             uint64_t unsafe_interval, uint64_t rest,
+                             uint64_t ten_kappa, uint64_t unit)
 {
-    while (rest < upper_distance && delta - rest >= ten_kappa &&
-           (rest + ten_kappa < upper_distance ||
-            upper_distance - rest > rest + ten_kappa - upper_distance)) {
+    uint64_t small_distance = upper_distance - unit;
+    uint64_t big_distance = upper_distance + unit;
+
+    while (rest < small_distance &&
+           unsafe_interval - rest >= ten_kappa &&
+           (rest + ten_kappa < small_distance ||
+            small_distance - rest >= rest + ten_kappa - small_distance)) {
         digits[len - 1]--;
         rest += ten_kappa;
     }
+    /* If two digits are still plausible, the bignum fallback must decide. */
+    if (rest < big_distance && unsafe_interval - rest >= ten_kappa &&
+        (rest + ten_kappa < big_distance ||
+         big_distance - rest > rest + ten_kappa - big_distance))
+        return false;
+    return 2 * unit <= rest && rest <= unsafe_interval - 4 * unit;
 }
 
-static void dtoa_grisu_digits(DtoaDiyFp w, DtoaDiyFp upper,
-                              uint64_t delta, char *digits,
+static bool dtoa_grisu_digits(DtoaDiyFp w, DtoaDiyFp lower,
+                              DtoaDiyFp upper, char *digits,
                               int *plen, int *pdec_exp)
 {
     static const uint64_t pow10[] = {
@@ -1290,12 +1313,22 @@ static void dtoa_grisu_digits(DtoaDiyFp w, DtoaDiyFp upper,
         UINT64_C(10000000000000000), UINT64_C(100000000000000000),
         UINT64_C(1000000000000000000), UINT64_C(10000000000000000000)
     };
-    uint64_t one = (uint64_t)1 << -upper.e;
-    uint64_t upper_distance = upper.f - w.f;
-    uint32_t p1 = upper.f >> -upper.e;
-    uint64_t p2 = upper.f & (one - 1);
-    int kappa = dtoa_decimal_digits32(p1);
+    uint64_t unit = 1;
+    uint64_t one, upper_distance, unsafe_interval, p2;
+    uint32_t p1;
+    int kappa;
     int len = 0;
+
+    /* Cached-power multiplication is rounded by at most one unit.  Widen the
+       interval by that error; round-weed accepts only unambiguous results. */
+    lower.f -= unit;
+    upper.f += unit;
+    one = (uint64_t)1 << -upper.e;
+    upper_distance = upper.f - w.f;
+    unsafe_interval = upper.f - lower.f;
+    p1 = upper.f >> -upper.e;
+    p2 = upper.f & (one - 1);
+    kappa = dtoa_decimal_digits32(p1);
 
     while (kappa > 0) {
         uint32_t divisor = (uint32_t)pow10[kappa - 1];
@@ -1306,36 +1339,34 @@ static void dtoa_grisu_digits(DtoaDiyFp w, DtoaDiyFp upper,
             digits[len++] = '0' + digit;
         kappa--;
         rest = ((uint64_t)p1 << -upper.e) + p2;
-        if (rest <= delta) {
+        if (rest < unsafe_interval) {
             *pdec_exp += kappa;
-            dtoa_grisu_round(digits, len, delta, rest,
-                             pow10[kappa] << -upper.e, upper_distance);
             *plen = len;
-            return;
+            return dtoa_grisu_round(digits, len, upper_distance,
+                                    unsafe_interval, rest,
+                                    pow10[kappa] << -upper.e, unit);
         }
     }
     for (;;) {
         uint32_t digit;
-        int index;
         p2 *= 10;
-        delta *= 10;
+        unit *= 10;
+        unsafe_interval *= 10;
         digit = p2 >> -upper.e;
         if (digit || len)
             digits[len++] = '0' + digit;
         p2 &= one - 1;
         kappa--;
-        if (p2 < delta) {
+        if (p2 < unsafe_interval) {
             *pdec_exp += kappa;
-            index = -kappa;
-            dtoa_grisu_round(digits, len, delta, p2, one,
-                             upper_distance * (index < 20 ? pow10[index] : 0));
             *plen = len;
-            return;
+            return dtoa_grisu_round(digits, len, upper_distance * unit,
+                                    unsafe_interval, p2, one, unit);
         }
     }
 }
 
-static bool dtoa_grisu2(uint64_t bits, uint64_t *pmant, int *pdigits,
+static bool dtoa_grisu3(uint64_t bits, uint64_t *pmant, int *pdigits,
                         int *pdec_exp)
 {
     uint64_t frac = bits & (UINT64_C(1) << 52) - 1;
@@ -1370,13 +1401,9 @@ static bool dtoa_grisu2(uint64_t bits, uint64_t *pmant, int *pdigits,
     w = dtoa_diy_mul(dtoa_diy_normalize(v), c);
     lower_scaled = dtoa_diy_mul(lower, c);
     upper_scaled = dtoa_diy_mul(upper, c);
-    /* Stay strictly inside the rounding interval: cached-power
-       multiplication itself is rounded by at most one unit here. */
-    lower_scaled.f++;
-    upper_scaled.f--;
-    dtoa_grisu_digits(w, upper_scaled,
-                      upper_scaled.f - lower_scaled.f,
-                      digits, &len, pdec_exp);
+    if (!dtoa_grisu_digits(w, lower_scaled, upper_scaled,
+                           digits, &len, pdec_exp))
+        return false;
     if (len <= 0 || len > 17)
         return false;
     for (i = 0; i < len; i++)
@@ -1464,17 +1491,17 @@ int js_dtoa(char *buf, double d, int radix, int n_digits, int flags,
     if (radix == 10 && fmt == JS_DTOA_FORMAT_FREE &&
         (flags & JS_DTOA_EXP_MASK) == JS_DTOA_EXP_AUTO) {
         int dec_exp;
-        if (dtoa_grisu2(a & ~(UINT64_C(1) << 63), &m, &P, &dec_exp)) {
+        if (dtoa_grisu3(a & ~(UINT64_C(1) << 63), &m, &P, &dec_exp)) {
             E = P + dec_exp;
             mpb_set_u64(tmp1, m);
             goto output;
         }
     }
-    
+
     /* this choice of E implies F=round(x*B^(P-E) is such as: 
        B^(P-1) <= F < 2.B^P. */
     E = 1 + mul_log2_radix(e - 1, radix);
-    
+
     if (fmt == JS_DTOA_FORMAT_FREE) {
         int P_max, E0, e1, E_found, P_found;
         uint64_t m1, mant_found, mant, mant_max1;
@@ -1675,7 +1702,7 @@ double js_atod(const char *str, const char **pnext, int radix, int flags,
     } else {
         p_start = p;
     }
-    
+
     if (p[0] == '0') {
         if ((p[1] == 'x' || p[1] == 'X') &&
             (radix == 0 || radix == 16)) {
@@ -1751,7 +1778,7 @@ double js_atod(const char *str, const char **pnext, int radix, int flags,
         p++;
         pos++;
     }
-    
+
     sig_pos = pos;
     for(;;) {
         limb_t c;
@@ -1797,13 +1824,13 @@ double js_atod(const char *str, const char **pnext, int radix, int flags,
             dot_pos = pos;
         expn_offset = sig_pos + digit_count - dot_pos;
     }
-    
+
     /* Use the extra digits for rounding if the base is a power of
        two. Otherwise they are just truncated. */
     if (radix_bits != 0 && extra_digits != 0) {
         tmp0->tab[0] |= 1;
     }
-    
+
     /* parse the exponent, if any */
     expn = 0;
     expn_overflow = false;
