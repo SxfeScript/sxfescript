@@ -180,16 +180,15 @@
         return Object.setPrototypeOf(bufferBytesFromString(data, enc), Buffer.prototype);
       }
       if (data instanceof ArrayBuffer) return new Buffer(data); // a view, which is what Node gives for an ArrayBuffer
-      if (ArrayBuffer.isView(data)) {
-        // Node copies here, and code relies on it: `const copy =
-        // Buffer.from(original)` then writing to the copy must not reach the
-        // original. This handed back a view over the same bytes.
-        var bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-        var copy = new Buffer(data.byteLength);
-        copy.set(bytes);
-        return copy;
-      }
-      if (Array.isArray(data) || (data && typeof data.length === "number")) return new Buffer(data); // copies, matching Node
+      // Native (js_buffer_from_bytes in src/node.c): copying a view went
+      // through the Uint8Array subclass constructor, 0.285us against
+      // 0.210us for the copy made in C. Node copies here, and code relies
+      // on it -- writing to the copy must not reach the original.
+      if (ArrayBuffer.isView(data)) return __sxnBufferFromBytes(data);
+      // An array stays with the constructor: reading its elements one at a
+      // time from C measured 1.185us against the engine's own 0.375us for
+      // the same array, which it fills without leaving the interpreter.
+      if (Array.isArray(data) || (data && typeof data.length === "number")) return new Buffer(data);
       throw new TypeError("Buffer.from: unsupported argument");
     }
     // Node serializes a Buffer as { type: "Buffer", data: [...] }, and code

@@ -3850,6 +3850,50 @@ static JSValue js_stream_pipe(JSContext *ctx, JSValueConst this_val, int argc, J
     return JS_DupValue(ctx, dest);
 }
 
+
+/* Buffer.from of a view. Going through `new Buffer(...)` meant running a
+   Uint8Array subclass constructor per call; the copy is made here and given
+   Buffer's prototype -- a fresh object of ours, so nothing the caller holds
+   is changed. The array-like path below is kept for a Float64Array and
+   friends, whose elements Node truncates to bytes one by one, but a plain
+   Array is left to the constructor: reading its elements from C measured
+   three times slower than the engine filling the array itself. */
+static JSValue js_buffer_from_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "Buffer.from: unsupported argument");
+    size_t len = 0;
+    uint8_t *bytes = JS_GetUint8Array(ctx, &len, argv[0]);
+    JSValue out;
+    if (bytes) {
+        out = JS_NewUint8ArrayCopy(ctx, bytes, len);
+    } else {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        int64_t count = 0;
+        if (JS_GetLength(ctx, argv[0], &count)) return JS_EXCEPTION;
+        uint8_t *raw = js_malloc(ctx, count ? (size_t)count : 1);
+        if (!raw) return JS_EXCEPTION;
+        for (int64_t i = 0; i < count; i++) {
+            JSValue item = JS_GetPropertyUint32(ctx, argv[0], (uint32_t)i);
+            int32_t value = 0;
+            /* Node truncates to a byte, and anything not a number is zero. */
+            if (JS_ToInt32(ctx, &value, item)) { JS_FreeValue(ctx, JS_GetException(ctx)); value = 0; }
+            JS_FreeValue(ctx, item);
+            raw[i] = (uint8_t)value;
+        }
+        out = JS_NewUint8ArrayCopy(ctx, raw, (size_t)count);
+        js_free(ctx, raw);
+    }
+    if (JS_IsException(out)) return out;
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue buffer_class = JS_GetPropertyStr(ctx, global, "Buffer");
+    JSValue proto = JS_GetPropertyStr(ctx, buffer_class, "prototype");
+    JS_FreeValue(ctx, buffer_class);
+    JS_FreeValue(ctx, global);
+    JS_SetPrototype(ctx, out, proto);
+    JS_FreeValue(ctx, proto);
+    return out;
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -4331,6 +4375,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnBufferFromBytes", JS_NewCFunction(ctx, js_buffer_from_bytes, "__sxnBufferFromBytes", 1));
     JS_SetPropertyStr(ctx, global, "__sxnPipe", JS_NewCFunction(ctx, js_stream_pipe, "pipe", 2));
     JS_SetPropertyStr(ctx, global, "__sxnPromisify", JS_NewCFunction(ctx, js_promisify, "promisify", 1));
     JS_SetPropertyStr(ctx, global, "__sxnInspect", JS_NewCFunction(ctx, js_inspect, "inspect", 2));

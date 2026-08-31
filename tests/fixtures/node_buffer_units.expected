@@ -87,6 +87,12 @@ dec ascii 010203 "\u0001\u0002\u0003"
 dec binary 010203 "\u0001\u0002\u0003"
 dec utf16le 010203 "ȁ"
 dec ucs2 010203 "ȁ"
+from view copies 1 090203 true
+from a slice of a view 0203
+from a float array 0102
+from an empty view 0
+from an array 412cff02
+from an array-like 010203
 concat abcdefghij
 concat short abcd
 concat long 20 6162636465666768696a00000000000000000000

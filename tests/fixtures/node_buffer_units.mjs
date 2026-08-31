@@ -14,6 +14,21 @@ for (const hex of ["", "00", "41c1", "00d8", "ffff41", "e9", "010203"])
   for (const enc of ["latin1", "ascii", "binary", "utf16le", "ucs2"])
     log("dec", enc, hex, JSON.stringify(Buffer.from(hex, "hex").toString(enc)));
 
+// Buffer.from of a view copies, and the copy must not share bytes with the
+// original. A Float64Array is not raw bytes to Node: it truncates each
+// element to a byte.
+{
+  const src = new Uint8Array([1, 2, 3]);
+  const copy = Buffer.from(src);
+  copy[0] = 9;
+  log("from view copies", src[0], copy.toString("hex"), Buffer.isBuffer(copy));
+  log("from a slice of a view", Buffer.from(new Uint8Array([1, 2, 3, 4]).subarray(1, 3)).toString("hex"));
+  log("from a float array", Buffer.from(new Float64Array([1, 2])).toString("hex"));
+  log("from an empty view", Buffer.from(new Uint8Array()).length);
+  log("from an array", Buffer.from([65, 300, -1, 2.7]).toString("hex"));
+  log("from an array-like", Buffer.from({ length: 3, 0: 1, 1: 2, 2: 3 }).toString("hex"));
+}
+
 // Buffer.concat, which is native now: with and without a length, a length
 // that cuts the parts short, one that runs past them and leaves zeroes, and
 // an empty list.

@@ -265,6 +265,13 @@ value resolves with the first, not with an array of them, and a function that
 throws synchronously produces a rejection rather than throwing out of the
 call.
 
+`Buffer.from` split in two on the evidence. Copying a view is C now, 0.285
+microseconds to 0.210, because it was running the `Uint8Array` subclass
+constructor per call. Copying a plain array is not: reading its elements one
+at a time from C measured 1.185 microseconds against the engine's own 0.375,
+which fills the array without leaving the interpreter. The same function, two
+opposite answers, and only the measurement separates them.
+
 `pipe` moved for completeness rather than for speed: its four closures, one
 per event, are four C functions sharing the source and the destination, and
 that is worth 1.95 microseconds to 1.83. It was already five times quicker
@@ -313,6 +320,8 @@ does not have to re-derive it:
 | `util.inspect` of an object | 2.26 us | C, was 5.26; Node is 1.56 |
 | a promisified call | 0.29 us | C, was 0.62; Node is 0.08 |
 | `readable.pipe` | 1.83 us | C, was 1.95; Node is 7.21 |
+| `Buffer.from` a view | 0.21 us | C, was 0.285; Node is 0.035 |
+| `Buffer.from` an array | 0.37 us | JS: from C it measured 1.185 |
 | `process.nextTick` | 0.143 us | C, was 0.620 |
 | `res.getHeaders` | 0.110 us | C, was 0.173 |
 | `res.getHeaderNames` | 0.110 us | C, was 0.157 |
@@ -340,7 +349,7 @@ alone.
 | Section | Lines | What is native | What the JavaScript still does |
 | --- | --- | --- | --- |
 | `events` | 74 | `on`, `off`, `emit`, `once`, `listeners`, `listenerCount`, `removeAllListeners` | the class shape, and the two async helpers `once(emitter)` and `on(emitter)`, which are promise plumbing |
-| `buffer` | 146 | every encoding both ways, the lenient readers, `concat`, `compare`, the numeric accessors | `Buffer.from`'s dispatch on argument type, and `toString`'s on encoding name |
+| `buffer` | 146 | every encoding both ways, the lenient readers, `concat`, `compare`, copying a view, the numeric accessors | `Buffer.from`'s dispatch on argument type, and `toString`'s on encoding name |
 | `path` | 56 | all of it, both posix and win32 | the two tables and the platform choice between them |
 | `process` | 108 | `env`, `cwd`, `chdir`, `nextTick`, `exit`, `pid`, `platform`, `arch`, signal watching | `argv`, the stdio objects, `emitWarning`, `uptime` |
 | `fs` | 89 | reads, writes, `stat`, `exists` | the encoding branch, `Stats`' predicates, `createReadStream`'s wrapper |
