@@ -90,6 +90,24 @@ if ! (cd "$DIR/elsewhere" && "$SXN" priv.sxbc >/dev/null 2>&1); then
   if [ "$code" -gt 1 ]; then bad=1; echo "FAIL moved stripped .sxbc did not run (exit $code)"; fi
 fi
 
+# ---- a program of more than one file --------------------------------
+# Imports are resolved while a module is compiled, so `sxn compile` needs the
+# same module loader running a file does. It had none, and failed on any file
+# that imported a sibling -- which is every file in a real program.
+cat > "$DIR/lib.sx" <<'LIB'
+export const greet = (who: string): string => `hello ${who}`;
+LIB
+cat > "$DIR/entry.sx" <<'ENTRY'
+import { greet } from "./lib.sx";
+console.log(greet("bytecode"));
+ENTRY
+if ! "$SXN" compile "$DIR/entry.sx" -o "$DIR/entry.sxbc" >/dev/null 2>&1; then
+  bad=1; echo "FAIL compiling a file with an import failed"
+else
+  out=$("$SXN" "$DIR/entry.sxbc" 2>&1 || true)
+  [ "$out" = "hello bytecode" ] || { bad=1; echo "FAIL bytecode with an import printed '$out'"; }
+fi
+
 # ---- a corrupt/foreign .sxbc is a clean error, not a crash ------------
 echo "not bytecode" > "$DIR/bad.sxbc"
 set +e

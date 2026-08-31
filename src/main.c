@@ -1049,6 +1049,12 @@ static int sxn_compile_command(int argc, char **argv) {
     js_std_init_handlers(runtime);
     JSContext *context = JS_NewContext(runtime);
     if (!context) { JS_FreeRuntime(runtime); return 2; }
+    /* A module's imports are resolved while it is compiled, so compiling
+       needs the same loader running a file does. Without it, `sxn compile`
+       failed on any file with a relative import -- which is every file in a
+       program of more than one. */
+    JS_SetModuleLoaderFunc2(runtime, sxn_module_normalize, sxn_module_loader,
+                            js_module_check_attributes, NULL);
     int rc = sxn_compile_file(context, in, out, strip);
     js_std_free_handlers(runtime);
     JS_FreeContext(context);
