@@ -229,6 +229,17 @@ version of it, a shared no-op for writes with no callback, was faster at
 has to reach the stream's 'error' listeners whether anyone passed a callback
 or not.
 
+`StringDecoder` is native for utf-8 now -- it walks back at most three bytes
+for a sequence that has not all arrived and keeps it for the next chunk,
+where it used to run a `TextDecoder` with `{ stream: true }` per chunk: 0.330
+microseconds to 0.120. The other encodings keep the `TextDecoder`. Node's own
+answer for a stranded byte is one replacement character for the character
+that never arrived, not one per byte, which its own output settled.
+
+`node:util`'s `promisify`, `callbackify` and `inherits` were measured and
+left alone: at 0.27, 0.14 and 0.55 microseconds they are already faster here
+than in Node, which spends 1.37, 1.18 and 0.82 on the same three.
+
 The second sweep, over `node:util`, `node:string_decoder` and `process`,
 found something worse than any of the migrations: `process.cwd()` cost 7
 microseconds against Node's 0.01. It was calling `getcwd()` every time, and
@@ -258,6 +269,7 @@ does not have to re-derive it:
 | `PassThrough#write` | 0.600 us | two emitter hops, both already C |
 | `url.fileURLToPath` | 0.130 us | C, was 0.475 |
 | `module.isBuiltin` | 0.045 us | C, was 0.415 |
+| `StringDecoder#write` | 0.120 us | C, was 0.330 |
 | `new URL` | 0.885 us | the engine's own |
 | `url.pathToFileURL` | 0.92 us | C text, was 1.30; `new URL` is 0.885 of what is left |
 | `createRequire` | 1.00 us | already C |

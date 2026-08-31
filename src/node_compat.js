@@ -1267,15 +1267,24 @@
   // across a chunk boundary -- which is the entire reason it exists.
   function StringDecoder(encoding) {
     this.encoding = (encoding || "utf8").toLowerCase();
-    this._dec = new TextDecoder(this.encoding === "utf8" ? "utf-8" : this.encoding);
+    this._tail = null;
+    // utf-8 is native (js_decode_chunk in src/node.c); the other encodings
+    // keep the TextDecoder, which is where they came from.
+    this._dec = (this.encoding === "utf8" || this.encoding === "utf-8")
+      ? null : new TextDecoder(this.encoding);
   }
   StringDecoder.prototype.write = function (buf) {
     if (typeof buf === "string") return buf;
-    return this._dec.decode(buf, { stream: true });
+    if (this._dec) return this._dec.decode(buf, { stream: true });
+    return __sxnDecodeChunk(this, buf);
   };
   StringDecoder.prototype.end = function (buf) {
     let out = buf ? this.write(buf) : "";
-    out += this._dec.decode();
+    if (this._dec) return out + this._dec.decode();
+    // Anything still held back was never going to complete. It is the start
+    // of one character, however many bytes of it arrived, so Node emits one
+    // replacement character for it.
+    if (this._tail) { out += "\ufffd"; this._tail = null; }
     return out;
   };
   globalThis.__sxnStringDecoder = { StringDecoder };

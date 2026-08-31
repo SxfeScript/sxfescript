@@ -3233,6 +3233,56 @@ static JSValue js_path_to_file_url(JSContext *ctx, JSValueConst this_val, int ar
     return text;
 }
 
+
+/* StringDecoder for utf-8: hand back everything up to the last complete
+   character and keep the incomplete tail for the next chunk. This went
+   through a TextDecoder with { stream: true }, which is the same idea at
+   four times the cost. The tail is at most three bytes, so it lives on the
+   decoder as a small array. */
+static JSValue js_decode_chunk(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 2) return JS_ThrowTypeError(ctx, "decodeChunk expects a decoder and bytes");
+    size_t len = 0;
+    uint8_t *bytes = JS_GetUint8Array(ctx, &len, argv[1]);
+    if (!bytes) return JS_EXCEPTION;
+    /* Whatever was left over last time comes first. */
+    uint8_t tail[3];
+    size_t tail_len = 0;
+    JSValue held = JS_GetPropertyStr(ctx, argv[0], "_tail");
+    if (JS_IsObject(held)) {
+        size_t held_len = 0;
+        uint8_t *held_bytes = JS_GetUint8Array(ctx, &held_len, held);
+        if (held_bytes && held_len <= sizeof tail) { memcpy(tail, held_bytes, held_len); tail_len = held_len; }
+        else JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    JS_FreeValue(ctx, held);
+
+    size_t total = tail_len + len;
+    uint8_t *all = js_malloc(ctx, total ? total : 1);
+    if (!all) return JS_EXCEPTION;
+    if (tail_len) memcpy(all, tail, tail_len);
+    if (len) memcpy(all + tail_len, bytes, len);
+
+    /* Walk back over at most three bytes looking for the start of a
+       sequence that has not all arrived yet. */
+    size_t complete = total;
+    for (size_t back = 1; back <= 3 && back <= total; back++) {
+        uint8_t c = all[total - back];
+        if ((c & 0xc0) == 0x80) continue;            /* a continuation byte */
+        size_t needed = (c & 0x80) == 0 ? 1 : (c & 0xe0) == 0xc0 ? 2 : (c & 0xf0) == 0xe0 ? 3 : (c & 0xf8) == 0xf0 ? 4 : 1;
+        if (needed > back) complete = total - back;  /* short: hold it back */
+        break;
+    }
+    JSValue text = JS_NewStringLen(ctx, (const char *)all, complete);
+    if (complete < total) {
+        JS_SetPropertyStr(ctx, argv[0], "_tail", JS_NewUint8ArrayCopy(ctx, all + complete, total - complete));
+    } else {
+        JS_SetPropertyStr(ctx, argv[0], "_tail", JS_NULL);
+    }
+    js_free(ctx, all);
+    return text;
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -3714,6 +3764,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnDecodeChunk", JS_NewCFunction(ctx, js_decode_chunk, "__sxnDecodeChunk", 2));
     JS_SetPropertyStr(ctx, global, "__sxnPathToFileUrl", JS_NewCFunction(ctx, js_path_to_file_url, "pathToFileURL", 1));
     JS_SetPropertyStr(ctx, global, "__sxnFileUrlToPath", JS_NewCFunction(ctx, js_file_url_to_path, "fileURLToPath", 1));
     JS_SetPropertyStr(ctx, global, "__sxnWriteCallback", JS_NewCFunction(ctx, js_write_callback, "__sxnWriteCallback", 2));
