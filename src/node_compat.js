@@ -238,8 +238,16 @@
         if (enc === "utf-8" || enc === "utf8") return new Buffer(__sxnUtf8EncodeArrayBuffer(data));
         return Object.setPrototypeOf(bufferBytesFromString(data, enc), Buffer.prototype);
       }
-      if (data instanceof ArrayBuffer) return new Buffer(data); // zero-copy view over the whole buffer
-      if (ArrayBuffer.isView(data)) return new Buffer(data.buffer, data.byteOffset, data.byteLength); // zero-copy view
+      if (data instanceof ArrayBuffer) return new Buffer(data); // a view, which is what Node gives for an ArrayBuffer
+      if (ArrayBuffer.isView(data)) {
+        // Node copies here, and code relies on it: `const copy =
+        // Buffer.from(original)` then writing to the copy must not reach the
+        // original. This handed back a view over the same bytes.
+        var bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        var copy = new Buffer(data.byteLength);
+        copy.set(bytes);
+        return copy;
+      }
       if (Array.isArray(data) || (data && typeof data.length === "number")) return new Buffer(data); // copies, matching Node
       throw new TypeError("Buffer.from: unsupported argument");
     }

@@ -2278,6 +2278,101 @@ static JSValue js_buffer_copy(JSContext *ctx, JSValueConst this_val, int argc, J
     return JS_NewInt64(ctx, n);
 }
 
+
+/* The variable-width accessors: readUIntBE(offset, byteLength) and its
+   siblings take the width as an argument, 1 to 6 bytes, which is why they
+   cannot share the fixed-width table above. */
+static JSValue js_buffer_read_var(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic) {
+    size_t len = 0;
+    uint8_t *bytes = JS_GetUint8Array(ctx, &len, this_val);
+    if (!bytes) return JS_ThrowTypeError(ctx, "not a Buffer");
+    int64_t offset = 0, width = 0;
+    if (argc > 0 && JS_ToInt64(ctx, &offset, argv[0])) return JS_EXCEPTION;
+    if (argc > 1 && JS_ToInt64(ctx, &width, argv[1])) return JS_EXCEPTION;
+    if (width < 1 || width > 6) return JS_ThrowRangeError(ctx, "byteLength must be between 1 and 6");
+    if (!sxn_num_range(ctx, len, offset, (int)width)) return JS_EXCEPTION;
+    uint64_t raw = sxn_read_raw(bytes + offset, (int)width, (magic & SXN_NUM_BIG_END) != 0);
+    if (magic & SXN_NUM_SIGNED) {
+        int shift = 64 - (int)width * 8;
+        return JS_NewInt64(ctx, ((int64_t)(raw << shift)) >> shift);
+    }
+    return JS_NewInt64(ctx, (int64_t)raw);
+}
+
+static JSValue js_buffer_write_var(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic) {
+    size_t len = 0;
+    uint8_t *bytes = JS_GetUint8Array(ctx, &len, this_val);
+    if (!bytes) return JS_ThrowTypeError(ctx, "not a Buffer");
+    double value = 0;
+    int64_t offset = 0, width = 0;
+    if (argc > 0 && JS_ToFloat64(ctx, &value, argv[0])) return JS_EXCEPTION;
+    if (argc > 1 && JS_ToInt64(ctx, &offset, argv[1])) return JS_EXCEPTION;
+    if (argc > 2 && JS_ToInt64(ctx, &width, argv[2])) return JS_EXCEPTION;
+    if (width < 1 || width > 6) return JS_ThrowRangeError(ctx, "byteLength must be between 1 and 6");
+    if (!sxn_num_range(ctx, len, offset, (int)width)) return JS_EXCEPTION;
+    sxn_write_raw(bytes + offset, (uint64_t)(int64_t)value, (int)width, (magic & SXN_NUM_BIG_END) != 0);
+    return JS_NewInt64(ctx, offset + width);
+}
+
+/* swap16/swap32/swap64: reverse each group of bytes in place. */
+static JSValue js_buffer_swap(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic) {
+    (void)argc; (void)argv;
+    size_t len = 0;
+    uint8_t *bytes = JS_GetUint8Array(ctx, &len, this_val);
+    if (!bytes) return JS_ThrowTypeError(ctx, "not a Buffer");
+    size_t width = (size_t)magic;
+    if (len % width) return JS_ThrowRangeError(ctx, "buffer size must be a multiple of %d", (int)width);
+    for (size_t i = 0; i + width <= len; i += width)
+        for (size_t a = 0, b = width - 1; a < b; a++, b--) {
+            uint8_t t = bytes[i + a];
+            bytes[i + a] = bytes[i + b];
+            bytes[i + b] = t;
+        }
+    return JS_DupValue(ctx, this_val);
+}
+
+
+/* Buffer#write(string, offset, length, encoding): UTF-8 into the bytes that
+   are already there, which is the shape a protocol writer wants and which
+   this runtime did not have at all. */
+static JSValue js_buffer_write(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    size_t buf_len = 0;
+    uint8_t *bytes = JS_GetUint8Array(ctx, &buf_len, this_val);
+    if (!bytes) return JS_ThrowTypeError(ctx, "not a Buffer");
+    if (argc < 1) return JS_NewInt32(ctx, 0);
+
+    int64_t offset = 0, max = -1;
+    const char *encoding = NULL;
+    /* write(string), write(string, encoding), write(string, offset[, length][, encoding]) */
+    int at = 1;
+    if (at < argc && JS_IsString(argv[at])) {
+        encoding = JS_ToCString(ctx, argv[at]);
+        at++;
+    } else {
+        if (at < argc && !JS_IsUndefined(argv[at])) { if (JS_ToInt64(ctx, &offset, argv[at])) return JS_EXCEPTION; }
+        at++;
+        if (at < argc && !JS_IsUndefined(argv[at]) && !JS_IsString(argv[at])) { if (JS_ToInt64(ctx, &max, argv[at])) return JS_EXCEPTION; at++; }
+        if (at < argc && JS_IsString(argv[at])) { encoding = JS_ToCString(ctx, argv[at]); at++; }
+    }
+    bool utf8 = !encoding || !strcmp(encoding, "utf8") || !strcmp(encoding, "utf-8");
+    if (encoding) JS_FreeCString(ctx, encoding);
+    if (!utf8) return JS_ThrowTypeError(ctx, "Buffer#write supports utf-8 only");
+    if (offset < 0 || (uint64_t)offset > (uint64_t)buf_len)
+        return JS_ThrowRangeError(ctx, "the value of \"offset\" is out of range");
+
+    size_t text_len = 0;
+    const char *text = JS_ToCStringLen(ctx, &text_len, argv[0]);
+    if (!text) return JS_EXCEPTION;
+    size_t room = buf_len - (size_t)offset;
+    if (max >= 0 && (size_t)max < room) room = (size_t)max;
+    size_t n = text_len < room ? text_len : room;
+    /* Never leave half a character behind: back off to a boundary. */
+    while (n > 0 && n < text_len && ((unsigned char)text[n] & 0xc0) == 0x80) n--;
+    memcpy(bytes + offset, text, n);
+    JS_FreeCString(ctx, text);
+    return JS_NewInt64(ctx, (int64_t)n);
+}
+
 static const char *node_querystring_names[] = { "parse", "stringify", "escape", "unescape", "decode", "encode" };
 static const char *node_url_names[] = {
     "URL", "URLSearchParams", "fileURLToPath", "pathToFileURL", "format", "parse",
@@ -2535,6 +2630,18 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
             JS_SetPropertyStr(ctx, accessors, writes[i].name,
                               JS_NewCFunctionMagic(ctx, js_buffer_write_num, writes[i].name, 2, JS_CFUNC_generic_magic, writes[i].magic));
         JS_SetPropertyStr(ctx, accessors, "copy", JS_NewCFunction(ctx, js_buffer_copy, "copy", 4));
+        JS_SetPropertyStr(ctx, accessors, "readUIntLE", JS_NewCFunctionMagic(ctx, js_buffer_read_var, "readUIntLE", 2, JS_CFUNC_generic_magic, 0));
+        JS_SetPropertyStr(ctx, accessors, "readUIntBE", JS_NewCFunctionMagic(ctx, js_buffer_read_var, "readUIntBE", 2, JS_CFUNC_generic_magic, SXN_NUM_BIG_END));
+        JS_SetPropertyStr(ctx, accessors, "readIntLE", JS_NewCFunctionMagic(ctx, js_buffer_read_var, "readIntLE", 2, JS_CFUNC_generic_magic, SXN_NUM_SIGNED));
+        JS_SetPropertyStr(ctx, accessors, "readIntBE", JS_NewCFunctionMagic(ctx, js_buffer_read_var, "readIntBE", 2, JS_CFUNC_generic_magic, SXN_NUM_SIGNED | SXN_NUM_BIG_END));
+        JS_SetPropertyStr(ctx, accessors, "writeUIntLE", JS_NewCFunctionMagic(ctx, js_buffer_write_var, "writeUIntLE", 3, JS_CFUNC_generic_magic, 0));
+        JS_SetPropertyStr(ctx, accessors, "writeUIntBE", JS_NewCFunctionMagic(ctx, js_buffer_write_var, "writeUIntBE", 3, JS_CFUNC_generic_magic, SXN_NUM_BIG_END));
+        JS_SetPropertyStr(ctx, accessors, "writeIntLE", JS_NewCFunctionMagic(ctx, js_buffer_write_var, "writeIntLE", 3, JS_CFUNC_generic_magic, SXN_NUM_SIGNED));
+        JS_SetPropertyStr(ctx, accessors, "writeIntBE", JS_NewCFunctionMagic(ctx, js_buffer_write_var, "writeIntBE", 3, JS_CFUNC_generic_magic, SXN_NUM_SIGNED | SXN_NUM_BIG_END));
+        JS_SetPropertyStr(ctx, accessors, "write", JS_NewCFunction(ctx, js_buffer_write, "write", 4));
+        JS_SetPropertyStr(ctx, accessors, "swap16", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap16", 0, JS_CFUNC_generic_magic, 2));
+        JS_SetPropertyStr(ctx, accessors, "swap32", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap32", 0, JS_CFUNC_generic_magic, 4));
+        JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
     JS_SetPropertyStr(ctx, global, "__sxnIsIP", JS_NewCFunction(ctx, js_net_is_ip, "isIP", 1));

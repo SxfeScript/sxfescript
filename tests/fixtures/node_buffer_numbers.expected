@@ -18,3 +18,26 @@ compare -1 true false
 "a" "" 1 false 1
 "ÿ" "\u0000" 1 false 1
 sorted a,ab,b
+hex 123456563412000000000000
+uintBE 1193046 uintLE 1193046
+intBE -1000 intLE -1000 fffc1818fcff
+w1 255 ff0000000000
+w2 255 00ff00000000
+w3 255 0000ff000000
+w4 255 000000ff0000
+w5 255 00000000ff00
+w6 255 0000000000ff
+swap16 0201040306050807
+swap32 0403020108070605
+swap64 0807060504030201
+odd swap -> RangeError
+width 7 -> RangeError
+wrote 5 hello.....
+offset 2 ...hi.....
+truncated 4 hell
+length cap 3 hel.......
+multibyte 3 "hé"
+encoding arg 3 hey.....
+src after writing to the copy: 1 copy: 99
+uint8array after: 1 buffer: 42
+arraybuffer view shares: 7

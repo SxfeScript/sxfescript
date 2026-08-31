@@ -89,7 +89,11 @@ runtime fails the fixture:
 - `Buffer.byteLength`, `compare`, `equals`, `concat`, `toJSON` (Node's
   `{type:"Buffer",data:[...]}` shape).
 - The numeric accessors — `readUInt32BE`, `writeFloatLE`, `readBigInt64LE`
-  and the rest of the forty — plus `copy`, `Buffer.compare`, `isEncoding`.
+  and the rest of the forty, plus the variable-width `readUIntBE`/`writeIntLE`
+  family — `write`, `copy`, `swap16`/`swap32`/`swap64`, `Buffer.compare` and
+  `isEncoding`.
+- `Buffer.from` copies when given a Buffer or a typed array, as Node does;
+  it shares only when given an ArrayBuffer.
 
 ## Encoding-name and Buffer performance
 
