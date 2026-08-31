@@ -368,10 +368,9 @@
   // run before any subsequently-scheduled timer/I-O callback, matching Node's
   // "runs before the event loop continues" contract for the cases this runtime
   // supports.
-  process.nextTick = function (fn) {
-    var args = Array.prototype.slice.call(arguments, 1);
-    queueMicrotask(function () { fn.apply(undefined, args); });
-  };
+  // Native (js_next_tick in src/node.c): this copied `arguments` into an
+  // array and built a closure over it for every tick.
+  process.nextTick = __sxnNextTick;
 
   // process.on('SIGINT'/'SIGTERM', ...) only arms the native libuv signal
   // watcher (see __sxnWatchSignal in src/node.c) the first time a listener

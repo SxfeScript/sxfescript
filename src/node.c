@@ -3318,6 +3318,62 @@ static JSValue js_header_list(JSContext *ctx, JSValueConst this_val, int argc, J
     return out;
 }
 
+
+#define SXN_TICK_ARRAY 4   /* magic is stored unsigned, so this is not -1 */
+
+/* process.nextTick: the JavaScript version copied `arguments` into an array
+   and built a closure over it for every tick. The C one carries the
+   function and up to three arguments directly. */
+static JSValue sxn_tick_run(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic, JSValue *data) {
+    (void)this_val; (void)argc; (void)argv;
+    if (magic == SXN_TICK_ARRAY) {
+        /* More than three arguments: they were kept as an array. */
+        int64_t count = 0;
+        if (JS_GetLength(ctx, data[1], &count)) return JS_EXCEPTION;
+        JSValue *args = js_malloc(ctx, sizeof(JSValue) * (count ? (size_t)count : 1));
+        if (!args) return JS_EXCEPTION;
+        for (int64_t i = 0; i < count; i++) args[i] = JS_GetPropertyUint32(ctx, data[1], (uint32_t)i);
+        JSValue out = JS_Call(ctx, data[0], JS_UNDEFINED, (int)count, (JSValueConst *)args);
+        for (int64_t i = 0; i < count; i++) JS_FreeValue(ctx, args[i]);
+        js_free(ctx, args);
+        return out;
+    }
+    JSValueConst args[3] = { data[1], data[2], data[3] };
+    return JS_Call(ctx, data[0], JS_UNDEFINED, magic, args);
+}
+
+static JSValue js_next_tick(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1 || !JS_IsFunction(ctx, argv[0]))
+        return JS_ThrowTypeError(ctx, "nextTick expects a function");
+    int extra = argc - 1;
+    JSValue data[4] = { JS_DupValue(ctx, argv[0]), JS_UNDEFINED, JS_UNDEFINED, JS_UNDEFINED };
+    int magic = extra;
+    if (extra > 3) {
+        /* Rare enough to keep in an array rather than widening the closure. */
+        JSValue list = JS_NewArray(ctx);
+        for (int i = 0; i < extra; i++)
+            JS_SetPropertyUint32(ctx, list, (uint32_t)i, JS_DupValue(ctx, argv[i + 1]));
+        data[1] = list;
+        magic = SXN_TICK_ARRAY;
+    } else {
+        for (int i = 0; i < extra; i++) data[i + 1] = JS_DupValue(ctx, argv[i + 1]);
+    }
+    JSValue job = JS_NewCFunctionData(ctx, sxn_tick_run, 0, magic, 4, data);
+    for (int i = 0; i < 4; i++) JS_FreeValue(ctx, data[i]);
+    if (JS_IsException(job)) return job;
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue enqueue = JS_GetPropertyStr(ctx, global, "queueMicrotask");
+    JSValueConst call_args[1] = { job };
+    JSValue result = JS_Call(ctx, enqueue, global, 1, call_args);
+    JS_FreeValue(ctx, enqueue);
+    JS_FreeValue(ctx, global);
+    JS_FreeValue(ctx, job);
+    if (JS_IsException(result)) return result;
+    JS_FreeValue(ctx, result);
+    return JS_UNDEFINED;
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -3799,6 +3855,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnNextTick", JS_NewCFunction(ctx, js_next_tick, "nextTick", 1));
     JS_SetPropertyStr(ctx, global, "__sxnGetHeaders", JS_NewCFunctionMagic(ctx, js_header_list, "getHeaders", 0, JS_CFUNC_generic_magic, 0));
     JS_SetPropertyStr(ctx, global, "__sxnGetHeaderNames", JS_NewCFunctionMagic(ctx, js_header_list, "getHeaderNames", 0, JS_CFUNC_generic_magic, 1));
     JS_SetPropertyStr(ctx, global, "__sxnDecodeChunk", JS_NewCFunction(ctx, js_decode_chunk, "__sxnDecodeChunk", 2));

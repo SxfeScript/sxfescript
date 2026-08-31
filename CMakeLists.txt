@@ -366,6 +366,9 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # multi-byte character across chunks.
   add_test(NAME sxn-node-string-decoder COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_string_decoder.mjs)
   set_tests_properties(sxn-node-string-decoder PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # process.nextTick carries its arguments natively.
+  add_test(NAME sxn-node-next-tick COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_next_tick.mjs)
+  set_tests_properties(sxn-node-next-tick PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   # process.cwd() is cached; process.chdir() is what clears it.
   add_test(NAME sxn-node-process-cwd COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_process_cwd.mjs)
   set_tests_properties(sxn-node-process-cwd PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")

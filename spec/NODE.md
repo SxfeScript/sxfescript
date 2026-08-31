@@ -240,6 +240,13 @@ that never arrived, not one per byte, which its own output settled.
 left alone: at 0.27, 0.14 and 0.55 microseconds they are already faster here
 than in Node, which spends 1.37, 1.18 and 0.82 on the same three.
 
+`process.nextTick` copied `arguments` into an array and built a closure over
+it every time; it carries up to three arguments in the C closure now and
+keeps the rest in an array, 0.620 microseconds to 0.143. A magic value of -1
+for the array case is what found a sharp edge in the engine: `JS_NewCFunctionData`
+stores its magic unsigned, so -1 came back as 65535 and the call read 65535
+arguments off a four-slot array. It is 4 now.
+
 A third sweep, over what a server actually touches, found two corruptions
 rather than costs. `fs/promises.readFile` read the file as text and encoded
 it back to bytes, so every byte that is not valid UTF-8 came back as the
@@ -278,6 +285,7 @@ does not have to re-derive it:
 | `PassThrough#write` | 0.600 us | two emitter hops, both already C |
 | `url.fileURLToPath` | 0.130 us | C, was 0.475 |
 | `module.isBuiltin` | 0.045 us | C, was 0.415 |
+| `process.nextTick` | 0.143 us | C, was 0.620 |
 | `res.getHeaders` | 0.110 us | C, was 0.173 |
 | `res.getHeaderNames` | 0.110 us | C, was 0.157 |
 | `StringDecoder#write` | 0.120 us | C, was 0.330 |
