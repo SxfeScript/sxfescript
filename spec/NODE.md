@@ -193,6 +193,13 @@ a fresh `Stats` with a `for-in` loop and added four Dates. The native call
 takes `Stats.prototype` now and fills the object once -- 3.30 microseconds a
 stat became 2.75.
 
+The two lenient readers finally lost their JavaScript halves. Node's hex and
+base64 readers stop or skip rather than throwing, and they read a string a
+byte at a time, so a code unit above 0xff is truncated -- which is why an
+emoji ends a base64 string. The native readers used to hand such a string
+back and let a JavaScript loop do it; they read the code units themselves
+now, and the loops are gone.
+
 A second was tried and thrown away for a better reason than speed. A stream
 pushing a `Uint8Array` wraps it in a Buffer over the same bytes, which costs
 0.24 microseconds a chunk; giving the array Buffer's prototype in place costs

@@ -87,3 +87,14 @@ dec ascii 010203 "\u0001\u0002\u0003"
 dec binary 010203 "\u0001\u0002\u0003"
 dec utf16le 010203 "ȁ"
 dec ucs2 010203 "ȁ"
+lenient hex "4a4bÿ41" 4a4b
+lenient hex "zz" 
+lenient hex "4a🎉" 4a
+lenient hex "4A4b" 4a4b
+lenient hex "4a4" 4a
+lenient base64 "QUJDÿ" 414243
+lenient base64 "QU JD" 414243
+lenient base64 "QUJD🎉QUJD" 414243414243
+lenient base64 "QUJ=" 4142
+lenient base64url "-_8=" fbff
+lenient base64 "Q\nUJD" 414243

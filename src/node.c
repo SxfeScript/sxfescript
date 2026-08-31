@@ -2389,6 +2389,8 @@ static void sxn_free_plain_buffer(JSRuntime *rt, void *opaque, void *ptr) {
     free(ptr);
 }
 
+static uint8_t *sxn_string_code_units(JSContext *ctx, JSValueConst val, size_t *out_count, bool wide);
+
 static JSValue js_hex_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
     if (argc < 1) return JS_NULL;
@@ -2407,10 +2409,27 @@ static JSValue js_hex_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSV
         out[n++] = (uint8_t)((hi << 4) | lo);
     }
     JS_FreeCString(ctx, str);
-    if (!ascii) { free(out); return JS_NULL; }
-    /* The buffer goes to JavaScript as it stands rather than being copied
-       into a fresh one. */
-    return JS_NewUint8Array(ctx, out, n, sxn_free_plain_buffer, NULL, false);
+    if (ascii) {
+        /* The buffer goes to JavaScript as it stands rather than being
+           copied into a fresh one. */
+        return JS_NewUint8Array(ctx, out, n, sxn_free_plain_buffer, NULL, false);
+    }
+    /* Anything non-ASCII means Node's byte-at-a-time reading of the string
+       is visible, so read the code units and mask each to a byte. */
+    free(out);
+    size_t count = 0;
+    uint8_t *units = sxn_string_code_units(ctx, argv[0], &count, false);
+    if (!units) return JS_EXCEPTION;
+    uint8_t *bytes = malloc(count / 2 + 1);
+    if (!bytes) { js_free(ctx, units); return JS_ThrowOutOfMemory(ctx); }
+    n = 0;
+    for (size_t i = 0; i + 1 < count; i += 2) {
+        int hi = sxn_hex_value(units[i]), lo = sxn_hex_value(units[i + 1]);
+        if (hi < 0 || lo < 0) break;
+        bytes[n++] = (uint8_t)((hi << 4) | lo);
+    }
+    js_free(ctx, units);
+    return JS_NewUint8Array(ctx, bytes, n, sxn_free_plain_buffer, NULL, false);
 }
 
 static JSValue js_base64_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -2447,8 +2466,28 @@ static JSValue js_base64_bytes(JSContext *ctx, JSValueConst this_val, int argc, 
         if (bits >= 8) { bits -= 8; out[n++] = (uint8_t)((acc >> bits) & 0xff); }
     }
     JS_FreeCString(ctx, str);
-    if (!ascii) { free(out); return JS_NULL; }
-    return JS_NewUint8Array(ctx, out, n, sxn_free_plain_buffer, NULL, false);
+    if (ascii) return JS_NewUint8Array(ctx, out, n, sxn_free_plain_buffer, NULL, false);
+    /* Non-ASCII: Node reads the string a byte at a time, so a code unit
+       above 0xff is truncated rather than skipped -- which is why an emoji
+       ends a base64 string, its surrogate's low byte being '='. */
+    free(out);
+    size_t count = 0;
+    uint8_t *units = sxn_string_code_units(ctx, argv[0], &count, false);
+    if (!units) return JS_EXCEPTION;
+    uint8_t *bytes = malloc(count * 3 / 4 + 4);
+    if (!bytes) { js_free(ctx, units); return JS_ThrowOutOfMemory(ctx); }
+    n = 0; acc = 0; bits = 0;
+    for (size_t i = 0; i < count; i++) {
+        uint8_t c = units[i];
+        if (c == '=') break;
+        int v = table[c];
+        if (v < 0) continue;
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) { bits -= 8; bytes[n++] = (uint8_t)((acc >> bits) & 0xff); }
+    }
+    js_free(ctx, units);
+    return JS_NewUint8Array(ctx, bytes, n, sxn_free_plain_buffer, NULL, false);
 }
 
 
@@ -2593,17 +2632,16 @@ static JSValue js_buffer_decode_units(JSContext *ctx, JSValueConst this_val, int
 }
 
 
-/* The other direction: a string into latin1 bytes (Node keeps the low byte
-   of each code unit) or into utf16le. The string is read as CESU-8, which
-   encodes each surrogate on its own, so every code unit survives the trip. */
-static JSValue js_buffer_encode_units(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic) {
-    (void)this_val;
+/* A string's code units, each masked down to a byte -- what Node means by
+   latin1, and what its hex and base64 readers see in a string with anything
+   non-ASCII in it. The string is read as CESU-8, which encodes each
+   surrogate on its own, so every code unit survives the trip. */
+static uint8_t *sxn_string_code_units(JSContext *ctx, JSValueConst val, size_t *out_count, bool wide) {
     size_t len = 0;
-    const char *str = argc > 0 ? JS_ToCStringLen2(ctx, &len, argv[0], true) : NULL;
-    if (!str) return JS_EXCEPTION;
-    size_t cap = magic ? (len + 1) * 2 : len + 1;
-    uint8_t *out = js_malloc(ctx, cap);
-    if (!out) { JS_FreeCString(ctx, str); return JS_EXCEPTION; }
+    const char *str = JS_ToCStringLen2(ctx, &len, val, true);
+    if (!str) return NULL;
+    uint8_t *out = js_malloc(ctx, wide ? (len + 1) * 2 : len + 1);
+    if (!out) { JS_FreeCString(ctx, str); return NULL; }
     size_t n = 0;
     for (size_t i = 0; i < len; ) {
         uint8_t c = (uint8_t)str[i];
@@ -2614,15 +2652,26 @@ static JSValue js_buffer_encode_units(JSContext *ctx, JSValueConst this_val, int
             unit = ((c & 0x0fu) << 12) | (((uint8_t)str[i + 1] & 0x3fu) << 6) | ((uint8_t)str[i + 2] & 0x3fu);
             i += 3;
         } else { unit = c; i += 1; }
-        if (magic) { out[n++] = unit & 0xff; out[n++] = (unit >> 8) & 0xff; }
+        if (wide) { out[n++] = unit & 0xff; out[n++] = (unit >> 8) & 0xff; }
         else out[n++] = unit & 0xff;
     }
     JS_FreeCString(ctx, str);
+    *out_count = n;
+    return out;
+}
+
+/* The other direction for Buffer: a string into latin1 bytes (Node keeps the
+   low byte of each code unit) or into utf16le. */
+static JSValue js_buffer_encode_units(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic) {
+    (void)this_val;
+    if (argc < 1) return JS_EXCEPTION;
+    size_t n = 0;
+    uint8_t *out = sxn_string_code_units(ctx, argv[0], &n, magic != 0);
+    if (!out) return JS_EXCEPTION;
     JSValue bytes = JS_NewUint8ArrayCopy(ctx, out, n);
     js_free(ctx, out);
     return bytes;
 }
-
 
 /* require() of a builtin. This was a 25-entry object literal in JavaScript,
    rebuilt on every single require() call before the name was even looked at;

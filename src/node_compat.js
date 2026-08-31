@@ -83,52 +83,10 @@
   // Only called for non-utf-8 encodings -- Buffer.from's string branch
   // handles utf-8 itself via a native primitive that skips the extra
   // allocation this returns-a-bare-Uint8Array shape would otherwise cost.
-  // `encoding` arrives already-lowercased from that call site.
-  // Node decodes as much as it can and stops, where the standard
-  // Uint8Array.fromHex throws. Take the strict, native path first and fall
-  // back only when it refuses, so valid input keeps its speed.
-  function hexBytesLenient(str) {
-    var out = new Uint8Array(str.length >> 1), n = 0;
-    for (var i = 0; i + 1 < str.length; i += 2) {
-      var hi = hexDigit(str.charCodeAt(i) & 0xff), lo = hexDigit(str.charCodeAt(i + 1) & 0xff);
-      if (hi < 0 || lo < 0) break;
-      out[n++] = (hi << 4) | lo;
-    }
-    return out.subarray(0, n);
-  }
-  function hexDigit(c) {
-    if (c >= 48 && c <= 57) return c - 48;
-    if (c >= 97 && c <= 102) return c - 87;
-    if (c >= 65 && c <= 70) return c - 55;
-    return -1;
-  }
-
-  // Node's base64 reader takes either alphabet, skips anything that is not a
-  // base64 character, and does not require padding.
-  var B64 = (function () {
-    var t = new Int8Array(128).fill(-1);
-    var a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    for (var i = 0; i < a.length; i++) t[a.charCodeAt(i)] = i;
-    t[43] = 62; t[47] = 63;   // + /
-    t[45] = 62; t[95] = 63;   // - _  (base64url)
-    return t;
-  })();
-  function base64BytesLenient(str) {
-    var out = new Uint8Array((str.length * 3) >> 2), n = 0, acc = 0, bits = 0;
-    for (var i = 0; i < str.length; i++) {
-      // Node reads the string one byte at a time, so a code unit above 0xff is
-      // truncated rather than skipped -- which is why an emoji ends a base64
-      // string: the high half of its surrogate pair masks down to '='.
-      var c = str.charCodeAt(i) & 0xff;
-      if (c === 61) break;                        // '=' ends the data
-      var v = c < 128 ? B64[c] : -1;
-      if (v < 0) continue;
-      acc = (acc << 6) | v; bits += 6;
-      if (bits >= 8) { bits -= 8; out[n++] = (acc >> bits) & 0xff; }
-    }
-    return out.subarray(0, n);
-  }
-
+  // `encoding` arrives already-lowercased from that call site. The lenient
+  // hex and base64 readers Node's leniency needs are native (js_hex_bytes
+  // and js_base64_bytes), including the case where a string holds code
+  // units above 0xff and Node's byte-at-a-time reading of it shows.
   var utf16leBytes = __sxnUtf16leBytes;
   // Native (js_buffer_decode_units in src/node.c): latin1, Node's 7-bit
   // "ascii" and utf16le are all a widening of bytes into code units, which
@@ -147,16 +105,14 @@
       // at all; the native lenient reader takes over when the input has
       // something in it that the strict one refuses.
       try { return Uint8Array.fromHex(str); } catch { /* fall through */ }
-      var hex = __sxnHexBytes(str);
-      return hex !== null ? hex : hexBytesLenient(str);
+      return __sxnHexBytes(str);
     }
     if (encoding === "base64" || encoding === "base64url") {
       try {
         return encoding === "base64" ? Uint8Array.fromBase64(str)
                                      : Uint8Array.fromBase64(str, { alphabet: "base64url" });
       } catch { /* fall through */ }
-      var b64 = __sxnBase64Bytes(str);
-      return b64 !== null ? b64 : base64BytesLenient(str);
+      return __sxnBase64Bytes(str);
     }
     if (encoding === "ucs2" || encoding === "ucs-2" ||
         encoding === "utf16le" || encoding === "utf-16le") return utf16leBytes(str);
