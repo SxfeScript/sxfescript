@@ -2170,6 +2170,114 @@ static JSValue js_net_is_ip(JSContext *ctx, JSValueConst this_val, int argc, JSV
     return JS_NewInt32(ctx, family);
 }
 
+
+/* ---------------- Buffer's numeric accessors, in C ----------------
+   Node has about forty of these -- readUInt32BE, writeInt16LE and the rest.
+   They are pure byte-to-number conversion, they are what binary protocol
+   code spends its time in, and none of them existed here. One function
+   covers them all: the magic argument carries the width, the sign, the
+   endianness and whether it is a float. */
+
+#define SXN_NUM_WIDTH(m)  ((m) & 0x0f)
+#define SXN_NUM_SIGNED    0x10
+#define SXN_NUM_BIG_END   0x20
+#define SXN_NUM_FLOAT     0x40
+#define SXN_NUM_BIG_INT   0x80
+
+static bool sxn_num_range(JSContext *ctx, size_t buf_len, int64_t offset, int width) {
+    if (offset < 0 || (uint64_t)offset + (uint64_t)width > (uint64_t)buf_len) {
+        JS_ThrowRangeError(ctx, "the value of \"offset\" is out of range");
+        return false;
+    }
+    return true;
+}
+
+static uint64_t sxn_read_raw(const uint8_t *p, int width, bool big_endian) {
+    uint64_t v = 0;
+    if (big_endian) for (int i = 0; i < width; i++) v = (v << 8) | p[i];
+    else for (int i = width - 1; i >= 0; i--) v = (v << 8) | p[i];
+    return v;
+}
+
+static void sxn_write_raw(uint8_t *p, uint64_t v, int width, bool big_endian) {
+    if (big_endian) for (int i = width - 1; i >= 0; i--) { p[i] = (uint8_t)(v & 0xff); v >>= 8; }
+    else for (int i = 0; i < width; i++) { p[i] = (uint8_t)(v & 0xff); v >>= 8; }
+}
+
+static JSValue js_buffer_read(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic) {
+    size_t len = 0;
+    uint8_t *bytes = JS_GetUint8Array(ctx, &len, this_val);
+    if (!bytes) return JS_ThrowTypeError(ctx, "not a Buffer");
+    int width = SXN_NUM_WIDTH(magic);
+    int64_t offset = 0;
+    if (argc > 0 && !JS_IsUndefined(argv[0]) && JS_ToInt64(ctx, &offset, argv[0])) return JS_EXCEPTION;
+    if (!sxn_num_range(ctx, len, offset, width)) return JS_EXCEPTION;
+    const uint8_t *p = bytes + offset;
+    bool big = (magic & SXN_NUM_BIG_END) != 0;
+    uint64_t raw = sxn_read_raw(p, width, big);
+    if (magic & SXN_NUM_FLOAT) {
+        if (width == 4) { float f; uint32_t bits = (uint32_t)raw; memcpy(&f, &bits, 4); return JS_NewFloat64(ctx, (double)f); }
+        double d; memcpy(&d, &raw, 8); return JS_NewFloat64(ctx, d);
+    }
+    if (magic & SXN_NUM_BIG_INT) {
+        if (magic & SXN_NUM_SIGNED) return JS_NewBigInt64(ctx, (int64_t)raw);
+        return JS_NewBigUint64(ctx, raw);
+    }
+    if (magic & SXN_NUM_SIGNED) {
+        int shift = 64 - width * 8;
+        return JS_NewInt64(ctx, ((int64_t)(raw << shift)) >> shift);
+    }
+    return JS_NewInt64(ctx, (int64_t)raw);
+}
+
+static JSValue js_buffer_write_num(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic) {
+    size_t len = 0;
+    uint8_t *bytes = JS_GetUint8Array(ctx, &len, this_val);
+    if (!bytes) return JS_ThrowTypeError(ctx, "not a Buffer");
+    int width = SXN_NUM_WIDTH(magic);
+    int64_t offset = 0;
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && JS_ToInt64(ctx, &offset, argv[1])) return JS_EXCEPTION;
+    if (!sxn_num_range(ctx, len, offset, width)) return JS_EXCEPTION;
+    uint8_t *p = bytes + offset;
+    bool big = (magic & SXN_NUM_BIG_END) != 0;
+    if (magic & SXN_NUM_FLOAT) {
+        double d = 0;
+        if (JS_ToFloat64(ctx, &d, argc > 0 ? argv[0] : JS_UNDEFINED)) return JS_EXCEPTION;
+        if (width == 4) { float f = (float)d; uint32_t bits; memcpy(&bits, &f, 4); sxn_write_raw(p, bits, 4, big); }
+        else { uint64_t bits; memcpy(&bits, &d, 8); sxn_write_raw(p, bits, 8, big); }
+    } else if (magic & SXN_NUM_BIG_INT) {
+        int64_t v = 0;
+        if (JS_ToBigInt64(ctx, &v, argc > 0 ? argv[0] : JS_UNDEFINED)) return JS_EXCEPTION;
+        sxn_write_raw(p, (uint64_t)v, width, big);
+    } else {
+        double d = 0;
+        if (JS_ToFloat64(ctx, &d, argc > 0 ? argv[0] : JS_UNDEFINED)) return JS_EXCEPTION;
+        sxn_write_raw(p, (uint64_t)(int64_t)d, width, big);
+    }
+    return JS_NewInt64(ctx, offset + width);
+}
+
+/* Buffer#copy(target, targetStart, sourceStart, sourceEnd) -> bytes copied,
+   with the overlapping case handled the way Node's is. */
+static JSValue js_buffer_copy(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    size_t src_len = 0, dst_len = 0;
+    uint8_t *src = JS_GetUint8Array(ctx, &src_len, this_val);
+    uint8_t *dst = argc > 0 ? JS_GetUint8Array(ctx, &dst_len, argv[0]) : NULL;
+    if (!src || !dst) return JS_ThrowTypeError(ctx, "copy expects a Buffer target");
+    int64_t target_start = 0, source_start = 0, source_end = (int64_t)src_len;
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && JS_ToInt64(ctx, &target_start, argv[1])) return JS_EXCEPTION;
+    if (argc > 2 && !JS_IsUndefined(argv[2]) && JS_ToInt64(ctx, &source_start, argv[2])) return JS_EXCEPTION;
+    if (argc > 3 && !JS_IsUndefined(argv[3]) && JS_ToInt64(ctx, &source_end, argv[3])) return JS_EXCEPTION;
+    if (target_start < 0 || source_start < 0 || source_end < source_start)
+        return JS_ThrowRangeError(ctx, "index out of range");
+    if (source_end > (int64_t)src_len) source_end = (int64_t)src_len;
+    int64_t n = source_end - source_start;
+    if (n > (int64_t)dst_len - target_start) n = (int64_t)dst_len - target_start;
+    if (n <= 0) return JS_NewInt32(ctx, 0);
+    memmove(dst + target_start, src + source_start, (size_t)n);
+    return JS_NewInt64(ctx, n);
+}
+
 static const char *node_querystring_names[] = { "parse", "stringify", "escape", "unescape", "decode", "encode" };
 static const char *node_url_names[] = {
     "URL", "URLSearchParams", "fileURLToPath", "pathToFileURL", "format", "parse",
@@ -2393,6 +2501,42 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
     JS_SetPropertyStr(ctx, global, "__sxnWinBasename", JS_NewCFunction(ctx, js_path_win_basename, "basename", 2));
     JS_SetPropertyStr(ctx, global, "__sxnWinExtname", JS_NewCFunction(ctx, js_path_win_extname, "extname", 1));
     JS_SetPropertyStr(ctx, global, "__sxnWinRelative", JS_NewCFunction(ctx, js_path_win_relative, "relative", 2));
+    {
+        /* name, magic */
+        static const struct { const char *name; int magic; } reads[] = {
+            { "readUInt8", 1 }, { "readInt8", 1 | SXN_NUM_SIGNED },
+            { "readUInt16LE", 2 }, { "readUInt16BE", 2 | SXN_NUM_BIG_END },
+            { "readInt16LE", 2 | SXN_NUM_SIGNED }, { "readInt16BE", 2 | SXN_NUM_SIGNED | SXN_NUM_BIG_END },
+            { "readUInt32LE", 4 }, { "readUInt32BE", 4 | SXN_NUM_BIG_END },
+            { "readInt32LE", 4 | SXN_NUM_SIGNED }, { "readInt32BE", 4 | SXN_NUM_SIGNED | SXN_NUM_BIG_END },
+            { "readFloatLE", 4 | SXN_NUM_FLOAT }, { "readFloatBE", 4 | SXN_NUM_FLOAT | SXN_NUM_BIG_END },
+            { "readDoubleLE", 8 | SXN_NUM_FLOAT }, { "readDoubleBE", 8 | SXN_NUM_FLOAT | SXN_NUM_BIG_END },
+            { "readBigUInt64LE", 8 | SXN_NUM_BIG_INT }, { "readBigUInt64BE", 8 | SXN_NUM_BIG_INT | SXN_NUM_BIG_END },
+            { "readBigInt64LE", 8 | SXN_NUM_BIG_INT | SXN_NUM_SIGNED },
+            { "readBigInt64BE", 8 | SXN_NUM_BIG_INT | SXN_NUM_SIGNED | SXN_NUM_BIG_END },
+        };
+        static const struct { const char *name; int magic; } writes[] = {
+            { "writeUInt8", 1 }, { "writeInt8", 1 | SXN_NUM_SIGNED },
+            { "writeUInt16LE", 2 }, { "writeUInt16BE", 2 | SXN_NUM_BIG_END },
+            { "writeInt16LE", 2 | SXN_NUM_SIGNED }, { "writeInt16BE", 2 | SXN_NUM_SIGNED | SXN_NUM_BIG_END },
+            { "writeUInt32LE", 4 }, { "writeUInt32BE", 4 | SXN_NUM_BIG_END },
+            { "writeInt32LE", 4 | SXN_NUM_SIGNED }, { "writeInt32BE", 4 | SXN_NUM_SIGNED | SXN_NUM_BIG_END },
+            { "writeFloatLE", 4 | SXN_NUM_FLOAT }, { "writeFloatBE", 4 | SXN_NUM_FLOAT | SXN_NUM_BIG_END },
+            { "writeDoubleLE", 8 | SXN_NUM_FLOAT }, { "writeDoubleBE", 8 | SXN_NUM_FLOAT | SXN_NUM_BIG_END },
+            { "writeBigUInt64LE", 8 | SXN_NUM_BIG_INT }, { "writeBigUInt64BE", 8 | SXN_NUM_BIG_INT | SXN_NUM_BIG_END },
+            { "writeBigInt64LE", 8 | SXN_NUM_BIG_INT | SXN_NUM_SIGNED },
+            { "writeBigInt64BE", 8 | SXN_NUM_BIG_INT | SXN_NUM_SIGNED | SXN_NUM_BIG_END },
+        };
+        JSValue accessors = JS_NewObject(ctx);
+        for (size_t i = 0; i < countof(reads); i++)
+            JS_SetPropertyStr(ctx, accessors, reads[i].name,
+                              JS_NewCFunctionMagic(ctx, js_buffer_read, reads[i].name, 1, JS_CFUNC_generic_magic, reads[i].magic));
+        for (size_t i = 0; i < countof(writes); i++)
+            JS_SetPropertyStr(ctx, accessors, writes[i].name,
+                              JS_NewCFunctionMagic(ctx, js_buffer_write_num, writes[i].name, 2, JS_CFUNC_generic_magic, writes[i].magic));
+        JS_SetPropertyStr(ctx, accessors, "copy", JS_NewCFunction(ctx, js_buffer_copy, "copy", 4));
+        JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
+    }
     JS_SetPropertyStr(ctx, global, "__sxnIsIP", JS_NewCFunction(ctx, js_net_is_ip, "isIP", 1));
     JS_SetPropertyStr(ctx, global, "__sxnQsParse", JS_NewCFunction(ctx, js_qs_parse, "parse", 4));
     JS_SetPropertyStr(ctx, global, "__sxnQsStringify", JS_NewCFunction(ctx, js_qs_stringify, "stringify", 3));

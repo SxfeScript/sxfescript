@@ -1798,6 +1798,22 @@ static JSValue sxn_random_bytes(JSContext *ctx, JSValueConst this_val, int argc,
 /* HMAC, from the library that already does the digests. It was built here in
    JavaScript out of two padded key buffers and three digest calls, with a
    Uint8Array allocated per update. */
+
+/* Buffer#compare: Node orders by unsigned byte value, then by length. A
+   JavaScript loop compared a byte at a time; memcmp compares a word at a
+   time and is what the C library is for. */
+static JSValue sxn_bytes_compare(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    size_t a_len = 0, b_len = 0;
+    uint8_t *a = argc > 0 ? JS_GetUint8Array(ctx, &a_len, argv[0]) : NULL;
+    uint8_t *b = argc > 1 ? JS_GetUint8Array(ctx, &b_len, argv[1]) : NULL;
+    if (!a || !b) return JS_ThrowTypeError(ctx, "compare expects two Uint8Arrays");
+    size_t n = a_len < b_len ? a_len : b_len;
+    int rc = n ? memcmp(a, b, n) : 0;
+    if (rc == 0) rc = a_len == b_len ? 0 : (a_len < b_len ? -1 : 1);
+    return JS_NewInt32(ctx, rc < 0 ? -1 : (rc > 0 ? 1 : 0));
+}
+
 static JSValue sxn_hmac(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
     const char *algo = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
@@ -2502,6 +2518,7 @@ int sxn_install_network(JSContext *ctx) {
                       JS_NewCFunction(ctx, sxn_abl_emit, "__ablEmit", 2));
 #endif
     JS_SetPropertyStr(ctx, global, "__sxnRandomBytes", JS_NewCFunction(ctx, sxn_random_bytes, "__sxnRandomBytes", 1));
+    JS_SetPropertyStr(ctx, global, "__sxnBytesCompare", JS_NewCFunction(ctx, sxn_bytes_compare, "__sxnBytesCompare", 2));
     JS_SetPropertyStr(ctx, global, "__sxnHmac", JS_NewCFunction(ctx, sxn_hmac, "__sxnHmac", 3));
     JS_SetPropertyStr(ctx, global, "__sxnTimingSafeEqual", JS_NewCFunction(ctx, sxn_timing_safe_equal, "__sxnTimingSafeEqual", 2));
     JS_SetPropertyStr(ctx, global, "__sxnDigest", JS_NewCFunction(ctx, sxn_digest, "__sxnDigest", 2));

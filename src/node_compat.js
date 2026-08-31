@@ -250,11 +250,8 @@
     // Node orders by unsigned byte value, then by length, and equals is just
     // compare === 0. Anything holding bytes is accepted, as Node does.
     compare(other) {
-      var n = Math.min(this.length, other.length);
-      for (var i = 0; i < n; i++) {
-        if (this[i] !== other[i]) return this[i] < other[i] ? -1 : 1;
-      }
-      return this.length === other.length ? 0 : (this.length < other.length ? -1 : 1);
+      // Native (sxn_bytes_compare in src/network.c): memcmp, then length.
+      return __sxnBytesCompare(this, other instanceof Uint8Array ? other : Buffer.from(other));
     }
     equals(other) { return this.length === other.length && this.compare(other) === 0; }
 
@@ -273,6 +270,19 @@
       return out;
     }
   }
+  // The numeric accessors -- readUInt32BE, writeFloatLE and the rest -- and
+  // copy, all native (js_buffer_read/js_buffer_write_num/js_buffer_copy in
+  // src/node.c). They are pure byte-to-number work, they are what binary
+  // protocol code spends its time in, and none of them existed here before.
+  Object.assign(Buffer.prototype, __sxnBufferAccessors);
+  delete globalThis.__sxnBufferAccessors;
+
+  Buffer.compare = (a, b) => __sxnBytesCompare(a, b);
+  Buffer.isEncoding = (enc) =>
+    ["utf8", "utf-8", "hex", "base64", "base64url", "latin1", "binary", "ascii", "ucs2", "ucs-2", "utf16le", "utf-16le"]
+      .includes(String(enc).toLowerCase());
+  Buffer.poolSize = 8192;
+
   globalThis.Buffer = Buffer;
 
   // ---------------- path: posix / win32 ----------------
