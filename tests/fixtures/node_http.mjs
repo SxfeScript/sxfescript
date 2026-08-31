@@ -86,6 +86,15 @@ const server = http.createServer((req, res) => {
     check("hasHeader", res.hasHeader("x-set"), true);
     check("getHeader", res.getHeader("X-Set"), "yes");
     check("getHeaderNames", res.getHeaderNames(), ["x-set"]);
+    // getHeaders hands back a copy, in the order the names were set.
+    res.setHeader("x-two", "2");
+    const snapshot = res.getHeaders();
+    res.setHeader("x-three", "3");
+    check("getHeaders is a copy", snapshot, { "x-set": "yes", "x-two": "2" });
+    check("getHeaders sees the third", res.getHeaders()["x-three"], "3");
+    check("names in order", res.getHeaderNames(), ["x-set", "x-two", "x-three"]);
+    res.removeHeader("x-two");
+    res.removeHeader("x-three");
     // The name is lowercased whatever spelling it arrives in, and hasHeader
     // asks about own properties only.
     res.setHeader("X-Mixed", "1");

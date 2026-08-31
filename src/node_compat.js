@@ -920,8 +920,8 @@
   // first, which is a scan over a short string rather than a builtin call.
   ServerResponse.prototype.setHeader = __sxnSetHeader;
   ServerResponse.prototype.getHeader = __sxnGetHeader;
-  ServerResponse.prototype.getHeaders = function () { return Object.assign({}, this._headers); };
-  ServerResponse.prototype.getHeaderNames = function () { return Object.keys(this._headers); };
+  ServerResponse.prototype.getHeaders = __sxnGetHeaders;
+  ServerResponse.prototype.getHeaderNames = __sxnGetHeaderNames;
   ServerResponse.prototype.hasHeader = __sxnHasHeader;
   ServerResponse.prototype.removeHeader = __sxnRemoveHeader;
   ServerResponse.prototype.writeHead = function (status, reasonOrHeaders, maybeHeaders) {

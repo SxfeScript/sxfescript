@@ -278,7 +278,13 @@ does not have to re-derive it:
 | `PassThrough#write` | 0.600 us | two emitter hops, both already C |
 | `url.fileURLToPath` | 0.130 us | C, was 0.475 |
 | `module.isBuiltin` | 0.045 us | C, was 0.415 |
+| `res.getHeaders` | 0.110 us | C, was 0.173 |
+| `res.getHeaderNames` | 0.110 us | C, was 0.157 |
 | `StringDecoder#write` | 0.120 us | C, was 0.330 |
+| `res.writeHead` | 0.330 us | JS: it is setHeader in a loop, and that is C |
+| `new Writable` | 0.360 us | JS: field stores, measured slower in C |
+| `new Readable` | 0.500 us | JS: same |
+| `readable.on("data")` | 1.16 us | JS: 0.5 of it is the deferred drain, which is the semantics |
 | `new URL` | 0.885 us | the engine's own |
 | `url.pathToFileURL` | 0.92 us | C text, was 1.30; `new URL` is 0.885 of what is left |
 | `createRequire` | 1.00 us | already C |

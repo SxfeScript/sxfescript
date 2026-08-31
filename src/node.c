@@ -3296,6 +3296,28 @@ static JSValue js_decode_chunk(JSContext *ctx, JSValueConst this_val, int argc, 
     return text;
 }
 
+
+/* Measured against the JavaScript it would replace: res.getHeaders copies
+   the header object, res.getHeaderNames lists its keys. */
+static JSValue js_header_list(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic) {
+    (void)argc; (void)argv;
+    JSValue headers = JS_GetPropertyStr(ctx, this_val, "_headers");
+    JSPropertyEnum *keys = NULL;
+    uint32_t count = 0;
+    if (JS_GetOwnPropertyNames(ctx, &keys, &count, headers, JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
+        JS_FreeValue(ctx, headers);
+        return JS_EXCEPTION;
+    }
+    JSValue out = magic ? JS_NewArray(ctx) : JS_NewObject(ctx);
+    for (uint32_t i = 0; i < count; i++) {
+        if (magic) JS_SetPropertyUint32(ctx, out, i, JS_AtomToString(ctx, keys[i].atom));
+        else JS_SetProperty(ctx, out, keys[i].atom, JS_GetProperty(ctx, headers, keys[i].atom));
+    }
+    JS_FreePropertyEnum(ctx, keys, count);
+    JS_FreeValue(ctx, headers);
+    return out;
+}
+
 /* ---------------- assert's deep comparison, in C ----------------
    The whole of it is calls back into the engine -- reading properties,
    comparing values, walking a Map -- so this is not faster than the
@@ -3777,6 +3799,8 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
         JS_SetPropertyStr(ctx, accessors, "swap64", JS_NewCFunctionMagic(ctx, js_buffer_swap, "swap64", 0, JS_CFUNC_generic_magic, 8));
         JS_SetPropertyStr(ctx, global, "__sxnBufferAccessors", accessors);
     }
+    JS_SetPropertyStr(ctx, global, "__sxnGetHeaders", JS_NewCFunctionMagic(ctx, js_header_list, "getHeaders", 0, JS_CFUNC_generic_magic, 0));
+    JS_SetPropertyStr(ctx, global, "__sxnGetHeaderNames", JS_NewCFunctionMagic(ctx, js_header_list, "getHeaderNames", 0, JS_CFUNC_generic_magic, 1));
     JS_SetPropertyStr(ctx, global, "__sxnDecodeChunk", JS_NewCFunction(ctx, js_decode_chunk, "__sxnDecodeChunk", 2));
     JS_SetPropertyStr(ctx, global, "__sxnPathToFileUrl", JS_NewCFunction(ctx, js_path_to_file_url, "pathToFileURL", 1));
     JS_SetPropertyStr(ctx, global, "__sxnFileUrlToPath", JS_NewCFunction(ctx, js_file_url_to_path, "fileURLToPath", 1));
