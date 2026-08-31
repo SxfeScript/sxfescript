@@ -808,6 +808,9 @@ static void on_connection_cb(uv_stream_t *server_handle, int status) {
     ConnState *conn = calloc(1, sizeof(*conn)); conn->serve = serve;
     uv_tcp_init(sxn_loop(), &conn->handle); conn->handle.data = conn;
     if (uv_accept(server_handle, (uv_stream_t *)&conn->handle) == 0) {
+        /* No Nagle: a reply is written in one go and wants to leave now, not
+           when the kernel has collected enough to be worth a packet. */
+        uv_tcp_nodelay(&conn->handle, 1);
         conn->next = serve->conns;
         if (serve->conns) serve->conns->prev = conn;
         serve->conns = conn;
