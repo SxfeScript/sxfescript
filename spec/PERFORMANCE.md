@@ -205,8 +205,8 @@ surrogate pairs and the three-byte replacement for unpaired surrogates
 included, without encoding it.
 
 Cumulatively, on the Mac: Buffer 102->19.4 ms, TextEncoder 76->4.7 ms,
-EventEmitter 37->6.6 ms, cold start 10.7->8.3 ms, and the pause benchmark's
-total 1.1 s->143.9 ms, with
+EventEmitter 37->6.7 ms, cold start 10.7->7.5 ms, and the pause benchmark's
+total 1.1 s->146.6 ms, with
 zero GC cycles during the loops throughout. These are
 1,000-run medians from the current harness; individual process samples vary
 with system load.
