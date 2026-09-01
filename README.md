@@ -189,21 +189,22 @@ runtime's startup cost.
 
 | Category | sxn | Node | Bun | Winner |
 |---|---|---|---|---|
-| Real-world end-to-end task | **10.4 ms** | 76.3 ms | 15.5 ms | sxn |
-| Cold start | **8.4 ms** | 41.6 ms | 9.2 ms | sxn |
-| Sustained throughput: Buffer ops | **19.2 ms** | 23.8 ms | 27.6 ms | sxn |
-| Sustained throughput: TextEncoder | **4.7 ms** | 38.9 ms | 6.3 ms | sxn |
-| Sustained throughput: EventEmitter | 6.6 ms | **5.1 ms** | 9.3 ms | Node |
-| Pause consistency: total time | **147.8 ms** | 242.5 ms | 283.1 ms | sxn |
-| Pause consistency: worst single pause | **0.04 ms** | 0.36 ms | 2.59 ms | sxn |
-| Parse 32k-line generated file | **20.9 ms** | 51.0 ms | 24.3 ms | sxn |
+| Real-world end-to-end task | **8.4 ms** | 80.7 ms | 18.6 ms | sxn |
+| Cold start | **9.2 ms** | 45.1 ms | 10.2 ms | sxn |
+| Sustained throughput: Buffer ops | **19.4 ms** | 24.5 ms | 27.1 ms | sxn |
+| Sustained throughput: TextEncoder | **4.7 ms** | 39.8 ms | 6.2 ms | sxn |
+| Sustained throughput: EventEmitter | 6.7 ms | **5.4 ms** | 9.2 ms | Node |
+| Sustained throughput: JSON round trip | 48.0 ms | 29.3 ms | **24.8 ms** | Bun |
+| Pause consistency: total time | **146.6 ms** | 241.7 ms | 277.0 ms | sxn |
+| Pause consistency: worst single pause | **0.01 ms** | 0.28 ms | 3.13 ms | sxn |
+| Parse 32k-line generated file | **20.1 ms** | 49.9 ms | 25.6 ms | sxn |
 
-Seven of eight, holding steady since the last pass -- these numbers include
-the class-constructor and thread-safe-function work, and neither moved a
-row. EventEmitter is the one Node keeps, and its 1.1x here is a JIT inlining
-a call to nothing: an ablation that skips the fused call's guards entirely
-still only reaches 4.7 ms, because roughly a third of the row is this
-interpreter's own loop dispatch.
+Seven of nine. The two that are not sxn's are the two worth reading: a JIT
+inlines an EventEmitter call to nothing, and an ablation that skips this
+interpreter's fused-call guards entirely still only reaches 4.7 ms, because
+roughly a third of that row is loop dispatch. JSON is a megabyte parsed and
+written back forty times, and the gap there is the same story with more code
+in it -- `JSON.parse` is C in all three, but what surrounds it is not.
 
 ### Linux PC (Ryzen 7 5700G)
 

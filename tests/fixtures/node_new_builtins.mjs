@@ -8,9 +8,17 @@ const check = (name, ok, detail) => {
   console.log((ok ? "ok   " : "FAIL ") + name + (detail === undefined ? "" : " " + detail));
 };
 
-const base = require("module").builtinModules.filter((m) => !m.includes("/"));
+const all = require("module").builtinModules;
+const base = all.filter((m) => !m.includes("/"));
 check("builtin count", base.length === 37, String(base.length));
 for (const name of base) check("resolves " + name, require("node:" + name) !== undefined);
+// Every one of them imports as well as requires: the two paths are separate
+// (the loader registers a module; require reads a table), and a name that
+// only answers to one of them is a bug that hides until someone writes ESM.
+for (const name of all) {
+  const m = await import("node:" + name);
+  check("imports " + name, m.default !== undefined || Object.keys(m).length > 0);
+}
 
 // child_process: a real process, its output, and its exit status.
 const cp = require("node:child_process");

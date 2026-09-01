@@ -4584,6 +4584,24 @@ NODE_SIMPLE_MODULE(dgram, "__sxnDgram", node_dgram_names)
 NODE_SIMPLE_MODULE(punycode, "__sxnPunycode", node_punycode_names)
 NODE_SIMPLE_MODULE(diagnostics_channel, "__sxnDiagnosticsChannel", node_diagnostics_channel_names)
 
+static const char *node_console_names[] = { "log", "error", "warn", "info", "debug", "trace", "Console" };
+NODE_SIMPLE_MODULE(console, "__sxnConsole", node_console_names)
+
+/* node:constants is a flat bag of numbers whose names differ by platform, so
+   it has no named exports to declare -- only the object itself. */
+static int node_constants_init(JSContext *ctx, JSModuleDef *m) {
+    JS_SetModuleExport(ctx, m, "default", node_global_lookup(ctx, "__sxnConstants"));
+    return 0;
+}
+
+static JSModuleDef *sxn_init_module_node_constants(JSContext *ctx, const char *name) {
+    JSModuleDef *m = JS_NewCModule(ctx, name, node_constants_init);
+    if (!m) return NULL;
+    JS_AddModuleExport(ctx, m, "default");
+    return m;
+}
+
+
 
 
 static const char *node_fs_export_names[] = {
@@ -4727,6 +4745,8 @@ static const SxnNodeModule sxn_node_modules[] = {
     { "node:dgram", sxn_init_module_node_dgram },
     { "node:punycode", sxn_init_module_node_punycode },
     { "node:diagnostics_channel", sxn_init_module_node_diagnostics_channel },
+    { "node:console", sxn_init_module_node_console },
+    { "node:constants", sxn_init_module_node_constants },
     { NULL, NULL },
 };
 
