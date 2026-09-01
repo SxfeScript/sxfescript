@@ -204,7 +204,7 @@ was missing here entirely and is now native: it walks the string and counts,
 surrogate pairs and the three-byte replacement for unpaired surrogates
 included, without encoding it.
 
-Cumulatively, on the Mac: Buffer 102->19.2 ms, TextEncoder 76->4.6 ms,
+Cumulatively, on the Mac: Buffer 102->19.4 ms, TextEncoder 76->4.7 ms,
 EventEmitter 37->6.6 ms, cold start 10.7->8.3 ms, and the pause benchmark's
 total 1.1 s->143.9 ms, with
 zero GC cycles during the loops throughout. These are

@@ -209,22 +209,23 @@ in it -- `JSON.parse` is C in all three, but what surrounds it is not.
 
 ### Linux PC (Ryzen 7 5700G)
 
-| Category | sxn | Node 18 | Bun | Winner |
+| Category | sxn | Node | Bun | Winner |
 |---|---|---|---|---|
-| Real-world end-to-end task | **6.9 ms** | 224.0 ms | 23.2 ms | sxn |
-| Cold start | **7.6 ms** | 117.1 ms | 15.1 ms | sxn |
-| Sustained throughput: Buffer ops | **37.4 ms** | 75.6 ms | 83.0 ms | sxn |
-| Sustained throughput: TextEncoder | **8.6 ms** | 89.2 ms | 16.2 ms | sxn |
-| Sustained throughput: EventEmitter | 14.8 ms | **13.0 ms** | 23.2 ms | Node |
-| Pause consistency: total time | **2836.0 ms** | 3463.2 ms | 3219.4 ms | sxn |
-| Pause consistency: worst single pause | **0.30 ms** | 4.96 ms | 5.67 ms | sxn |
-| Parse 32k-line generated file | **34.8 ms** | 144.3 ms | 54.1 ms | sxn |
+| Real-world end-to-end task | **7.5 ms** | 56.7 ms | 22.4 ms | sxn |
+| Cold start | **7.4 ms** | 23.1 ms | 13.3 ms | sxn |
+| Sustained throughput: Buffer ops | **38.0 ms** | 39.2 ms | 83.2 ms | sxn |
+| Sustained throughput: TextEncoder | **9.1 ms** | 80.6 ms | 18.0 ms | sxn |
+| Sustained throughput: EventEmitter | 15.9 ms | **10.1 ms** | 25.2 ms | Node |
+| Sustained throughput: JSON round trip | 82.9 ms | 113.5 ms | **60.3 ms** | Bun |
+| Pause consistency: total time | **2855.9 ms** | 3295.3 ms | 3252.4 ms | sxn |
+| Pause consistency: worst single pause | **0.25 ms** | 1.72 ms | 6.48 ms | sxn |
+| Parse 32k-line generated file | **36.6 ms** | 51.5 ms | 54.2 ms | sxn |
 
-Seven of eight, and the numbers are far steadier than anything the laptop can
-produce. Both machines agree on which row is which: sxn takes everything
-except EventEmitter, and that one is Node's on both, which is the point --
-it is the one row where the gap is architectural rather than incidental. The
-Linux gap is the narrower of the two, 1.1x against the Mac's 1.3x.
+Seven of nine again, and the same two are not sxn's, which is the useful
+part: two machines, two chips, two operating systems, and the shape of the
+result does not move. Buffer is the one row where Node is close here rather
+than behind, and JSON is closer than it is on the Mac -- against this Node,
+sxn takes JSON while Bun keeps it.
 
 The full write-up -- pause-row detail, the no-JIT tradeoff, every
 optimization behind these numbers in the order it landed, and what's still
