@@ -99,6 +99,15 @@ opcode lowering, full control-flow ownership pass, native npm registry backend,
 and semantic LSP features are tracked in `spec/IMPLEMENTATION.md` and are not
 yet represented as complete production implementations.
 
+Two things the annotations do today rather than being stripped. `&mut` requires
+a `let mut` owner, so borrowing an immutable binding is a compile error naming
+SX2003 -- the one ownership rule enforced ahead of that control-flow pass. And
+the declared type reaches codegen: `safe let mut n: i32` wraps at the 32-bit
+boundary where every other annotation keeps exact JavaScript arithmetic, and a
+small function with a fully declared scalar signature is inlined into its
+caller, worth 3.1x on a two-argument add. `spec/PERFORMANCE.md` has the
+measurements.
+
 ## What the runtime does
 
 Two documents cover what actually runs, and split the same way the codebase
@@ -106,14 +115,14 @@ does:
 
 - **`spec/RUNTIME.md`** -- the WinterTC web APIs and the `Sxn` host namespace:
   `fetch`, `Sxn.serve` (HTTP, SSE, WebSocket upgrade), Web Streams,
-  `URLPattern`, Web Crypto, `structuredClone`, and `Sxn.ffi` for calling a C
-  function directly. Every name in the Minimum Common API is there except
-  WebAssembly's.
+  `URLPattern`, Web Crypto, `structuredClone`, `Sxn.memoryUsage()` and
+  `Sxn.gc()`, and `Sxn.ffi` for calling a C function directly. Every name in
+  the Minimum Common API is there except WebAssembly's.
   This is the half that travels when the engine is embedded elsewhere, and
   the only half a mobile build needs.
 - **`spec/NODE.md`** -- what makes `sxn` usable as a Node alternative:
-  CommonJS, `node:` builtins (37 of ~37), and `.node` native-addon loading
-  through a from-scratch Node-API implementation. This half exists to
+  CommonJS, a superset of the `node:` builtins, and `.node` native-addon
+  loading over 120 Node-API entry points. This half exists to
   emulate Node and nothing else, so a build with no Node surface drops it
   and loses nothing on the runtime side.
 
