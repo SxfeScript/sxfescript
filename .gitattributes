@@ -1,0 +1,6 @@
+# GitHub Linguist does not know `.sx`, so it renders SxfeScript as plain text.
+# TypeScript is the closest grammar it ships: same expression and statement
+# syntax, same `:` type annotations. `let mut`, `&mut`, and `unsafe` are the
+# only tokens it misses. The real grammar lives in
+# tooling/vscode/syntaxes/sxfe.tmLanguage.json.
+*.sx linguist-language=TypeScript
