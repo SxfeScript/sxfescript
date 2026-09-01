@@ -451,7 +451,7 @@ alone.
 | `os` | 37 | all of it, from libuv | the object it hangs on |
 | `querystring` | 17 | all four functions | the object it hangs on |
 | `url` | 16 | `fileURLToPath`, `pathToFileURL`'s text | `format` and `parse`, which are the engine's `URL` |
-| the eighteen added modules | 717 | spawning a process, resolving a name, the UDP socket, fs's flag numbers | the module shapes around those four calls, and the modules that are answers rather than work |
+| the seventeen added modules | 746 | spawning a process, resolving a name, the UDP socket, fs's flag numbers | the module shapes around those four calls, and the modules that are answers rather than work -- all of it built on first use, not at startup |
 
 
 Still JavaScript, with the reason measured rather than asserted:
