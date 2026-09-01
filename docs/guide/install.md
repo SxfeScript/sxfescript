@@ -17,6 +17,9 @@ irm https://sxfescript.github.io/latest/install.ps1 | iex
 
 Both arm64 and x64 are built for every platform. The script picks the right one.
 
+Release 0.0.2 provides macOS, Linux, and Windows binaries for both arm64 and
+x64. See the repository's `llm.txt` for build and verification notes.
+
 ## Where it goes
 
 `~/.sxn/bin` on macOS and Linux, `%USERPROFILE%\.sxn\bin` on Windows, and the
@@ -27,7 +30,7 @@ sxn --version
 ```
 
 ```
-sxn 0.0.1
+sxn 0.0.2
 ```
 
 ## Pinning a version
@@ -36,7 +39,7 @@ Swap `latest` for a release tag in either URL to install that version instead
 of the newest:
 
 ```sh
-curl -fsSL https://sxfescript.github.io/v0.0.1/install.sh | bash
+curl -fsSL https://sxfescript.github.io/v0.0.2/install.sh | bash
 ```
 
 ## Building from source

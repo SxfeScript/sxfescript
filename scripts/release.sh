@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Builds sxn for every target this session can reach locally (macOS
-# arm64/x64, Linux arm64/x64) and uploads them to a GitHub release.
-# Windows isn't built here - there's no Windows machine in this setup, so
-# it stays CI's job (see .github/workflows/ci.yml); this script only
-# covers what these two machines can actually build and test themselves.
+# Builds and packages the macOS/Linux targets reachable from this host and
+# uploads any matching prebuilt Windows archives supplied in dist/. Windows
+# x64/arm64 are cross-built separately; keep their binaries in dist/ before
+# invoking this script so a release contains all six targets.
 #
 # Usage: scripts/release.sh vX.Y.Z [--prerelease]
 #
@@ -97,7 +96,7 @@ else
 fi
 
 echo "== Uploading to $REPO release $VERSION =="
-assets=(dist/sxn-"${VERSION#v}"-*.tar.gz)
+assets=(dist/sxn-"${VERSION#v}"-*.tar.gz dist/sxn-"${VERSION#v}"-*.zip)
 if gh release view "$VERSION" --repo "$REPO" >/dev/null 2>&1; then
   gh release upload "$VERSION" "${assets[@]}" --repo "$REPO" --clobber
 else

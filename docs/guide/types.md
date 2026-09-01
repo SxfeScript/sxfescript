@@ -14,7 +14,7 @@ sxn hello.js
 ```
 
 ```
-hello from sxn 0.0.1
+hello from sxn 0.0.2
 ```
 
 ## TypeScript, without `tsc`

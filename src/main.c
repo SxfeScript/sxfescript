@@ -1117,7 +1117,7 @@ static int sxn_compile_command(int argc, char **argv) {
 }
 
 static void usage(void) {
-    puts("SXN 0.0.1\n"
+    puts("SXN 0.0.2\n"
          "Usage:\n"
          "  sxn <file.sx|file.ts|file.js|file.mjs|file.cjs> [args...]\n"
          "  sxn run [script] -- [args...]\n"
@@ -1145,7 +1145,7 @@ int main(int argc, char **argv) {
     _setmode(_fileno(stdin), _O_BINARY);
 #endif
     if (argc < 2 || !strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) { usage(); return 0; }
-    if (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v")) { puts("sxn 0.0.1"); return 0; }
+    if (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v")) { puts("sxn 0.0.2"); return 0; }
     if (!strcmp(argv[1], "lsp")) return sxn_lsp_main();
     if (!strcmp(argv[1], "compile")) return sxn_compile_command(argc, argv);
     if (!strcmp(argv[1], "run") || !strcmp(argv[1], "install") || !strcmp(argv[1], "add") ||

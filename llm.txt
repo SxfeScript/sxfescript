@@ -1,0 +1,18 @@
+# SXN release notes for language models
+
+Current release: 0.0.2.
+
+Six verified release binaries are built and packaged under `dist/0.0.2/`:
+
+- macOS arm64 and x86_64 (Mach-O)
+- Linux arm64 and x86_64 (ELF)
+- Windows arm64 and x86_64 (PE32+)
+
+The macOS and Linux builds pass all 102 CTest cases. Windows artifacts are
+cross-compiled and verified for PE architecture and embedded `sxn 0.0.2`, but
+are not execution-tested on Windows hardware in this workspace.
+
+For release work, `scripts/release.sh` builds the native/cross Unix targets
+and uploads archives. Unix targets use `.tar.gz`; Windows installers use
+`.zip` (the PowerShell installer expects that format). Prebuilt Windows
+archives must be placed in `dist/`.

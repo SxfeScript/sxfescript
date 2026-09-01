@@ -1697,7 +1697,7 @@ static JSValue js_sxn_fetch_raw(JSContext *ctx, JSValueConst this_val, int argc,
        3xx back as it arrived, and "error" is rejected by the JS wrapper --
        both need the transfer to stop at the first response. */
     curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, follow ? 1L : 0L);
-    curl_easy_setopt(easy, CURLOPT_USERAGENT, "sxn/0.0.1");
+    curl_easy_setopt(easy, CURLOPT_USERAGENT, "sxn/0.0.2");
     curl_easy_setopt(easy, CURLOPT_PRIVATE, fs);
     curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, fetch_header_cb);
     curl_easy_setopt(easy, CURLOPT_HEADERDATA, fs);
@@ -2981,7 +2981,7 @@ int sxn_install_network(JSContext *ctx) {
 
     JSValue global = JS_GetGlobalObject(ctx);
     JSValue runtime = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, runtime, "version", JS_NewString(ctx, "0.0.1"));
+    JS_SetPropertyStr(ctx, runtime, "version", JS_NewString(ctx, "0.0.2"));
     JS_SetPropertyStr(ctx, runtime, "serve", JS_NewCFunction(ctx, js_serve, "serve", 2));
     JS_SetPropertyStr(ctx, runtime, "file", JS_NewCFunction(ctx, sxn_file, "file", 1));
     JS_SetPropertyStr(ctx, runtime, "write", JS_NewCFunction(ctx, sxn_write, "write", 2));

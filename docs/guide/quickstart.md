@@ -12,7 +12,7 @@ sxn --version
 ```
 
 ```
-sxn 0.0.1
+sxn 0.0.2
 ```
 
 ## Your first program

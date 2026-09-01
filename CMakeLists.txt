@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(sxn VERSION 0.0.1 LANGUAGES C)
+project(sxn VERSION 0.0.2 LANGUAGES C)
 # Every other dependency here (curl, zlib, libuv, libffi) resolves to a
 # dylib under /usr/lib on macOS - part of the OS, present on every Mac.
 # OpenSSL doesn't ship there anymore, so find_package(OpenSSL) resolves to
@@ -9,8 +9,32 @@ project(sxn VERSION 0.0.1 LANGUAGES C)
 if(APPLE)
   set(OPENSSL_USE_STATIC_LIBS TRUE)
 endif()
-find_package(OpenSSL REQUIRED)
-find_package(CURL REQUIRED)
+if(DEFINED SXN_CROSS_DEPS_ROOT)
+  # Cross builds cannot use the host's FindOpenSSL/CURL/ZLIB results.  The
+  # release builder supplies a target sysroot containing import libraries.
+  set(_cross_root "${SXN_CROSS_DEPS_ROOT}")
+  add_library(OpenSSL::Crypto UNKNOWN IMPORTED)
+  set_target_properties(OpenSSL::Crypto PROPERTIES
+    IMPORTED_LOCATION "${_cross_root}/lib/libcrypto.dll.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${_cross_root}/include")
+  add_library(OpenSSL::SSL UNKNOWN IMPORTED)
+  set_target_properties(OpenSSL::SSL PROPERTIES
+    IMPORTED_LOCATION "${_cross_root}/lib/libssl.dll.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${_cross_root}/include"
+    INTERFACE_LINK_LIBRARIES OpenSSL::Crypto)
+  add_library(CURL::libcurl UNKNOWN IMPORTED)
+  set_target_properties(CURL::libcurl PROPERTIES
+    IMPORTED_LOCATION "${_cross_root}/lib/libcurl.dll.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${_cross_root}/include"
+    INTERFACE_LINK_LIBRARIES "ws2_32;crypt32;bcrypt;advapi32")
+  add_library(ZLIB::ZLIB UNKNOWN IMPORTED)
+  set_target_properties(ZLIB::ZLIB PROPERTIES
+    IMPORTED_LOCATION "${_cross_root}/lib/libz.dll.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${_cross_root}/include")
+else()
+  find_package(OpenSSL REQUIRED)
+  find_package(CURL REQUIRED)
+endif()
 # libuv ships a CMake config package from Homebrew and vcpkg, but Ubuntu's
 # libuv1-dev provides only pkg-config, so fall back to that rather than
 # requiring the config package everywhere.

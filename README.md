@@ -61,8 +61,12 @@ irm https://sxfescript.github.io/latest/install.ps1 | iex
 ```
 
 Both install to `~/.sxn/bin` (`%USERPROFILE%\.sxn\bin` on Windows) and add it
-to your PATH. Swap `latest` for a version tag (`v0.0.1`) in either URL to pin
+to your PATH. Swap `latest` for a version tag (`v0.0.2`) in either URL to pin
 a specific release instead of always getting the newest one.
+
+The 0.0.2 pre-release includes binaries for macOS arm64/x64, Linux arm64/x64,
+and Windows arm64/x64. The release builds are documented in [`llm.txt`](llm.txt)
+and the reproducible packaging entry point is [`scripts/release.sh`](scripts/release.sh).
 
 ## Build
 

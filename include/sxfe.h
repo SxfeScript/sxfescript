@@ -9,7 +9,7 @@
 extern "C" {
 #endif
 
-#define SXFE_VERSION "0.0.1"
+#define SXFE_VERSION "0.0.2"
 
 /* Length of the absolute-path root at p: 0 if relative, 1 for POSIX's
    leading '/', or 3 for a Windows drive letter (`C:/` or `C:\`). Used by
