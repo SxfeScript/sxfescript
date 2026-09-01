@@ -394,34 +394,39 @@ sqrt(144)  = 12</code></pre>
         <tbody>
           <tr>
             <td>Starting a new process</td>
-            <td class="num yes">8.4 ms</td><td class="num">41.6 ms</td><td class="num">9.2 ms</td>
+            <td class="num yes">9.2 ms</td><td class="num">45.1 ms</td><td class="num">10.2 ms</td>
             <td>About 5x faster than Node to start, and a hair ahead of Bun. Matters for a CLI tool or a serverless cold start</td>
           </tr>
           <tr>
             <td>Processing binary data (<code>Buffer</code>)</td>
-            <td class="num yes">19.2 ms</td><td class="num">23.8 ms</td><td class="num">27.6 ms</td>
+            <td class="num yes">19.4 ms</td><td class="num">24.5 ms</td><td class="num">27.1 ms</td>
             <td>Faster than both, at the operation almost every server-side script does constantly</td>
           </tr>
           <tr>
             <td>Encoding text (<code>TextEncoder</code>)</td>
-            <td class="num yes">4.7 ms</td><td class="num">38.9 ms</td><td class="num">6.3 ms</td>
+            <td class="num yes">4.7 ms</td><td class="num">39.8 ms</td><td class="num">6.2 ms</td>
             <td>8x faster than Node, ahead of Bun too</td>
           </tr>
           <tr>
             <td>Worst single GC-style pause</td>
-            <td class="num yes">0.04 ms</td><td class="num">0.36 ms</td><td class="num">2.59 ms</td>
+            <td class="num yes">0.01 ms</td><td class="num">0.28 ms</td><td class="num">3.13 ms</td>
             <td>No JIT means no warm-up stalls. The most predictable of the three, which is what a real-time or low-latency workload actually needs</td>
           </tr>
           <tr>
             <td>Firing many event listeners</td>
-            <td class="num">6.6 ms</td><td class="num yes">5.1 ms</td><td class="num">9.3 ms</td>
+            <td class="num">6.7 ms</td><td class="num yes">5.4 ms</td><td class="num">9.2 ms</td>
             <td>The one row Node wins, narrowly. Its JIT inlines the hot path in a way an interpreter structurally can't</td>
+          </tr>
+          <tr>
+            <td>A megabyte of JSON in and out</td>
+            <td class="num">48.0 ms</td><td class="num">29.3 ms</td><td class="num yes">24.8 ms</td>
+            <td>Bun's row, and Node is ahead too. Parsing is C in all three; what surrounds it is not</td>
           </tr>
         </tbody>
       </table>
     </div>
     <p style="color:var(--ink-soft); font-size:13px; margin: 10px 0 30px;">
-      All five rows, every runtime, same machine, same workload, run side by side by
+      All six rows, every runtime, same machine, same workload, run side by side by
       <code>benchmarks/wintertc/run.sh</code> in the repo. Nothing here is cherry-picked
       or estimated.
     </p>
