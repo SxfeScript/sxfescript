@@ -1,0 +1,43 @@
+hex fffe34121234c01dfeff3fc000000000
+readUInt8 255 readInt8 -2
+u16le 4660 u16be 4660
+i32le -123456 floatBE 1.5
+double 3.141592653589793 182d4454fb210940
+bigu64 12345678901234567890 ab54a98ceb1f0ad2
+bigi64 -42
+copied 5 world
+range -> RangeError
+compare -1 true false
+"abc" "abc" 0 true 0
+"abc" "abd" -1 false -1
+"abd" "abc" 1 false 1
+"ab" "abc" -1 false -1
+"abc" "ab" 1 false 1
+"" "" 0 true 0
+"" "a" -1 false -1
+"a" "" 1 false 1
+"ÿ" "\u0000" 1 false 1
+sorted a,ab,b
+hex 123456563412000000000000
+uintBE 1193046 uintLE 1193046
+intBE -1000 intLE -1000 fffc1818fcff
+w1 255 ff0000000000
+w2 255 00ff00000000
+w3 255 0000ff000000
+w4 255 000000ff0000
+w5 255 00000000ff00
+w6 255 0000000000ff
+swap16 0201040306050807
+swap32 0403020108070605
+swap64 0807060504030201
+odd swap -> RangeError
+width 7 -> RangeError
+wrote 5 hello.....
+offset 2 ...hi.....
+truncated 4 hell
+length cap 3 hel.......
+multibyte 3 "hé"
+encoding arg 3 hey.....
+src after writing to the copy: 1 copy: 99
+uint8array after: 1 buffer: 42
+arraybuffer view shares: 7

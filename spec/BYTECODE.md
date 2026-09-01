@@ -16,7 +16,14 @@ mechanism:
   something a user's own script can opt into.
 
 Both produce and consume the same file format, so `sxn app.sxbc` runs either
-one's output directly.
+one's output directly. A module's imports are resolved while it is compiled,
+so compiling a file compiles what it imports; the bytecode holds the entry
+module, and the imports are resolved by name when it runs.
+
+What it does not do is make a running program faster. The interpreter
+executes the same bytecode either way -- compiling ahead of time removes the
+parse, which happens once. On a server the difference is a millisecond of
+startup against however long the server then runs.
 
 ## Is it worth it for your script?
 

@@ -79,7 +79,7 @@ static int write_initial_manifest(void) {
     if (check) { fclose(check); fputs("sxn init: package.json already exists\n", stderr); return 1; }
     FILE *file = fopen("package.json", "wb");
     if (!file) { perror("package.json"); return 1; }
-    const char *manifest = "{\n  \"name\": \"sxfe-app\",\n  \"version\": \"0.0.1\",\n  \"type\": \"module\",\n  \"scripts\": {\n    \"start\": \"sxn index.sx\"\n  },\n  \"trustedDependencies\": []\n}\n";
+    const char *manifest = "{\n  \"name\": \"sxfe-app\",\n  \"version\": \"0.0.2\",\n  \"type\": \"module\",\n  \"scripts\": {\n    \"start\": \"sxn index.sx\"\n  },\n  \"trustedDependencies\": []\n}\n";
     fwrite(manifest, 1, strlen(manifest), file); fclose(file);
     puts("Created package.json"); return 0;
 }
@@ -195,7 +195,7 @@ static int curl_get(const char *url, MemBuf *out) {
     if (!easy) return -1;
     curl_easy_setopt(easy, CURLOPT_URL, url);
     curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(easy, CURLOPT_USERAGENT, "sxn/0.0.1");
+    curl_easy_setopt(easy, CURLOPT_USERAGENT, "sxn/0.0.2");
     curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, membuf_write);
     curl_easy_setopt(easy, CURLOPT_WRITEDATA, out);
     CURLcode rc = curl_easy_perform(easy);

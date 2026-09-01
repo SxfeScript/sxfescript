@@ -204,19 +204,248 @@ was missing here entirely and is now native: it walks the string and counts,
 surrogate pairs and the three-byte replacement for unpaired surrogates
 included, without encoding it.
 
-Cumulatively, on the Mac: Buffer 102->19.2 ms, TextEncoder 76->4.6 ms,
-EventEmitter 37->6.6 ms, cold start 10.7->8.3 ms, and the pause benchmark's
-total 1.1 s->143.9 ms, with
+Cumulatively, on the Mac: Buffer 102->19.4 ms, TextEncoder 76->4.7 ms,
+EventEmitter 37->6.7 ms, cold start 10.7->7.5 ms, and the pause benchmark's
+total 1.1 s->146.6 ms, with
 zero GC cycles during the loops throughout. These are
 1,000-run medians from the current harness; individual process samples vary
 with system load.
+
+## JSON
+
+The harness's `json` row parses a 1MB API payload and writes it back out,
+forty times. It is the one row named after a workload rather than an API,
+because it is what an HTTP service spends its time on: a request body in,
+a response body out.
+
+Three changes, all inside the tokenizer and the serializer rather than the
+value model:
+
+- **Strings are scanned a word at a time.** Both directions used to walk a
+  string one character per iteration -- four comparisons per byte on the way
+  in, a `string_getc`/`string_buffer_putc` pair per character on the way
+  out. Both now test eight bytes at once for the only bytes that matter (a
+  quote, a backslash, a control character, and on the way in anything
+  non-ASCII), using the standard `(x - 0x01..) & ~x` zero-byte trick, and
+  copy the run between them in one `memcpy`. Scanning was the largest single
+  cost in each direction.
+- **An escape-free string is allocated once.** The parser accumulated every
+  string into a `StringBuffer` that starts at 48 characters and is then
+  grown, copied and trimmed. A string with no escape and nothing above ASCII
+  -- most strings in most JSON -- is now measured by the scan above and
+  allocated at its final size.
+- **Quoting writes into the buffer the caller already has.** `stringify`
+  allocated a quoted copy of every key and every string value, copied it into
+  its output, and freed it. It writes through now.
+
+- **A parsed string is not built until its use is known.** An escape-free
+  ASCII string is handed on as a slice of the input, so a property name goes
+  straight to an atom -- a hash of bytes already in memory -- instead of
+  allocating a string, interning it and freeing it again. Only a value is
+  allocated.
+- **Getting at the input costs a scan, so the scan is a word wide.**
+  `JS_ToCString` already returns an ASCII 8-bit string's own bytes without
+  copying, but it decided that by counting non-ASCII bytes one at a time
+  across the whole string; it now clears eight at a time and only counts from
+  the first non-ASCII byte. Its wide-string transcode -- what an input pays
+  when one accent makes the whole string 16-bit -- copies four ASCII code
+  points per iteration instead of one. Both help every `JS_ToCString` caller
+  in the runtime, not only JSON.
+
+And a plain integer is converted by the tokenizer instead of `strtod`, which
+is locale-aware -- it takes a lock to find the decimal separator -- and
+rescans the digits.
+
+Then the object model, which the profile pointed at once the scanning was
+cheap. Writing:
+
+- **An object's keys are read as atoms, not as strings.** `stringify` built
+  a JavaScript array of key strings per object and then looked each property
+  back up by string, which hashes it into an atom again. An ordinary object
+  with no replacer list now walks its own atoms, reads by atom, and takes the
+  key string from the atom rather than building one. When its keys are all
+  ordinary strings they come straight out of its shape into a stack array --
+  no allocation per object at all -- and, while the shape has not changed,
+  each value is read from the slot recorded then rather than looked up.
+- **Integers, booleans and null go in as bytes.** Each used to be handed to
+  `JS_ToString`, which allocates a string to copy in and free. A JSON
+  document is mostly those three.
+- **`toJSON` is looked for once per shape.** Every object was searched for
+  the method, walking its prototype chain to find nothing. The last shape
+  with none is remembered against the runtime's property-location generation
+  -- the stamp the inline caches already keep. The memo is only taken when
+  nothing on the chain is exotic and nothing on it has a `toJSON` property at
+  all: a Proxy answers from its own trap and they all share one shape, and a
+  shape records which properties exist, not what they hold.
+- **The circular-reference check left the JavaScript heap.** The path from
+  the root was a JavaScript array, so every object cost an `Array#includes`,
+  a push and a pop through the generic property machinery. It is a small
+  array of object pointers now.
+- **Nothing is written for a separator that is empty**, which is both of them
+  whenever `JSON.stringify` is called without a gap.
+
+Reading:
+
+- **A property goes straight into the object being built.** The parser owns
+  the object it is filling and nothing else can see it, so a key that is not
+  already there is added directly instead of going through the descriptor
+  machinery. A repeated key -- legal, last one wins -- is the only case that
+  finds an existing slot.
+- **An array element is appended, not defined.** The array is the parser's
+  own fresh fast array; appending to it skips the indexed-property path,
+  which has to assume the target could be anything.
+- **The last few property names are remembered.** Every object in a document
+  of records repeats the same keys, and each one was hashed into the atom
+  table again.
+
+On the Mac the round trip went 165.4 -> 47.4 ms against Node's 28.5 and
+Bun's 23.1. Per operation, against Node:
+
+| | this runtime | Node |
+|---|---|---|
+| parse a 1MB document | 2.29 -> 1.22 ms | 1.05 |
+| write it | 7.01 -> 1.23 ms | 0.60 |
+| parse 30000 small objects | 8.56 -> 4.44 ms | 2.36 |
+| write them | 10.6 -> 3.69 ms | 0.95 |
+| parse one long string | 0.94 -> 0.19 ms | 0.32 |
+| write one long string | 2.52 -> 0.08 ms | 0.13 |
+
+Both string rows are now ahead of Node; the rest is within 1.2x on parsing a
+document of mixed content and about 2x on writing one.
+
+Numbers were the other half, and are no longer. Turning a double into its
+shortest round-tripping decimal was an exact big-integer search; `dtoa.c` now
+takes Grisu3 (Loitsch, PLDI 2010) first, which computes the digits with
+64-bit arithmetic and a table of cached powers of ten and then *proves* its
+result is the unique shortest form, declining when it cannot. Every decline,
+and every other radix, format and exponent mode, still runs the exact
+algorithm. Stringifying 120000 random doubles: 22.8 -> 13.9 ms per pass. It
+is checked by a differential test against Node over millions of values --
+random bit patterns, every integer from -1e6 to 1e6, powers of ten,
+subnormals, the signed zeroes, infinities, NaN, and ULP windows around 1e21
+and 2^53 -- with no divergence.
+
+What is left is writing object-heavy documents, still around 4x Node and
+spread across the remaining per-property work with no peak worth naming.
+
+Two of these went in wrong the first time and were caught by review before
+they shipped: the `toJSON` memo carried one Proxy's answer to the next, and
+re-checking enumerability per property let a getter change what was written
+after the key list had been taken. `tests/fixtures/json_edges.mjs` covers
+both, and `json_fuzz.mjs` walks 4000 seeded-random documents through parse
+and stringify and hashes every string produced -- the expected hash is
+Node's, so a byte of divergence anywhere fails the build.
+
+None of it is the parser's structure, which is why a faster external parser
+is not the answer. A DOM parser would replace the part that is now cheap and
+still leave every JavaScript object to be built one property at a time, with
+a second representation to copy out of on the way.
 
 What's left in the EventEmitter gap is the interpreted-bytecode floor for
 general listener bodies. The benchmark's numeric accumulator takes a native
 fast path and now a fused call site as well, but arbitrary listeners still
 require an interpreter frame. A JIT is the usual way to remove that frame,
-and it's ruled out here; closing the gap some other way is open, and hasn't
-been attempted yet.
+and it's ruled out here; closing the gap some other way is open, and the
+declared-signature inlining below is the first thing that has removed one.
+
+## Startup
+
+The Node layer used to register all forty-four `node:` modules at startup --
+a `JSModuleDef` and an atom per export name each -- and to construct every
+module object, whatever the program went on to import. Both now happen when
+something asks: the loader registers a module on the specifier it was handed,
+and the seventeen builtins past the original twenty build their objects on
+first use. Cold start on the Mac, minimum of 150 interleaved launches:
+7.15 -> 6.97 ms.
+
+What is left above the 6.83 ms this measured before the Minimum Common API
+work is `src/bootstrap.js`: `URLPattern`, the compression streams, the stream
+controller classes and the three event-handler properties are built eagerly,
+because a page-shaped global has to be there before the program's first line
+runs. Deferring the node_compat half was worth about 0.2 ms; deferring this
+half would mean a getter per global, and the globals are the surface.
+
+Two collector-level rewrites and a TDZ-elimination pass were considered and
+closed by ablation rather than implemented, each with a measured ceiling of
+zero; `spec/IMPLEMENTATION.md` records the method and the numbers. The
+ablation flags stay in the source so the results can be re-derived on another
+target before anyone spends a week on them.
+
+## The declared types buy something, and it is the call frame
+
+Every annotation used to be stripped, so `safe` was the only fact reaching
+codegen and it did not carry which type had been written. Recording the type
+instead let the same specialization be aimed properly, and let a second one
+exist at all. Measured on the Mac, minimum of 9 runs over 5M iterations,
+reported per loop iteration:
+
+| | sxn | Node 25.2 | Bun 1.2.17 |
+|---|---|---|---|
+| empty loop | 4.0 ns | 0.27 | 0.23 |
+| interpreted call, 0 args | 14.4 ns | -- | -- |
+| interpreted call, 2 args | 16.3 ns | 0.37 | 0.22 |
+| field read + write | 11.9 ns | 0.27 | 0.22 |
+| f64 accumulate | 5.9 ns | 0.53 | 0.54 |
+
+Read that the way this document reads every JIT row: Node and Bun delete these
+loops outright, so no interpreter change reaches 0.3 ns. What the table
+locates is where this runtime's own time goes. A call costs about 10.4 ns
+before an argument is passed and 1.7 ns per argument after; a field access is
+2.6 ns; arithmetic is already within 2 ns of the dispatch floor. Typed and
+untyped field access measured 11.76 and 11.67 ns, the same number, which is
+what "the annotations bought nothing" meant concretely.
+
+Hand-inlining a small typed function gave the exact upper bound for removing
+the frame -- 17.1 ns to 5.4 for a two-argument `i32` add -- and unlike the
+ablations below, that bound was not zero. A call whose callee is a local
+written once by an `fclosure`, never captured, with every parameter and the
+return declared scalar, and whose body loads each parameter once in order and
+then runs only operand-free arithmetic, is now spliced into its caller at the
+pass-2 peephole. `benchmarks/engine/call_inline_probe.sx`:
+
+| | ns/op |
+|---|---|
+| empty loop | 4.07 |
+| untyped call | 16.34 |
+| typed call, inlined | 5.31 |
+| hand-inlined ceiling | 5.38 |
+
+16.34 to 5.31 ns, 3.1x, landing on the ceiling. Against Node's 0.37 ns that is
+a 44x gap narrowed to 14x, and it should be quoted that way. It needs no
+opcode, which matters because the opcode space is full -- the template-literal
+`concat` op above took the last slot. Plain JavaScript never qualifies: the
+gate is the declared signature, so a `.js` file is untouched.
+
+Two limits are worth stating rather than discovering. The splice needs the
+body to load every parameter once in declaration order, so anything reusing a
+parameter still pays for its frame. And an inlined callee no longer appears in
+a stack trace if its arithmetic throws, which is the tradeoff every inlining
+compiler makes.
+
+## An idle process never collected
+
+Not a speed result but a memory one, and the counterpart to the zero ceilings
+below: the collector's cadence was worth far more than its mechanism.
+
+Nothing in `src/` called `JS_RunGC`. Collection happened only inside
+`js_trigger_gc`, when an allocation crossed a threshold that is then set to
+1.5x whatever was live. A burst of 200,000 cyclic objects, held while built
+and then dropped, left 229 MB that 96 MB of subsequent churn did not collect
+once -- the collection at the peak had raised the bar above what leaked, and
+the bigger the garbage the higher the bar.
+
+The event loop now sweeps when it has been blocked waiting, is holding more
+than 32 MB, and has not swept in half a second, and resets the threshold
+afterwards. A burst-then-idle daemon reclaims 171 MB across one loop turn with
+nothing calling anything; `Sxn.gc()` is the explicit ask. A server under
+sustained load takes no sweep at all -- 4,000 requests, zero collections, the
+same wall time with the feature on and off -- because `uv_run` never blocks
+long enough. The rows above are unmoved, worst pause included.
+
+`benchmarks/engine/gc_idle_probe.sx` re-derives it, and reports RSS beside the
+allocator's own accounting because the two diverge: after a sweep took tracked
+bytes from 164 MB to 0.7, RSS moved only 199.8 to 196.8 MB. The system
+allocator kept the pages. Assert on `mallocSize`; read `rss`.
 
 Two collector-level rewrites and a TDZ-elimination pass were considered and
 closed by ablation rather than implemented, each with a measured ceiling of

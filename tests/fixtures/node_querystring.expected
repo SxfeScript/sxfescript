@@ -1,0 +1,33 @@
+"a=1&b=2" -> {"a":"1","b":"2"}
+"a=1&a=2&a=3" -> {"a":["1","2","3"]}
+"a" -> {"a":""}
+"a=" -> {"a":""}
+"=b" -> {"":"b"}
+"" -> {}
+"a=1&&b=2" -> {"a":"1","b":"2"}
+"&&" -> {}
+"name=a+b" -> {"name":"a b"}
+"city=S%C3%A3o+Paulo" -> {"city":"São Paulo"}
+"bad=%zz" -> {"bad":"%zz"}
+"half=%" -> {"half":"%"}
+"p=%2Fslash" -> {"p":"/slash"}
+"x=1;y=2" -> {"x":"1;y=2"}
+"k%5B%5D=1&k%5B%5D=2" -> {"k[]":["1","2"]}
+"utf=%F0%9F%8E%89" -> {"utf":"🎉"}
+"eq=a=b" -> {"eq":"a=b"}
+"sp=a%20b" -> {"sp":"a b"}
+"plus=a%2Bb" -> {"plus":"a+b"}
+"empty=&next=1" -> {"empty":"","next":"1"}
+"dup=1&dup=2&other=3" -> {"dup":["1","2"],"other":"3"}
+custom sep -> {"a":"1","b":"2"}
+maxKeys 2  -> {"a":"1","b":"2"}
+stringify {"a":1,"b":"two"} -> "a=1&b=two"
+stringify {"a":["1","2"]} -> "a=1&a=2"
+stringify {"a b":"c d"} -> "a%20b=c%20d"
+stringify {"e":""} -> "e="
+stringify {"n":null,"t":true,"f":false,"num":4.5} -> "n=&u=&t=true&f=false&num=4.5"
+stringify {"é":"🎉"} -> "%C3%A9=%F0%9F%8E%89"
+stringify {} -> ""
+stringify custom -> "a:1|b:2"
+escape   -> a%20b%2Fc%3Fd%3De%26f%2Bg'()!~*.
+unescape -> a b/c?d

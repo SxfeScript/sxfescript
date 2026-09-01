@@ -1,8 +1,8 @@
 # The runtime surface
 
-This is what `sxn` gives you independent of Node compatibility: the WinterCG
-web APIs (45 of 55 names in the common surface), the `Sxn` host namespace, and
-the engine capabilities that go with it. `spec/NODE.md` is the other half —
+This is what `sxn` gives you independent of Node compatibility: the WinterTC
+web APIs (every name in the Minimum Common API except WebAssembly's), the
+`Sxn` host namespace, and the engine capabilities that go with it. `spec/NODE.md` is the other half —
 what runs because it imitates Node.
 The split matters because only this half travels when the engine is embedded
 elsewhere (`spec/NATIVE.md` explains why for the native-code case
@@ -17,10 +17,13 @@ same surface those runtimes implement.
 
 `sxn file.sx` runs an SxfeScript file — ordinary JavaScript plus explicit
 mutation, affine values, and borrow sigils, parsed natively with no separate
-transform step (`spec/LANGUAGE.md`). `sxn file.ts` strips TypeScript types and
-runs the result, also natively, with no build step. `sxn file.js` / `.mjs` /
-`.cjs` run plain JavaScript. All four import each other freely: a `.sx`
-module can `import` a `.ts` module and vice versa.
+transform step (`spec/LANGUAGE.md`). `sxn file.ts` parses TypeScript types
+natively and runs the result, also with no build step; no code is emitted for
+an annotation, but a declared scalar type is recorded rather than discarded
+and spent on the bytecode that comes out (`spec/LANGUAGE.md`,
+`spec/PERFORMANCE.md`). `sxn file.js` / `.mjs` / `.cjs` run plain JavaScript.
+All four import each other freely: a `.sx` module can `import` a `.ts` module
+and vice versa.
 
 Module-or-script is decided the way Node decides it — see spec/NODE.md — with
 one exception: `.sx` and `.ts` are always modules, because type stripping is
@@ -63,18 +66,49 @@ the shape the native layer speaks and `node:http` is built on directly.
 Response headers are emitted in declaration order; an array value repeats the
 header (the multi-`Set-Cookie` case), and `Content-Length`/`Connection` are
 filtered since those describe the framing rather than the payload the handler
-wrote. The returned handle reports `port`, `url`, and a `stop()` that lets a
-process serve and then do something else, rather than block forever the way a
-bare listener would.
+wrote. `options` takes `port`, `hostname` (or `host`, Node's name for it; loopback
+by default, `"0.0.0.0"` to accept from the network, an IPv6 literal or
+`"localhost"` also work), and `reusePort`. With `reusePort: true` several
+processes bind the same port and the kernel spreads connections across them,
+which is how one program uses more than one core here -- there are no threads
+and no cluster module. The kernels that distribute this way are Linux, the
+BSDs, Solaris and AIX; on macOS the call fails with a message saying so
+rather than quietly giving the last process every connection.
+
+The returned handle reports `port`, `hostname`, `url`, and a `stop()` that
+lets a process serve and then do something else, rather than block forever
+the way a bare listener would; `stop()` closes the connections still open as
+well as the listener. Connections are kept alive by default, as HTTP/1.1 requires,
+and a request pipelined behind another is answered without waiting for a
+further read. A request larger than 64MB is refused rather than buffered.
 
 ## Web Streams
 
-`ReadableStream`, `WritableStream`, `TransformStream`, and both queuing
-strategies, plus `TextEncoderStream`/`TextDecoderStream` built on them. A
-fetch response body is a real `ReadableStream`, not a stand-in, so
-`pipeThrough`, `pipeTo`, and `for await` all work on one. Not yet
-implemented: `CompressionStream`/`DecompressionStream` (`node:zlib` covers
-the same ground synchronously — see spec/NODE.md) and the BYOB reader.
+`ReadableStream`, `WritableStream`, `TransformStream`, both queuing
+strategies, and each of the controller and reader classes the spec names, so
+`instanceof` answers the way it does elsewhere. `TextEncoderStream`/
+`TextDecoderStream` are built on them. A fetch response body is a real
+`ReadableStream`, not a stand-in, so `pipeThrough`, `pipeTo`, and `for await`
+all work on one.
+
+A BYOB reader (`getReader({ mode: "byob" })`) fills the view you hand it and
+keeps whatever did not fit for the next read. What it does not do is let the
+*source* write into your buffer: `byobRequest` is always null, so a source
+written to only ever fill a `byobRequest` finds nothing to fill. Reading is
+still a copy, one chunk at a time; what BYOB buys here is the calling shape,
+not zero-copy.
+
+`CompressionStream`/`DecompressionStream` handle `gzip`, `deflate` and
+`deflate-raw`, over the same zlib `node:zlib` uses, with one stream kept per
+object so chunks compress as a single stream rather than one per chunk.
+
+## URLPattern
+
+`new URLPattern({ pathname: "/books/:id" })`, `test`, and `exec` with named
+groups. Each URL component is compiled separately: `:name` captures up to the
+component's own separator (`/` in a path, `.` in a hostname), `(...)` is a
+regular expression written in place, `*` is anything, and `{...}?` makes what
+it wraps optional. A component you leave out matches anything.
 
 ## Crypto
 
@@ -91,10 +125,27 @@ of the same digests; see spec/NODE.md.
 `clearX` counterparts, `performance.now` (bound directly to its C primitive,
 not wrapped — see the README benchmarks for why that matters).
 
-Not implemented: `URLPattern`, `BroadcastChannel`, `Worker`, `WebSocket` as an
-*outbound client* (the server side — upgrading an incoming connection to a
-WebSocket from a `Sxn.serve` handler — works), `ErrorEvent`,
-`PromiseRejectionEvent`, and `Intl`.
+`console.log`/`info`/`debug` write to stdout and `console.error`/`warn` to
+stderr, which is also what `process.stderr` is built on.
+
+`ErrorEvent` and `PromiseRejectionEvent` exist, and so do the three handlers
+that carry them.
+
+## Errors that reach the top
+
+The global object is an event target: `addEventListener("error", ...)` and
+`onerror` both see an exception nothing caught, and either can keep it from
+being printed — a listener by calling `preventDefault()`, `onerror` by
+returning true. `reportError(e)` reports one without throwing it.
+
+A promise rejection nothing handled is reported once every job that could
+still have handled it has run, as an `unhandledrejection` event; if something
+handles it later, `rejectionhandled` follows. With no handler registered,
+nothing changes: an unhandled rejection is as quiet as it was before.
+
+Not implemented: `BroadcastChannel`, `Worker`, `WebSocket` as an *outbound
+client* (the server side — upgrading an incoming connection to a WebSocket
+from a `Sxn.serve` handler — works), and `Intl`.
 
 ## `Sxn.ffi` — calling a C function
 
@@ -113,7 +164,27 @@ that belongs to the engine rather than to Node compatibility.
 `Sxn.file(path)` and `Sxn.write(path, data)` for file I/O in the Bun-style
 idiom; `Sxn.memoryUsage()`; `Sxn.version`.
 
+`Sxn.memoryUsage()` reports the engine allocator's accounting -- `mallocSize`,
+`objects`, `gcCount` and the GC timings -- plus `rss`, which is what the
+operating system says the process holds. The two move independently: the
+system allocator may keep freed pages rather than return them, so `rss` can
+stay high after a collection that reclaimed everything. Assert on
+`mallocSize`; read `rss`.
+
+`Sxn.gc()` collects reference cycles and returns the tracked size left behind.
+Refcounting frees everything else the moment its last reference goes, but a
+cycle -- an object that points at itself, a closure the object it captures
+also holds -- needs the collector, and the collector otherwise runs only when
+an allocation crosses a threshold. A process that stops allocating stops
+collecting, which is why a server is also swept while its event loop is idle;
+see `spec/CLI.md` for `--no-idle-gc` and `--idle-gc-floor`.
+
 ## What's deliberately not here
+
+WebAssembly. It is the one part of the Minimum Common API this runtime does
+not have, and it is not a small gap to close: QuickJS has no WebAssembly
+engine, so `WebAssembly` is undefined rather than a stub that throws, which
+lets feature detection do the right thing.
 
 Anything that only makes sense with a machine-code tier — a JIT, or
 `process.dlopen`/`.node` addons — lives in the Node-compatibility layer

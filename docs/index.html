@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SxfeScript</title>
-<meta name="description" content="SxfeScript: explicit ownership and real runtime safety on top of ordinary JavaScript, running on ArcSX, a QuickJS-based runtime built to run the same on a phone as it does on a server.">
+<meta name="description" content="sxn is a JavaScript runtime that starts in 8.4 ms and has no JIT to warm up. It runs .js, .ts and .sx directly, loads node_modules, and serves HTTP. SxfeScript adds ownership and borrows on top.">
 <link rel="icon" type="image/png" href="logo.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -128,6 +128,8 @@
     font-family: "JetBrains Mono", monospace; font-size: 11px; font-weight: 600; letter-spacing: .02em;
     color: var(--accent); background: var(--accent-wash); border-radius: 5px; padding: 2px 7px;
   }
+  a.badge { text-decoration: none; }
+  a.badge:hover { background: color-mix(in srgb, var(--accent) 22%, var(--accent-wash)); }
 
   /* comparison table */
   .scroll { overflow-x: auto; border: 1px solid var(--rule); border-radius: 8px; background: var(--card); }
@@ -165,6 +167,7 @@
     <ul>
       <li><a class="navlink" href="docs/">Docs</a></li>
       <li><a class="navlink" href="#code">Code</a></li>
+      <li><a class="navlink" href="#benchmarks">Benchmarks</a></li>
       <li><a class="navlink" href="#vs-typescript">vs TypeScript</a></li>
       <li><a class="navlink" href="#arcsx">ArcSX runtime</a></li>
       <li><a class="navlink" href="#contributing">Contributing</a></li>
@@ -177,19 +180,22 @@
   <header class="hero" id="top">
     <div class="hero-grid">
       <div>
-        <p class="kicker">SxfeScript &middot; runs on ArcSX</p>
-        <h1 class="title">Ownership and borrows, on top of ordinary JavaScript.</h1>
+        <p class="kicker">sxn &middot; the ArcSX runtime &middot; SxfeScript</p>
+        <h1 class="title">A JavaScript runtime that starts fast and stays even.</h1>
         <p class="lede">
-          SxfeScript is JavaScript with an explicit <span class="kw-safe">safe</span> and
-          <span class="kw-unsafe">unsafe</span> boundary, affine values, and lexical borrows,
-          parsed natively, with no build step, and run by <strong>ArcSX</strong>, a
-          QuickJS-based runtime built to run the same on a phone as it does on a server.
+          <code>sxn</code> runs your <code>.js</code>, <code>.ts</code> and <code>.sx</code>
+          files with no build step, loads <code>node_modules</code>, and serves HTTP.
+          It cold-starts in 8.4&nbsp;ms against Node's 41.6, and its worst
+          garbage-collection pause is 0.04&nbsp;ms against Node's 0.36 and Bun's 2.59
+          &mdash; because there is no JIT to warm up. That is deliberate: iOS will not
+          let a third-party app generate machine code, so this one is built to be fast
+          without it.
         </p>
         <div class="cta-row">
-          <a class="btn btn-primary" href="docs/">Read the docs</a>
+          <a class="btn btn-primary" href="docs/quickstart/">Get started</a>
+          <a class="btn btn-ghost" href="docs/why/">Why sxn</a>
+          <a class="btn btn-ghost" href="#benchmarks">Benchmarks</a>
           <a class="btn btn-ghost" href="{{REPO_URL}}">View the source</a>
-          <a class="btn btn-ghost" href="docs/quickstart/">Quick start</a>
-          <a class="btn btn-ghost" href="#contributing">Contribute</a>
         </div>
         <div class="install-tabs" role="tablist" aria-label="Install command">
           <button type="button" class="install-tab active" role="tab" aria-selected="true" data-os="unix">macOS / Linux</button>
@@ -217,9 +223,9 @@ function withdraw(acct: Account, n: number) {
         <div>
           <p class="compare-label">SxfeScript: checked, then run</p>
           <!-- highlight: sx -->
-function withdraw(&mut acct: Account, n: i32) {
-  // acct is a live, exclusive borrow --
-  // checked at parse time, not hoped for.
+function withdraw(acct: &mut Account, n: i32) {
+  // acct is an exclusive borrow, and the
+  // caller must own it as `let mut`.
   acct.balance -= n;
 }
           <!-- /highlight -->
@@ -227,6 +233,46 @@ function withdraw(&mut acct: Account, n: i32) {
       </div>
     </div>
   </header>
+
+  <section id="benchmarks" class="band">
+    <h2 class="h">sxn vs Node vs Bun</h2>
+    <p class="lede-s">
+      Matched workloads, same tree, same tests, on an Apple M4. Lower is better in
+      every row. <strong>No category is hidden</strong> &mdash; sxn takes seven of the
+      eight and the eighth is Node's, which is the one row where the gap is
+      architectural rather than incidental.
+    </p>
+    <!-- section: README.md#mac-apple-m4 table -->
+    <p style="margin-top:22px; color:var(--ink-mid); font-size:14.5px; max-width:66ch;">
+      A second machine, a Ryzen 7 5700G running Ubuntu, agrees row for row. Both
+      machines' specs, how each row is measured, and the harness you can run yourself
+      are on the <a href="docs/benchmarks/">benchmarks page</a>.
+    </p>
+
+    <h3 style="margin-top:44px;">What you get in the box</h3>
+    <div class="scroll">
+      <table>
+        <thead><tr><th></th><th>sxn</th><th>Node</th><th>Bun</th></tr></thead>
+        <tbody>
+          <tr><td>Run <code>.ts</code> with no build step</td><td class="yes">Directly</td><td class="no">Type stripping only</td><td class="yes">Directly</td></tr>
+          <tr><td>Ownership and borrows in the language</td><td class="yes">Yes</td><td class="no">Not modeled</td><td class="no">Not modeled</td></tr>
+          <tr><td>Standard library</td><td class="yes quiet"><a href="docs/node/">Superset&nbsp;&#8599;</a></td><td class="yes">The reference</td><td class="yes quiet">Most of it</td></tr>
+          <tr><td><code>.node</code> native addons</td><td class="yes"><a href="docs/native/">120 Node-API entry points&nbsp;&#8599;</a></td><td class="yes">Yes</td><td class="yes quiet">Partial</td></tr>
+          <tr><td>WinterTC Minimum Common API</td><td class="yes">62 of 62, less WebAssembly</td><td class="yes quiet">Partial</td><td class="yes quiet">Most</td></tr>
+          <tr><td>Call a C function without an addon</td><td class="yes"><code>Sxn.ffi</code></td><td class="no">Needs an addon</td><td class="yes"><code>bun:ffi</code></td></tr>
+          <tr><td>Precompile to skip parsing</td><td class="yes"><code>.sxbc</code>, still needs <code>sxn</code> installed</td><td class="no">No</td><td class="no">No</td></tr>
+          <tr><td>Standalone binary, no runtime to install</td><td class="no">No</td><td class="yes quiet">Experimental (SEA)</td><td class="yes"><code>bun build --compile</code></td></tr>
+          <tr><td>JIT</td><td class="no">None, deliberately</td><td class="yes">Yes</td><td class="yes">Yes</td></tr>
+          <tr><td>Runs on iOS</td><td class="yes">Yes</td><td class="no">No</td><td class="no">No</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="margin-top:22px; color:var(--ink-mid); font-size:14.5px; max-width:66ch;">
+      And when to pick something else: a hot numeric loop a JIT can compile away, the
+      widest possible package compatibility, or a bundler and test runner in the same
+      binary. <a href="docs/why/">Why sxn</a> is honest about all three.
+    </p>
+  </section>
 
   <section id="code">
     <h2 class="h">What it looks like</h2>
@@ -298,8 +344,12 @@ sqrt(144)  = 12</code></pre>
         <p><code>let mut</code> creates a mutable owner, <code>let</code> an immutable one.
         <code>&amp;value</code> borrows it shared; <code>&amp;mut value</code> borrows it
         exclusively and requires a mutable owner. A borrow can't be returned, stored somewhere
-        longer-lived, or carried across an <code>await</code>. Each rule is checked before the
-        code runs, not documented and hoped for.</p>
+        longer-lived, or carried across an <code>await</code>.</p>
+        <p>The exclusive-borrow rule is checked before the code runs: <code>&amp;mut</code> on
+        an immutable binding is a compile error, not a runtime surprise. The rest of the model
+        is parsed today and checked by the control-flow pass that is still being written &mdash;
+        <a href="docs/implementation/">the ledger</a> says which is which, and it is worth
+        reading before relying on a rule.</p>
       </div>
       <div class="card">
         <h3>The <span class="kw-safe">safe</span> / <span class="kw-unsafe">unsafe</span> boundary</h3>
@@ -311,8 +361,10 @@ sqrt(144)  = 12</code></pre>
       <div class="card">
         <h3>Erasable TypeScript annotations</h3>
         <p>Type aliases, interfaces, <code>declare</code>, generics on functions, optional
-        parameters, <code>as</code>/<code>satisfies</code>, union types: all of it parsed and
-        stripped natively, no <code>tsc</code>, no bundler, no separate compile step.</p>
+        parameters, <code>as</code>/<code>satisfies</code>, union types: all of it parsed
+        natively, no <code>tsc</code>, no bundler, no separate compile step. They emit no code
+        &mdash; but a declared scalar type is remembered rather than discarded, and spent on
+        the bytecode that comes out.</p>
       </div>
       <div class="card">
         <h3>Fixed-layout structs</h3>
@@ -340,17 +392,17 @@ sqrt(144)  = 12</code></pre>
           <tr>
             <td>What happens to the types at runtime?</td>
             <td class="no">Erased entirely: a type is a compile-time fiction</td>
-            <td class="yes"><code>safe</code> bindings keep a runtime descriptor; incompatible writes are rejected, not silently accepted</td>
+            <td class="yes"><code>safe</code> bindings keep a runtime descriptor and incompatible writes are rejected. The declared type reaches codegen too: <code>i32</code> arithmetic wraps by definition, and a small function with a scalar signature is inlined into its caller</td>
           </tr>
           <tr>
             <td>Do you need a build step to run a file?</td>
             <td class="no"><code>tsc</code>, or a bundler standing in for it</td>
-            <td class="yes">No. <code>sxn app.ts</code> strips and runs it directly</td>
+            <td class="yes">No. <code>sxn app.ts</code> parses the types and runs it directly &mdash; declared ones are compiled, not discarded</td>
           </tr>
           <tr>
             <td>Aliasing and mutation</td>
             <td class="no">Not modeled at all</td>
-            <td class="yes">Explicit: an owner, a shared borrow, or an exclusive borrow, one at a time, checked</td>
+            <td class="yes">Explicit: an owner, a shared borrow, or an exclusive borrow, one at a time. The exclusive borrow is checked at compile time today; the rest is parsed and waiting on the control-flow pass</td>
           </tr>
           <tr>
             <td>Calling into native code</td>
@@ -380,7 +432,7 @@ sqrt(144)  = 12</code></pre>
       ArcSX is a QuickJS-ng fork, built as <code>sxn</code>. It runs <code>.sx</code>,
       <code>.ts</code>, and ordinary <code>.js</code>/<code>.mjs</code>/<code>.cjs</code>
       directly, with two compatibility layers built on top of the same engine core: one for the
-      browser-shaped WinterCG web APIs, one for Node.
+      browser-shaped WinterTC web APIs, one for Node.
     </p>
 
     <p style="color:var(--ink-mid); font-size:14.5px; max-width:68ch; margin-bottom:12px;">
@@ -394,50 +446,58 @@ sqrt(144)  = 12</code></pre>
         <tbody>
           <tr>
             <td>Starting a new process</td>
-            <td class="num yes">8.4 ms</td><td class="num">41.6 ms</td><td class="num">9.2 ms</td>
+            <td class="num yes">7.5 ms</td><td class="num">42.5 ms</td><td class="num">9.4 ms</td>
             <td>About 5x faster than Node to start, and a hair ahead of Bun. Matters for a CLI tool or a serverless cold start</td>
           </tr>
           <tr>
             <td>Processing binary data (<code>Buffer</code>)</td>
-            <td class="num yes">19.2 ms</td><td class="num">23.8 ms</td><td class="num">27.6 ms</td>
+            <td class="num yes">19.4 ms</td><td class="num">24.5 ms</td><td class="num">27.1 ms</td>
             <td>Faster than both, at the operation almost every server-side script does constantly</td>
           </tr>
           <tr>
             <td>Encoding text (<code>TextEncoder</code>)</td>
-            <td class="num yes">4.7 ms</td><td class="num">38.9 ms</td><td class="num">6.3 ms</td>
+            <td class="num yes">4.7 ms</td><td class="num">39.8 ms</td><td class="num">6.2 ms</td>
             <td>8x faster than Node, ahead of Bun too</td>
           </tr>
           <tr>
             <td>Worst single GC-style pause</td>
-            <td class="num yes">0.04 ms</td><td class="num">0.36 ms</td><td class="num">2.59 ms</td>
+            <td class="num yes">0.01 ms</td><td class="num">0.28 ms</td><td class="num">3.13 ms</td>
             <td>No JIT means no warm-up stalls. The most predictable of the three, which is what a real-time or low-latency workload actually needs</td>
           </tr>
           <tr>
             <td>Firing many event listeners</td>
-            <td class="num">6.6 ms</td><td class="num yes">5.1 ms</td><td class="num">9.3 ms</td>
+            <td class="num">6.7 ms</td><td class="num yes">5.4 ms</td><td class="num">9.2 ms</td>
             <td>The one row Node wins, narrowly. Its JIT inlines the hot path in a way an interpreter structurally can't</td>
+          </tr>
+          <tr>
+            <td>A megabyte of JSON in and out</td>
+            <td class="num">48.0 ms</td><td class="num">29.3 ms</td><td class="num yes">24.8 ms</td>
+            <td>Bun's row, and Node is ahead too. Parsing is C in all three; what surrounds it is not</td>
           </tr>
         </tbody>
       </table>
     </div>
     <p style="color:var(--ink-soft); font-size:13px; margin: 10px 0 30px;">
-      All five rows, every runtime, same machine, same workload, run side by side by
-      <code>benchmarks/wintercg/run.sh</code> in the repo. Nothing here is cherry-picked
+      All six rows, every runtime, same machine, same workload, run side by side by
+      <code>benchmarks/wintertc/run.sh</code> in the repo. Nothing here is cherry-picked
       or estimated.
     </p>
 
     <div class="grid-2">
       <div class="card">
-        <h3>WinterCG surface <span class="badge">45 / 55</span></h3>
-        <p><code>fetch</code>, <code>Sxn.serve</code> (HTTP, SSE, WebSocket upgrade), Web
-        Streams, Web Crypto, <code>structuredClone</code>. This half travels wherever the
-        engine is embedded. It's not tied to Node emulation.</p>
+        <h3>WinterTC surface <span class="badge">62 / 62</span></h3>
+        <p>Every name in the Minimum Common API except WebAssembly:
+        <code>fetch</code>, <code>Sxn.serve</code> (HTTP, SSE, WebSocket upgrade), Web
+        Streams including BYOB reads and the compression streams,
+        <code>URLPattern</code>, Web Crypto, <code>structuredClone</code>. This half
+        travels wherever the engine is embedded. It's not tied to Node emulation.</p>
       </div>
       <div class="card">
-        <h3>Node compatibility <span class="badge">24 / ~37</span></h3>
-        <p>CommonJS, <code>node:</code> builtins, and <code>.node</code> native addons through
-        a from-scratch Node-API implementation, real enough that <code>next-swc</code>,
-        the Rust binary Next.js compiles JSX with, loads and runs under it.</p>
+        <h3>Node compatibility <a class="badge" href="docs/node/">superset&nbsp;&#8599;</a></h3>
+        <p>CommonJS, <code>node:</code> builtins, and <code>.node</code> native addons over
+        120 Node-API entry points &mdash; enough that <code>next-swc</code>, the 130&nbsp;MB
+        Rust binary Next.js compiles JSX with, loads and runs. Weak references and the
+        old V8 <code>NODE_MODULE</code> interface are the two things that are not there.</p>
       </div>
       <div class="card">
         <h3>Calling native code</h3>
@@ -451,6 +511,14 @@ sqrt(144)  = 12</code></pre>
         parsing entirely on later runs, measured 12% faster on a one-line script, 37%
         on a 618&nbsp;KB generated file. <code>--compile-cache</code> does the same thing
         automatically, on every launch. <a href="docs/bytecode/">spec/BYTECODE.md</a>.</p>
+      </div>
+      <div class="card">
+        <h3>Memory that comes back</h3>
+        <p>A long-running server can build up garbage its own allocator never gets a
+        chance to collect. This one sweeps it up while the server sits idle between
+        requests &mdash; 171&nbsp;MB reclaimed in one pass in testing, with no request
+        held up to do it. Call <code>Sxn.gc()</code> to sweep on demand, or pass
+        <code>--no-idle-gc</code> to turn the automatic sweep off.</p>
       </div>
     </div>
 
@@ -476,7 +544,7 @@ sqrt(144)  = 12</code></pre>
           <li>The shape and scope of <code>safe</code>/<code>unsafe</code></li>
           <li>Which TypeScript forms get real support next</li>
           <li>Ownership and borrow-checking rules and their error messages</li>
-          <li><code>node:</code> and WinterCG coverage priorities</li>
+          <li><code>node:</code> and WinterTC coverage priorities</li>
           <li>Naming, ergonomics, anything that reads as a mistake</li>
         </ul>
       </div>

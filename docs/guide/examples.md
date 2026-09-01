@@ -105,7 +105,7 @@ sxn examples/files.sx
 ```
 "written by the example\n"
 via node:fs -> "written by the example\n"
-sxn version: 0.0.1
+sxn version: 0.0.2
 ```
 
 ## Calling a C function

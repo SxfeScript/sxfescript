@@ -111,6 +111,35 @@
   }
   .doc-nav a.next { text-align: right; }
   .doc-source { margin-top: 26px; font-size: 13px; color: var(--ink-soft); }
+
+  /* ---- page menu: the same page as markdown, for a person or an agent ---- */
+  .page-menu { position: relative; display: flex; justify-content: flex-end; margin-bottom: -8px; }
+  .page-menu > button {
+    display: inline-flex; align-items: center; gap: 7px; font: inherit; font-size: 13px;
+    font-weight: 600; color: var(--ink-mid); background: var(--card);
+    border: 1px solid var(--rule); border-radius: 8px; padding: 6px 11px; cursor: pointer;
+  }
+  .page-menu > button:hover { border-color: color-mix(in srgb, var(--accent) 40%, var(--rule)); color: var(--ink); }
+  .page-menu > button::after {
+    content: ""; width: 13px; height: 13px; background: var(--ink-soft);
+    -webkit-mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>') center / contain no-repeat;
+    mask: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>') center / contain no-repeat;
+  }
+  .page-menu ul {
+    position: absolute; top: calc(100% + 6px); right: 0; z-index: 20; min-width: 232px;
+    margin: 0; padding: 5px; list-style: none; background: var(--card);
+    border: 1px solid var(--rule); border-radius: 10px;
+    box-shadow: 0 12px 30px -12px rgb(0 0 0 / .3);
+  }
+  .page-menu[hidden] ul, .page-menu ul[hidden] { display: none; }
+  .page-menu li a, .page-menu li button {
+    display: block; width: 100%; text-align: left; font: inherit; font-size: 13.5px;
+    color: var(--ink); text-decoration: none; background: none; border: 0; border-radius: 7px;
+    padding: 7px 10px; cursor: pointer;
+  }
+  .page-menu li a:hover, .page-menu li button:hover { background: var(--rule); }
+  .page-menu li span { display: block; font-size: 11.5px; color: var(--ink-soft); margin-top: 1px; }
+  .page-menu hr { border: 0; border-top: 1px solid var(--rule); margin: 5px 2px; }
 </style>
 </head>
 <body>
@@ -120,6 +149,7 @@
     <a class="wordmark" href="{{ROOT}}"><img src="{{ROOT}}logo.png" alt="" width="30" height="30"><span>Sxfe<span class="wm-accent">Script</span></span></a>
     <ul>
       <li><a class="navlink current" href="{{ROOT}}docs/">Docs</a></li>
+      <li><a class="navlink" href="{{ROOT}}#benchmarks">Benchmarks</a></li>
       <li><a class="navlink" href="{{ROOT}}#vs-typescript">vs TypeScript</a></li>
       <li><a class="navlink" href="{{ROOT}}#arcsx">ArcSX runtime</a></li>
       <li><a class="navlink" href="{{ROOT}}#contributing">Contributing</a></li>
@@ -134,6 +164,22 @@
 {{SIDEBAR}}
     </aside>
     <article class="doc">
+      <!-- Every page is also served as markdown at {{ROOT}}docs/{{SLUG}}.md.
+           These controls are the ways to get at it: onto a clipboard, in a
+           browser tab, or straight into an assistant with the URL as its
+           first instruction. -->
+      <div class="page-menu">
+        <button type="button" aria-expanded="false" aria-controls="page-menu-list">Get markdown</button>
+        <ul id="page-menu-list" hidden>
+          <li><button type="button" data-copy-md>Copy markdown<span>Onto your clipboard</span></button></li>
+          <li><a href="{{ROOT}}docs/{{SLUG}}.md">View as Markdown<span>The source this page is built from</span></a></li>
+          <hr>
+          <li><a data-ask="chatgpt" href="#" target="_blank" rel="noopener">Open in ChatGPT<span>With this page as context</span></a></li>
+          <li><a data-ask="claude" href="#" target="_blank" rel="noopener">Open in Claude<span>With this page as context</span></a></li>
+          <hr>
+          <li><a href="{{REPO_URL}}/blob/main/{{SOURCE}}">Edit this page on GitHub<span><code>{{SOURCE}}</code></span></a></li>
+        </ul>
+      </div>
 {{CONTENT}}
       <div class="doc-nav">
 {{PREVNEXT}}
@@ -173,6 +219,46 @@
         });
       });
       pre.appendChild(btn);
+    });
+  })();
+
+  /* The page menu. The assistant links are built here rather than in the
+     template because they need the page's absolute URL, which only the
+     browser knows -- a relative one is useless to something fetching it from
+     somewhere else. */
+  (function () {
+    var menu = document.querySelector(".page-menu");
+    if (!menu) return;
+    var toggle = menu.querySelector("button[aria-controls]");
+    var list = menu.querySelector("ul");
+    var mdUrl = new URL(menu.querySelector("a[href$='.md']").getAttribute("href"), location.href).href;
+    var ask = "Read " + mdUrl + " so I can ask you about it.";
+
+    menu.querySelector("[data-ask='chatgpt']").href =
+      "https://chatgpt.com/?hint=search&q=" + encodeURIComponent(ask);
+    menu.querySelector("[data-ask='claude']").href =
+      "https://claude.ai/new?q=" + encodeURIComponent(ask);
+
+    function close() { list.hidden = true; toggle.setAttribute("aria-expanded", "false"); }
+    toggle.addEventListener("click", function (e) {
+      e.stopPropagation();
+      list.hidden = !list.hidden;
+      toggle.setAttribute("aria-expanded", String(!list.hidden));
+    });
+    document.addEventListener("click", close);
+    document.addEventListener("keydown", function (e) { if (e.key === "Escape") close(); });
+
+    menu.querySelector("[data-copy-md]").addEventListener("click", function () {
+      var btn = this;
+      /* Fetch rather than scrape the rendered DOM: the .md is the source the
+         page was built from, which is what an assistant should be pasted. */
+      fetch(mdUrl).then(function (r) { return r.text(); }).then(function (text) {
+        return navigator.clipboard.writeText(text);
+      }).then(function () {
+        var was = btn.firstChild.nodeValue;
+        btn.firstChild.nodeValue = "Copied";
+        setTimeout(function () { btn.firstChild.nodeValue = was; close(); }, 1200);
+      }).catch(function () { location.href = mdUrl; });
     });
   })();
 </script>

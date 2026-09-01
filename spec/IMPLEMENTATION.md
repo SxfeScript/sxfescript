@@ -11,6 +11,53 @@
   separate transform step. The earlier in-memory text transformer
   (`sxfe_compile`, src/frontend.c) remains as an independently unit-tested
   component but is no longer on the execution path.
+- One ownership rule is enforced rather than erased: `&mut x` requires `x` to
+  be a `let mut` owner, and borrowing an immutable one is a parse error naming
+  SX2003 (`js_parse_unary`, third_party/quickjs/quickjs.c). The check rules
+  only on a bare identifier it can resolve in the current function's lexical
+  scope chain or in its top-level lexicals; a parameter, a captured outer
+  binding, or anything it cannot resolve is left alone rather than guessed at.
+  Guarded by the `sxn-reject-mut-borrow` ctest. Note that `&mut` is still
+  erased at runtime, so it aliases through JS object identity and cannot write
+  back to a caller's number -- that needs the ownership CFG below.
+- Declared types are recorded rather than discarded.
+  `js_parse_type_annotation` classifies while it skips, and the result is kept
+  on `JSVarDef.sx_type` -- which covers parameters too, since `fd->args` is a
+  `JSVarDef[]` and reaches the bytecode through the `vardefs` memcpy -- and as
+  `JSFunctionBytecode.sx_ret_type`. Only the scalar types codegen acts on are
+  named. A union, a generic, an inline object type, a borrow, a struct name,
+  `string` and `void` all report `SX_TYPE_OTHER`, so codegen never specializes
+  on a type it half-understood, and no enum value exists that nothing reads.
+  The type is deliberately not propagated to `JSGlobalVar` or `JSClosureVar`:
+  both were written and never read, and a `safe` module-level binding is kept
+  in `fd->vars` by `sx_safe_module_local` anyway. The skipping itself is
+  unchanged, which is what keeps arbitrary erasable TypeScript parsing.
+- `safe` specializes on the type that was written, not on the keyword. The i32
+  opcodes are gated on `is_safe && sx_type == SX_TYPE_I32`
+  (`sx_is_safe_i32`), so `safe let mut x: f64` and an un-annotated `safe let
+  mut` keep exact JavaScript arithmetic instead of reaching a wrapping integer
+  opcode and being rescued by its runtime tag test. This also settled an
+  inconsistency: a constant right-hand side and a local one compile through
+  different peephole branches, and `safe let mut n: i32` used to promote on
+  `n += 1` while wrapping on `n += step`. Both wrap now.
+  `tests/fixtures/typed_overflow.sx` covers all four combinations plus the
+  fused loop; `tests/fixtures/js_overflow.mjs` stays the plain-JS boundary.
+- Typed calls are inlined. A call whose callee is a local written exactly
+  once by an `fclosure`, never captured, with every parameter and the return
+  declared scalar, and whose body loads each parameter once in order and then
+  runs only operand-free arithmetic, is spliced into the caller at the pass-2
+  peephole (`sx_inline_typed_calls`). The measured effect is below. Plain
+  JavaScript never qualifies, because the gate is the declared signature.
+  `tests/fixtures/typed_inline.sx` asserts the splice changes nothing
+  observable -- values, coercions, exceptions, reassignment, capture, wrong
+  arity, use as a value -- with every expected value taken from Node.
+- Cycle sweeping when the event loop is quiet, plus `Sxn.gc()` and an `rss`
+  field on `Sxn.memoryUsage()`. Why it was needed, and what it is worth, is
+  below.
+- `EventEmitter` warns once per emitter and event when a listener count
+  crosses its limit, with Node's `MaxListenersExceededWarning` object and
+  wording, and `setMaxListeners`/`getMaxListeners` to raise or disable it.
+  `defaultMaxListeners` had been a constant nothing read.
 - Fixed-layout calculation and aligned growable/poisonable arena primitives.
 - Module-loader hook that transforms imported `.sx` modules in memory.
 - Package command surface with safe argument validation, disabled lifecycle
@@ -37,7 +84,7 @@
   generated header; `third_party/QUICKJS-PROVENANCE.md` has the lineage this
   is built on.
 
-## Performance shape (measured, benchmarks/wintercg/run.sh)
+## Performance shape (measured, benchmarks/wintertc/run.sh)
 
 - sxn wins seven of the eight README benchmark categories on both measured
   machines: startup, cold start, Buffer and TextEncoder throughput, both
@@ -127,6 +174,80 @@ ns, because the extra branch on every cache hit costs more than the walk it
 saves), and a single-way per-call-site inline cache (12% slower than shape
 keying on a four-shape call site).
 
+### The call frame is the one large removable cost, and types remove it
+
+Every ceiling above measured at roughly zero. This one did not. All figures
+are the minimum of 9 runs over 5M iterations, macOS arm64, Release, reported
+per loop iteration; subtract the empty loop to read the work itself.
+
+| | sxn | Node 25.2 | Bun 1.2.17 |
+|---|---|---|---|
+| empty loop | 4.0 ns | 0.27 | 0.23 |
+| interpreted call, 0 args | 14.4 ns | -- | -- |
+| interpreted call, 2 args | 16.3 ns | 0.37 | 0.22 |
+| interpreted call, 4 args | 21.3 ns | -- | -- |
+| field read + write | 11.9 ns | 0.27 | 0.22 |
+| f64 accumulate | 5.9 ns | 0.53 | 0.54 |
+
+Read those the way the ledger reads every JIT comparison: Node and Bun delete
+these loops outright, so no interpreter change reaches 0.3 ns. What the table
+locates is where *this* runtime's time goes. A call costs ~10.4 ns before an
+argument is passed and ~1.7 ns per argument after; a field access is ~2.6 ns;
+arithmetic is already within 2 ns of the dispatch floor and has nothing left
+in it. Annotations bought none of this before: typed and untyped field access
+measured 11.76 and 11.67 ns, the same number.
+
+Hand-inlining gave the exact upper bound for removing the frame:
+
+| | via call | hand-inlined | recovered |
+|---|---|---|---|
+| `add2(i, 1)`, both `i32` | 17.1 ns | 5.4 | 11.8, 3.2x |
+| `len2(v)`, an interface | 28.9 ns | 18.1 | 10.7, 1.6x |
+
+**A cheaper prologue is a negative result.** Before building one, the prologue
+was ablated: `-DSXN_ABLATE_CALL_PROLOGUE` removes the stack-overflow check and
+the GC-free section, the only two pieces a statically known callee could be
+proven not to need. Interleaved over three rounds the 0-argument call went
+14.39 -> 12.89 ns and both 2-argument rows landed inside noise. A 1.5 ns
+ceiling on the one shape that benefits does not justify branching
+`JS_CallInternal` on a signature, so it was closed rather than written. The
+rest of the prologue is not ablatable at all -- the `var_buf` fill, the
+`var_refs` fill and the realm switch change meaning rather than repeat known
+work, and a build without them crashes during bootstrap. The flag stays in
+the source so the result can be re-derived on another target.
+
+**Inlining is where the 11 ns was, and it needs no opcode.**
+`sx_inline_typed_calls` runs in the pass-2 peephole beside
+`fuse_i32_accum_loops` and splices the callee's body over the call, which
+matters because the opcode space is full (`static_assert(OP_COUNT == 256)`;
+`spec/PERFORMANCE.md` records the template-literal `concat` op taking the last
+slot). Measured with `benchmarks/engine/call_inline_probe.sx`:
+
+| | ns/op |
+|---|---|
+| empty loop | 4.07 |
+| untyped call | 16.34 |
+| typed call, inlined | 5.31 |
+| hand-inlined ceiling | 5.38 |
+
+16.34 -> 5.31 ns, 3.1x, landing on the hand-inlined ceiling. Against Node's
+0.37 ns for the same call that is a 44x gap narrowed to 14x -- narrowed, not
+closed, and the row should be quoted that way. Compile time did not move:
+20000 small functions still compile in 40 ms, and the pass early-outs on any
+function with no locals or no constant pool.
+
+The `benchmarks/wintertc` rows are unchanged by all of it (buffer 19.4 ms,
+textencoder 4.6, events 6.7, worst pause 0.04), which is expected: none of
+those workloads calls a small function with a declared scalar signature.
+
+Two limits worth stating rather than discovering later. The splice requires
+the body to load every parameter once in declaration order, so
+`(a, b) => a * b + c` and anything reusing a parameter (`v.x * v.x`) still
+pays for its frame; lifting that needs the arguments in caller temporaries,
+which means allocating locals after `resolve_variables`. And an inlined callee
+no longer appears in a stack trace if its arithmetic throws -- the same
+tradeoff every inlining compiler makes.
+
 ### A JIT is ruled out by platform, not by effort
 
 iOS does not grant W^X/JIT entitlements to third-party apps, so a
@@ -137,6 +258,86 @@ dispatch floor above is the floor of what's been tried, not a proof that
 nothing faster exists. Benchmarks against JIT runtimes should be read with
 that in mind: on JIT-bound microbenchmarks the comparison is against a
 technique this project won't use, not necessarily a result it can't reach.
+
+### An idle process never collected, and the leak protected itself
+
+This one is a correctness result rather than a speed one, and it is the
+counterpart to the two negative results below: the collector's *cadence*
+turned out to be worth far more than its *mechanism*.
+
+Before this change, nothing in `src/` ever called `JS_RunGC`. The only
+GC-related line in the whole project was `JS_SetGCThreshold(runtime, 8 MB)` in
+`src/main.c`. Collection happened solely inside `js_trigger_gc`, when an
+allocation would cross the threshold -- and that function then sets the next
+threshold to `malloc_size + (malloc_size >> 1)`, 1.5x whatever was live.
+
+Those two facts combine badly. Measured with `Sxn.memoryUsage()`, building
+200,000 objects that each hold `self` and a closure reaching back into them,
+holding the batch, then dropping it:
+
+| | tracked bytes | collections |
+|---|---|---|
+| start | 734,672 | 0 |
+| after the same burst built **acyclic** | 735,584 | 8 |
+| after the **cyclic** burst is dropped | 229,535,648 | 9 |
+| after 12 further rounds of ~8 MB churn | 246,984,720 | **9** |
+
+Peak RSS 251 MB. The last two rows are the finding: 96 MB of subsequent
+allocation and release produced *zero* collections. The collection at the peak
+correctly sized the threshold for a 229 MB live set; the burst then died, but
+nothing re-evaluates a threshold except another collection, and the later
+churn is freed by refcounting as it goes so the bar is never reached again.
+**The larger the cyclic garbage, the higher the bar for collecting it**, and
+each burst raises a floor that never comes down.
+
+Three things it is *not*, each checked rather than assumed. Acyclic garbage is
+freed immediately by refcounting (row two). Cycles under sustained load are
+collected fine -- 500,000 cyclic closures in a tight loop fired 708
+collections and finished at 743 KB against a 736 KB baseline, and a
+3,000-request `Sxn.serve` run creating a cycle per request stayed at 787 KB.
+And the connection and callback registries do not retain: `ConnState` is a C
+list unlinked on close and is deliberately passed through its promise
+continuations *as an integer* rather than a JS value, `SxnTimer` is unlinked
+in `sxn_timer_stop`, and the fetch, chunk-view and UDP states each hold their
+callbacks in a C struct with a matching finalizer. Only quiescence after a
+peak leaks.
+
+The fix is `sxn_maybe_idle_gc`, called from both loops in `src/network.c` --
+`sxn_run_event_loop` and `sxn_await_with_loop`, because a module with
+top-level await never reaches the first, and hooking only it left every
+`await` daemon uncollected. It sweeps when the previous `uv_run` blocked for
+20 ms or more, tracked size is above a 32 MB floor, and half a second has
+passed since the last sweep. It then resets the threshold, which is the
+load-bearing half: `JS_RunGC` reclaims without touching it, so a sweep that
+does not also reset leaves the ratchet in place for the next burst.
+
+The first attempt gated on tracked size not growing between turns and never
+fired at all -- any loop with a timer on it allocates a trickle every turn, so
+the size always crept up. Timing how long `uv_run` blocked is the direct
+measurement and is what shipped.
+
+Results. A burst-then-idle daemon now reclaims 171 MB across one loop turn
+with nothing calling anything (`tests/fixtures/leak_idle_sweep.mjs`), and
+`Sxn.gc()` takes 229.5 MB back to 735 KB explicitly. A server under sustained
+load takes *no* sweep at all -- 4,000 requests, zero collections, and the same
+wall time with the feature on and off -- because `uv_run` never blocks long
+enough to open the gate. The benchmark rows are unmoved: buffer 18.9 ms,
+textencoder 4.8, events 6.5, worst pause 0.04 ms, all matching the figures
+above and matching a `--no-idle-gc` run.
+
+`benchmarks/engine/gc_idle_probe.sx` re-derives the whole thing and reports
+RSS beside tracked bytes. Note the two diverge exactly as expected: after a
+sweep that took tracked bytes from 164 MB to 0.7 MB, RSS only moved 199.8 ->
+196.8 MB, because the system allocator kept the pages. That is why the
+fixtures assert on `mallocSize` and only report `rss`.
+
+Two items proposed alongside this were not built. Reworking the network
+registries onto `WeakRef` has nothing to attach to, per the audit above.
+Statically flagging non-escaping values to skip cycle-collector registration
+is the `-DSXN_ABLATE_GC_LIST` experiment below, whose exact upper bound is
+0-1 ns -- and unregistering a value that can still enter a cycle is how a
+collector frees something reachable, so the risk is not proportionate to a
+measured zero.
 
 ### The remaining collector rewrites are measured at ~zero ceiling
 
@@ -221,7 +422,7 @@ The remaining item is a generational nursery for object churn
 refcounting versus a nursery that reclaims dead young objects for free).
 On the nursery's cost, an earlier claim in this ledger was overstated and is
 corrected here. The 0.05 ms vs 2.62 ms worst-pause figure comes from
-`benchmarks/wintercg/pause.sx`, where every allocation dies immediately --
+`benchmarks/wintertc/pause.sx`, where every allocation dies immediately --
 the pattern that most flatters refcounting and most penalises a collector,
 which must still scavenge. Re-measured on `benchmarks/workload/
 pause_survivors.js`, which keeps 2000 objects live while churning 2M, the

@@ -3,8 +3,21 @@
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <openssl/rand.h>
+#include <openssl/hmac.h>
+#include <openssl/crypto.h>
 #include <curl/curl.h>
 #include <uv.h>
+/* UV_TCP_REUSEPORT arrived in libuv 1.49; older versions get the socket
+   option set by hand below. */
+#if UV_VERSION_MAJOR > 1 || (UV_VERSION_MAJOR == 1 && UV_VERSION_MINOR >= 49)
+#define SXN_UV_HAS_REUSEPORT 1
+#else
+#define SXN_UV_HAS_REUSEPORT 0
+#endif
+#ifndef _WIN32
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 #include "sxfe.h"
 #include "sxn_bootstrap.h"
 
@@ -131,12 +144,22 @@ static int sxn_strcasecmp(const char *a, const char *b) {
     return (unsigned char)*a - (unsigned char)*b;
 }
 
+/* Make room for `want` bytes in one go. A 1MB request body arriving through
+   a buffer that doubles from 256 bytes is copied about a dozen times on the
+   way in; when Content-Length says how big it will be, it is copied once. */
+static void dynbuf_reserve(DynBuf *buf, size_t want) {
+    if (want <= buf->cap) return;
+    /* Grow geometrically as well as to what was asked for: the read path
+       asks for "what I have plus another read", and honouring that exactly
+       would copy the whole buffer on every read. */
+    size_t cap = buf->cap ? buf->cap * 2 : 256;
+    if (cap < want) cap = want;
+    buf->data = realloc(buf->data, cap);
+    buf->cap = cap;
+}
+
 static void dynbuf_append(DynBuf *buf, const void *data, size_t n) {
-    if (buf->length + n > buf->cap) {
-        size_t cap = buf->cap ? buf->cap * 2 : 256;
-        while (cap < buf->length + n) cap *= 2;
-        buf->data = realloc(buf->data, cap); buf->cap = cap;
-    }
+    dynbuf_reserve(buf, buf->length + n);
     memcpy(buf->data + buf->length, data, n); buf->length += n;
 }
 static void dynbuf_puts(DynBuf *buf, const char *s) { dynbuf_append(buf, s, strlen(s)); }
@@ -162,12 +185,50 @@ static const char *reason(int status) {
         default: return "Response"; }
 }
 
+/* The floor a sweep will not reduce the GC threshold below, and the initial
+   threshold main.c sets. Kept in one place because the idle sweep and
+   Sxn.gc() both have to restore it (see sxn_sweep_cycles). */
+#define SXN_GC_THRESHOLD_FLOOR (8u * 1024u * 1024u)
+
+/* Collect cycles, then put the allocation threshold back where the amount now
+   live says it belongs.
+
+   The second half is the part that matters. QuickJS only ever collects from
+   js_trigger_gc, which fires when an allocation would cross
+   malloc_gc_threshold and then sets the next threshold to 1.5x whatever was
+   live at that moment. So a burst that dies right after a collection leaves
+   the threshold sized for the peak and nothing lowers it again: the garbage
+   is unreachable, but the bar for noticing has been raised above it, and the
+   bigger the garbage the higher the bar. JS_RunGC reclaims without touching
+   the threshold, so a sweep that does not also reset it fixes one burst and
+   leaves the ratchet in place for the next. */
+static size_t sxn_sweep_cycles(JSRuntime *rt) {
+    size_t live, threshold;
+    JS_RunGC(rt);
+    live = JS_GetMallocSize(rt);
+    threshold = live + (live >> 1);
+    if (threshold < SXN_GC_THRESHOLD_FLOOR) threshold = SXN_GC_THRESHOLD_FLOOR;
+    JS_SetGCThreshold(rt, threshold);
+    return live;
+}
+
+static JSValue sxn_gc(JSContext *ctx, JSValueConst this_val,
+                      int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    /* The emit memo holds strong references to one emitter's _events object,
+       its event name and its listener list, so it is a root the sweep cannot
+       see past. Releasing it first is what lets that graph go. */
+    sxn_free_ee_memo(ctx);
+    return JS_NewInt64(ctx, (int64_t)sxn_sweep_cycles(JS_GetRuntime(ctx)));
+}
+
 static JSValue sxn_memory_usage(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv) {
     (void)this_val; (void)argc; (void)argv;
     JSRuntime *rt = JS_GetRuntime(ctx);
     JSMemoryUsage mem;
     JSGCStats gc;
+    size_t rss = 0;
     JS_ComputeMemoryUsage(rt, &mem);
     JS_GetGCStats(rt, &gc);
     JSValue result = JS_NewObject(ctx);
@@ -186,6 +247,12 @@ static JSValue sxn_memory_usage(JSContext *ctx, JSValueConst this_val,
     MEM_FIELD("gcTotalNs", gc.total_ns);
     MEM_FIELD("gcLastNs", gc.last_ns);
     MEM_FIELD("gcMaxNs", gc.max_ns);
+    /* Every field above is the engine allocator's own accounting. `rss` is
+       the operating system's, which is the only one that answers "is this
+       process growing": the allocator can hold freed pages rather than
+       return them, so the two move independently. Reported, never asserted
+       on -- see tests/fixtures/leak_cycle_stress.sx. */
+    if (uv_resident_set_memory(&rss) == 0) MEM_FIELD("rss", rss);
 #undef MEM_FIELD
     return result;
 }
@@ -225,16 +292,33 @@ static void websocket_text(DynBuf *out, const char *text) {
 
 /* Shared by every accepted connection: the JS handler is looked up once per
    Sxn.serve() call and kept alive (JS_DupValue) for the server's lifetime. */
-typedef struct ServeState { JSContext *ctx; JSValue handler; } ServeState;
+typedef struct ConnState ConnState;
+typedef struct ServeState { JSContext *ctx; JSValue handler; ConnState *conns; } ServeState;
 
 /* Per-connection state: outlives the read/parse/dispatch step so the
    assembled response survives until the uv_write completes. */
-typedef struct ConnState {
+struct ConnState {
     ServeState *serve; uv_tcp_t handle; char *write_data;
     /* Held across an async handler: the upgrade bits belong to the request
        that is still being answered, and the read buffer is long gone. */
     char *pending_upgrade; char *pending_ws_key;
-} ConnState;
+    /* A request arrives over as many reads as the kernel feels like giving
+       us; only a small one fits in the first. This accumulates them until
+       the head and Content-Length bytes of body are both in hand. */
+    DynBuf in;
+    /* Keep-alive: whether this connection survives the response being
+       written, and how many bytes of `in` the answered request used -- what
+       is left after them is the next, pipelined request. */
+    int keep_alive; size_t consumed;
+    /* Every live connection of a server, so stop() can close them: a
+       keep-alive connection outlives the request that opened it, and would
+       otherwise hold the loop open after its server was stopped. */
+    ConnState *prev, *next;
+};
+
+/* A request bigger than this is refused rather than buffered: the whole
+   thing is held in memory before the handler sees it. */
+#define SXN_MAX_REQUEST_BYTES (64u * 1024u * 1024u)
 
 static void conn_deliver(JSContext *ctx, ConnState *conn, JSValue result,
                          const char *upgrade, const char *ws_key);
@@ -267,20 +351,60 @@ static JSValue conn_promise_fail(JSContext *ctx, JSValueConst this_val,
     return JS_UNDEFINED;
 }
 
+/* Unlink first, then close: the close callback may run after the server it
+   belonged to is gone. */
+static void conn_shutdown(ConnState *conn, uv_close_cb cb) {
+    if (conn->serve) {
+        if (conn->prev) conn->prev->next = conn->next; else conn->serve->conns = conn->next;
+        if (conn->next) conn->next->prev = conn->prev;
+        conn->serve = NULL; conn->prev = conn->next = NULL;
+    }
+    uv_close((uv_handle_t *)&conn->handle, cb);
+}
+
 static void conn_close_cb(uv_handle_t *handle) {
     ConnState *conn = (ConnState *)handle->data;
-    free(conn->write_data); free(conn);
+    free(conn->write_data); free(conn->in.data); free(conn);
 }
 
+static void conn_try_dispatch(ConnState *conn);
+static void conn_alloc_cb(uv_handle_t *handle, size_t suggested, uv_buf_t *buf);
+static void conn_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf);
+
+/* One response is written. On a keep-alive exchange the connection is reused
+   for the next request rather than closed -- without this every request paid
+   for a new TCP connection, which under a load test exhausted the client's
+   ephemeral ports long before the server was the bottleneck. */
 static void conn_write_cb(uv_write_t *req, int status) {
-    (void)status;
     ConnState *conn = (ConnState *)req->data; free(req);
-    uv_close((uv_handle_t *)&conn->handle, conn_close_cb);
+    if (status < 0 || !conn->keep_alive) {
+        conn_shutdown(conn, conn_close_cb);
+        return;
+    }
+    free(conn->write_data); conn->write_data = NULL;
+    /* Whatever follows the request just answered is the next one, already
+       here: a pipelining client sends without waiting. */
+    size_t left = conn->in.length > conn->consumed ? conn->in.length - conn->consumed : 0;
+    if (left) memmove(conn->in.data, conn->in.data + conn->consumed, left);
+    conn->in.length = left;
+    if (conn->in.data) conn->in.data[left] = 0;
+    conn->consumed = 0;
+    uv_read_start((uv_stream_t *)&conn->handle, conn_alloc_cb, conn_read_cb);
+    if (left) conn_try_dispatch(conn);
 }
 
+/* Read straight into the connection's own buffer. It used to allocate 64KB
+   for every read and copy it in afterwards: a 1MB request meant sixteen
+   allocations, sixteen frees and a megabyte of copying that the kernel could
+   have done into the right place to begin with. */
 static void conn_alloc_cb(uv_handle_t *handle, size_t suggested, uv_buf_t *buf) {
-    (void)handle; (void)suggested;
-    buf->base = malloc(65536); buf->len = buf->base ? 65535 : 0; /* room for a trailing NUL */
+    (void)suggested;
+    ConnState *conn = (ConnState *)handle->data;
+    size_t room = 65536;
+    dynbuf_reserve(&conn->in, conn->in.length + room + 1); /* +1 for a trailing NUL */
+    if (!conn->in.data) { buf->base = NULL; buf->len = 0; return; }
+    buf->base = conn->in.data + conn->in.length;
+    buf->len = conn->in.cap - conn->in.length - 1;
 }
 
 /* arcsx: turn a handler's return value into bytes and write them. Split out
@@ -294,9 +418,13 @@ static void conn_deliver(JSContext *ctx, ConnState *conn, JSValue result,
     DynBuf out = {0};
     if (JS_IsException(result)) {
         JS_FreeValue(ctx, result);
-        dynbuf_puts(&out, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+        conn->keep_alive = 0;
+        dynbuf_puts(&out, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     } else {
         JSValue mode_value = JS_GetPropertyStr(ctx, result, "mode"); const char *mode = JS_ToCString(ctx, mode_value);
+        /* An upgrade and an SSE stream both own the connection until the
+           client goes away; neither can be followed by another request. */
+        if (mode && (!strcmp(mode, "websocket") || !strcmp(mode, "sse"))) conn->keep_alive = 0;
         if (mode && !strcmp(mode, "websocket") && upgrade && ws_key) {
             websocket_handshake(&out, ws_key);
             JSValue messages = JS_GetPropertyStr(ctx, result, "wsMessages"); uint32_t length = 0; JSValue size = JS_GetPropertyStr(ctx, messages, "length"); JS_ToUint32(ctx, &length, size); JS_FreeValue(ctx, size);
@@ -307,7 +435,10 @@ static void conn_deliver(JSContext *ctx, ConnState *conn, JSValue result,
             JSValue events = JS_GetPropertyStr(ctx, result, "events"); uint32_t length = 0; JSValue size = JS_GetPropertyStr(ctx, events, "length"); JS_ToUint32(ctx, &length, size); JS_FreeValue(ctx, size);
             for (uint32_t i = 0; i < length; ++i) {
                 JSValue event = JS_GetPropertyUint32(ctx, events, i); JSValue data = JS_GetPropertyStr(ctx, event, "data"); JSValue type = JS_GetPropertyStr(ctx, event, "event"); JSValue id = JS_GetPropertyStr(ctx, event, "id");
-                const char *text = JS_ToCString(ctx, data), *event_name = JS_ToCString(ctx, type), *event_id = JS_ToCString(ctx, id);
+                const char *text = JS_ToCString(ctx, data), *event_name = (JS_IsUndefined(type) || JS_IsNull(type)) ? NULL : JS_ToCString(ctx, type);
+                /* An absent id must be left out, not written as the string
+                   "undefined" -- JS_ToCString stringifies undefined. */
+                const char *event_id = (JS_IsUndefined(id) || JS_IsNull(id)) ? NULL : JS_ToCString(ctx, id);
                 char full[4096]; int n;
                 if (event_id) n = snprintf(full, sizeof(full), "event: %s\nid: %s\ndata: %s\n\n", event_name ? event_name : "message", event_id, text ? text : "");
                 else n = snprintf(full, sizeof(full), "%s%s%sdata: %s\n\n", event_name ? "event: " : "", event_name ? event_name : "", event_name ? "\n" : "", text ? text : "");
@@ -435,14 +566,22 @@ static void conn_deliver(JSContext *ctx, ConnState *conn, JSValue result,
             JS_FreeValue(ctx, hdrs);
             if (ct_override) content_type = ct_override;
 
-            char head[512]; int n = snprintf(head, sizeof(head), "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\nConnection: close\r\nContent-Type: %s\r\n", status, reason(status), body_len, content_type);
+            /* A HEAD response carries the length the body would have had
+               and no body at all, which is the one thing a handler cannot
+               express by returning bytes. */
+            JSValue nobody_value = JS_GetPropertyStr(ctx, result, "bodyOmitted");
+            int body_omitted = JS_ToBool(ctx, nobody_value);
+            JS_FreeValue(ctx, nobody_value);
+
+            char head[512]; int n = snprintf(head, sizeof(head), "HTTP/1.1 %d %s\r\nContent-Length: %zu\r\nConnection: %s\r\nContent-Type: %s\r\n", status, reason(status), body_len, conn->keep_alive ? "keep-alive" : "close", content_type);
             dynbuf_append(&out, head, (size_t)n);
             if (extra && extra_len) dynbuf_append(&out, extra, extra_len);
             dynbuf_append(&out, "\r\n", 2);
             free(extra);
             if (ct_override) JS_FreeCString(ctx, ct_override);
             JS_FreeValue(ctx, ct_value);
-            if (is_binary) { if (body_bytes) dynbuf_append(&out, body_bytes, body_len); }
+            if (body_omitted) { /* HEAD: the length above, and nothing after it */ }
+            else if (is_binary) { if (body_bytes) dynbuf_append(&out, body_bytes, body_len); }
             else if (body_text) dynbuf_append(&out, body_text, body_len);
 
             if (borrowed_cv && !JS_IsUndefined(borrow_u8)) {
@@ -466,20 +605,98 @@ static void conn_deliver(JSContext *ctx, ConnState *conn, JSValue result,
     uv_write(write_req, stream, &write_buf, 1, conn_write_cb);
 }
 
-static void conn_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
-    ConnState *conn = (ConnState *)stream->data;
-    uv_read_stop(stream);
-    if (nread <= 0) { free(buf->base); uv_close((uv_handle_t *)&conn->handle, conn_close_cb); return; }
+/* One complete request, parsed and handed to the handler. `request` is NUL
+   terminated for the header scanning below, and `length` is what bounds the
+   body -- a body may legitimately contain a NUL byte, so its length never
+   comes from strlen. */
+/* The connection's read buffer, once it has been handed to JavaScript. */
+static void sxn_free_read_buffer(JSRuntime *rt, void *opaque, void *ptr) {
+    (void)rt; (void)opaque;
+    free(ptr);
+}
+
+/* `body`, materialised only if something reads it. The bytes belong to the
+   Uint8Array in func_data, so this cannot outlive them. */
+static JSValue conn_body_string(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv,
+                                int magic, JSValueConst *func_data) {
+    (void)this_val; (void)argc; (void)argv; (void)magic;
+    size_t size = 0;
+    uint8_t *bytes = JS_GetUint8Array(ctx, &size, func_data[0]);
+    int64_t offset = 0, length = 0;
+    JS_ToInt64(ctx, &offset, func_data[1]);
+    JS_ToInt64(ctx, &length, func_data[2]);
+    if (!bytes || (size_t)(offset + length) > size) return JS_NewString(ctx, "");
+    return JS_NewStringLen(ctx, (const char *)bytes + offset, (size_t)length);
+}
+
+/* JSON straight from the bytes, with no string in between: a 1MB request
+   body would otherwise be copied into a JavaScript string first, and the
+   parser only wants the bytes. */
+static JSValue sxn_parse_json_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    size_t size = 0;
+    uint8_t *bytes = argc > 0 ? JS_GetUint8Array(ctx, &size, argv[0]) : NULL;
+    if (!bytes) return JS_ThrowTypeError(ctx, "expected a Uint8Array");
+    int64_t offset = 0, length = (int64_t)size;
+    if (argc > 1) JS_ToInt64(ctx, &offset, argv[1]);
+    if (argc > 2) JS_ToInt64(ctx, &length, argv[2]);
+    if (offset < 0 || length < 0 || (size_t)(offset + length) > size)
+        return JS_ThrowRangeError(ctx, "body slice out of range");
+    return JS_ParseJSON(ctx, (const char *)bytes + offset, (size_t)length, "<body>");
+}
+
+static void conn_dispatch_request(ConnState *conn, char *request, size_t length) {
     JSContext *ctx = conn->serve->ctx;
-    char *request = buf->base; request[nread] = 0;
     char method[16] = {0}, url[4096] = {0}; sscanf(request, "%15s %4095s", method, url);
-    char *body = strstr(request, "\r\n\r\n"); body = body ? body + 4 : request + nread;
+    char *head_end = strstr(request, "\r\n\r\n");
+    char *body = head_end ? head_end + 4 : request + length;
+    size_t body_len = (size_t)((request + length) - body);
     char *ws_key = header_value(request, "Sec-WebSocket-Key");
     char *upgrade = header_value(request, "Upgrade");
     JSValue req_obj = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, req_obj, "method", JS_NewString(ctx, method));
     JS_SetPropertyStr(ctx, req_obj, "url", JS_NewString(ctx, url));
-    JS_SetPropertyStr(ctx, req_obj, "body", JS_NewString(ctx, body));
+    if (body_len == 0) {
+        JS_SetPropertyStr(ctx, req_obj, "body", JS_NewString(ctx, ""));
+    } else {
+        /* Hand the body over as bytes JavaScript owns. When nothing else is
+           in the buffer -- which is every request that is not pipelined --
+           the buffer itself goes, so a megabyte of body is not copied into a
+           string that the handler may not even read. */
+        JSValue bytes;
+        size_t offset = (size_t)(body - request);
+        if (conn->in.data == request && conn->in.length == length) {
+            conn->in.data[length] = 0;   /* the parser may look one past the end */
+            bytes = JS_NewUint8Array(ctx, (uint8_t *)request, length + 1,
+                                     sxn_free_read_buffer, NULL, false);
+            conn->in.data = NULL; conn->in.length = 0; conn->in.cap = 0;
+        } else {
+            /* Another request is already in the buffer behind this one, so
+               the buffer cannot be handed over. The copy carries a trailing
+               NUL for the same reason the transferred buffer does: the JSON
+               parser may look one byte past the body. */
+            uint8_t *copy = malloc(length + 1);
+            if (!copy) { JS_FreeValue(ctx, req_obj); return; }
+            memcpy(copy, request, length);
+            copy[length] = 0;
+            bytes = JS_NewUint8Array(ctx, copy, length + 1, sxn_free_read_buffer, NULL, false);
+        }
+        JSValue offset_value = JS_NewInt64(ctx, (int64_t)offset);
+        JSValue length_value = JS_NewInt64(ctx, (int64_t)body_len);
+        JS_SetPropertyStr(ctx, req_obj, "bodyBytes", JS_DupValue(ctx, bytes));
+        JS_SetPropertyStr(ctx, req_obj, "bodyOffset", JS_DupValue(ctx, offset_value));
+        JS_SetPropertyStr(ctx, req_obj, "bodyLength", JS_DupValue(ctx, length_value));
+        /* `body` stays a string for node:http, built only if it is read. */
+        JSValueConst data[3] = { bytes, offset_value, length_value };
+        JSValue getter = JS_NewCFunctionData(ctx, conn_body_string, 0, 0, 3, data);
+        JSAtom body_atom = JS_NewAtom(ctx, "body");
+        JS_DefinePropertyGetSet(ctx, req_obj, body_atom, getter, JS_UNDEFINED, JS_PROP_C_W_E);
+        JS_FreeAtom(ctx, body_atom);
+        JS_FreeValue(ctx, bytes);
+        JS_FreeValue(ctx, offset_value);
+        JS_FreeValue(ctx, length_value);
+    }
     /* Every request header, lowercased, the way Node presents them. Only
        `upgrade` used to be exposed, so a handler could not read an
        Authorization, Content-Type or Cookie header at all. */
@@ -542,11 +759,93 @@ static void conn_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf
         JS_FreeValue(ctx, caught); JS_FreeValue(ctx, chained);
         JS_FreeValue(ctx, on_ok); JS_FreeValue(ctx, on_err);
         JS_FreeValue(ctx, data); JS_FreeValue(ctx, result);
-        free(buf->base);
         return;
     }
-    free(buf->base);
     conn_deliver(ctx, conn, result, upgrade, ws_key);
+}
+
+/* HTTP/1.1 keeps a connection open unless the request says otherwise;
+   HTTP/1.0 closes it unless the request asks for keep-alive. */
+static int request_keeps_alive(const char *head, const char *head_end) {
+    int one_one = strstr(head, "HTTP/1.1") != NULL && strstr(head, "HTTP/1.1") < head_end;
+    const char *line = strstr(head, "\r\n");
+    while (line && line + 2 < head_end) {
+        line += 2;
+        if (!strncasecmp(line, "Connection:", 11)) {
+            const char *value = line + 11;
+            while (*value == ' ' || *value == '\t') ++value;
+            if (!strncasecmp(value, "close", 5)) return 0;
+            if (!strncasecmp(value, "keep-alive", 10)) return 1;
+            break;
+        }
+        line = strstr(line, "\r\n");
+    }
+    return one_one;
+}
+
+/* Content-Length, or -1 when the head does not carry one. Its own scan
+   rather than header_value's, which returns an interior pointer and
+   overwrites the line's CRLF with a NUL -- fine once the request is complete
+   and about to be parsed, wrong while it is still being read. */
+static long long request_content_length(const char *head, const char *head_end) {
+    const char *line = strstr(head, "\r\n");
+    while (line && line + 2 < head_end) {
+        line += 2;
+        if (!strncasecmp(line, "Content-Length:", 15)) {
+            const char *value = line + 15;
+            while (*value == ' ' || *value == '\t') ++value;
+            long long length = strtoll(value, NULL, 10);
+            return length < 0 ? -1 : length;
+        }
+        line = strstr(line, "\r\n");
+    }
+    return -1;
+}
+
+/* Dispatch as soon as a whole request is in the buffer; otherwise wait for
+   more reads. Called after every read, and again after a response is written
+   in case the client pipelined the next request behind the last one. */
+static void conn_try_dispatch(ConnState *conn) {
+    uv_stream_t *stream = (uv_stream_t *)&conn->handle;
+    if (conn->in.length > SXN_MAX_REQUEST_BYTES) {
+        uv_read_stop(stream);
+        conn->keep_alive = 0;
+        conn_deliver(conn->serve->ctx, conn, JS_EXCEPTION, NULL, NULL);
+        return;
+    }
+    /* Wait for the whole head, then for the whole body it announces. Without
+       this a request larger than one read -- anything past about 64KB -- was
+       handed to the handler truncated. */
+    char *head_end = strstr(conn->in.data, "\r\n\r\n");
+    if (!head_end) return;
+    long long content_length = request_content_length(conn->in.data, head_end);
+    size_t head_bytes = (size_t)(head_end + 4 - conn->in.data);
+    size_t body_bytes = content_length > 0 ? (size_t)content_length : 0;
+    if (conn->in.length - head_bytes < body_bytes) {
+        /* Now that the length is known, take the room for it at once. */
+        dynbuf_reserve(&conn->in, head_bytes + body_bytes + 1);
+        return;
+    }
+
+    uv_read_stop(stream);
+    conn->keep_alive = request_keeps_alive(conn->in.data, head_end);
+    conn->consumed = head_bytes + body_bytes;
+    conn_dispatch_request(conn, conn->in.data, conn->consumed);
+}
+
+static void conn_read_cb(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
+    ConnState *conn = (ConnState *)stream->data;
+    (void)buf;   /* it is a window into conn->in, not a buffer of its own */
+    if (nread <= 0) {
+        uv_read_stop(stream);
+        conn_shutdown(conn, conn_close_cb);
+        return;
+    }
+    conn->in.length += (size_t)nread;
+    /* NUL terminated for the header parsing, which is all string work; the
+       body is bounded by the length instead. */
+    conn->in.data[conn->in.length] = 0;
+    conn_try_dispatch(conn);
 }
 
 static void on_connection_cb(uv_stream_t *server_handle, int status) {
@@ -554,10 +853,18 @@ static void on_connection_cb(uv_stream_t *server_handle, int status) {
     ServeState *serve = (ServeState *)server_handle->data;
     ConnState *conn = calloc(1, sizeof(*conn)); conn->serve = serve;
     uv_tcp_init(sxn_loop(), &conn->handle); conn->handle.data = conn;
-    if (uv_accept(server_handle, (uv_stream_t *)&conn->handle) == 0)
+    if (uv_accept(server_handle, (uv_stream_t *)&conn->handle) == 0) {
+        /* No Nagle: a reply is written in one go and wants to leave now, not
+           when the kernel has collected enough to be worth a packet. */
+        uv_tcp_nodelay(&conn->handle, 1);
+        conn->next = serve->conns;
+        if (serve->conns) serve->conns->prev = conn;
+        serve->conns = conn;
         uv_read_start((uv_stream_t *)&conn->handle, conn_alloc_cb, conn_read_cb);
-    else
+    } else {
+        conn->serve = NULL;
         uv_close((uv_handle_t *)&conn->handle, conn_close_cb);
+    }
 }
 
 /* Stops the listener a serve() call created. The handle is closed
@@ -579,6 +886,8 @@ static JSValue js_serve_stop(JSContext *ctx, JSValueConst this_val,
     void *ptr = JS_GetOpaque(func_data[0], sxn_serverhandle_class_id);
     if (ptr) {
         JS_SetOpaque(func_data[0], NULL);
+        ServeState *serve = (ServeState *)((uv_handle_t *)ptr)->data;
+        while (serve && serve->conns) conn_shutdown(serve->conns, conn_close_cb);
         uv_close((uv_handle_t *)ptr, serve_close_cb);
     }
     return JS_UNDEFINED;
@@ -589,25 +898,105 @@ static JSValue js_serve(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     if (argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_ThrowTypeError(ctx, "serve(options, handler) requires a handler");
     JSValue port_value = JS_GetPropertyStr(ctx, argv[0], "port"); JS_ToInt32(ctx, &port, port_value); JS_FreeValue(ctx, port_value);
 
-    ServeState *serve = malloc(sizeof(*serve)); serve->ctx = ctx; serve->handler = JS_DupValue(ctx, argv[1]);
+    /* The address to bind. Loopback by default -- a server nobody asked to
+       expose should not be reachable from the network -- but a real
+       deployment needs 0.0.0.0, and until this was read the option was
+       accepted and ignored. `host` is Node's name for it, `hostname` is
+       Bun's and Deno's; both work. */
+    char host[256] = "127.0.0.1";
+    {
+        JSValue h = JS_GetPropertyStr(ctx, argv[0], "hostname");
+        if (JS_IsUndefined(h)) {
+            JS_FreeValue(ctx, h);
+            h = JS_GetPropertyStr(ctx, argv[0], "host");
+        }
+        if (!JS_IsUndefined(h) && !JS_IsNull(h)) {
+            const char *str = JS_ToCString(ctx, h);
+            if (str) {
+                snprintf(host, sizeof(host), "%s", str);
+                JS_FreeCString(ctx, str);
+            }
+        }
+        JS_FreeValue(ctx, h);
+    }
+    /* SO_REUSEPORT: several processes bind the same port and the kernel
+       spreads incoming connections across them. This runtime has no threads
+       and no cluster module, so running N copies of a server is the way to
+       use N cores, and this is what makes that possible. Linux, the BSDs,
+       Solaris and AIX only -- macOS's SO_REUSEPORT does not distribute, and
+       libuv reports ENOTSUP there rather than silently giving the last
+       binder everything. */
+    bool reuse_port = false;
+    {
+        JSValue r = JS_GetPropertyStr(ctx, argv[0], "reusePort");
+        reuse_port = JS_ToBool(ctx, r);
+        JS_FreeValue(ctx, r);
+    }
+
+    ServeState *serve = calloc(1, sizeof(*serve)); serve->ctx = ctx; serve->handler = JS_DupValue(ctx, argv[1]);
     uv_tcp_t *server = malloc(sizeof(*server));
     uv_tcp_init(sxn_loop(), server); server->data = serve;
-    struct sockaddr_in address; uv_ip4_addr("127.0.0.1", port, &address);
-    int rc = uv_tcp_bind(server, (const struct sockaddr *)&address, 0);
-    if (rc == 0) rc = uv_listen((uv_stream_t *)server, 64, on_connection_cb);
+    struct sockaddr_storage address;
+    int rc;
+    /* The one name worth resolving without a DNS lookup, and the one people
+       actually write. */
+    if (!strcmp(host, "localhost"))
+        snprintf(host, sizeof(host), "127.0.0.1");
+    if (uv_ip4_addr(host, port, (struct sockaddr_in *)&address) == 0)
+        rc = 0;
+    else if (uv_ip6_addr(host, port, (struct sockaddr_in6 *)&address) == 0)
+        rc = 0;
+    else {
+        free(server); JS_FreeValue(ctx, serve->handler); free(serve);
+        return JS_ThrowTypeError(ctx, "serve: '%s' is not an IP address to bind", host);
+    }
+    if (!reuse_port) {
+        rc = uv_tcp_bind(server, (const struct sockaddr *)&address, 0);
+    } else {
+#if SXN_UV_HAS_REUSEPORT
+        rc = uv_tcp_bind(server, (const struct sockaddr *)&address, UV_TCP_REUSEPORT);
+#elif defined(SO_REUSEPORT) && defined(__linux__)
+        /* libuv older than 1.49 has no flag for it, so the socket is made
+           and configured here and handed over. Linux only: this is where
+           SO_REUSEPORT distributes connections rather than handing the last
+           binder everything. */
+        int fd = socket(address.ss_family, SOCK_STREAM, 0);
+        int on = 1;
+        if (fd < 0) rc = UV_ENOTSUP;
+        else if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0
+                 || setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) != 0
+                 || bind(fd, (const struct sockaddr *)&address,
+                         address.ss_family == AF_INET6 ? sizeof(struct sockaddr_in6)
+                                                       : sizeof(struct sockaddr_in)) != 0) {
+            close(fd);
+            rc = UV_ENOTSUP;
+        } else {
+            rc = uv_tcp_open(server, fd);
+            if (rc != 0) close(fd);
+        }
+#else
+        rc = UV_ENOTSUP;
+#endif
+    }
+    /* 511, the same backlog Node uses: at 64 a burst of concurrent clients got
+       connection-refused rather than queued. */
+    if (rc == 0) rc = uv_listen((uv_stream_t *)server, 511, on_connection_cb);
     if (rc != 0) {
         free(server); JS_FreeValue(ctx, serve->handler); free(serve);
-        return JS_ThrowInternalError(ctx, "listen on %d: %s", port, uv_strerror(rc));
+        if (reuse_port && rc == UV_ENOTSUP)
+            return JS_ThrowInternalError(ctx, "listen on %s:%d: reusePort is not supported on this platform", host, port);
+        return JS_ThrowInternalError(ctx, "listen on %s:%d: %s", host, port, uv_strerror(rc));
     }
     /* `port: 0` asks the OS to choose a free port, which is the only way to
        write a test or an example that can't collide with whatever else is
        already listening. Read back what it chose: reporting the requested 0
        left `handle.port` and `handle.url` naming a port nothing can connect
        to, so the documented `Sxn.serve({ port: 0 }, ...)` was unusable. */
-    struct sockaddr_in bound;
+    struct sockaddr_storage bound;
     int bound_len = (int)sizeof(bound);
     if (uv_tcp_getsockname(server, (struct sockaddr *)&bound, &bound_len) == 0)
-        port = ntohs(bound.sin_port);
+        port = ntohs(bound.ss_family == AF_INET6 ? ((struct sockaddr_in6 *)&bound)->sin6_port
+                                                 : ((struct sockaddr_in *)&bound)->sin_port);
 
     /* Hand back a handle: without one a server can never be stopped, which
        makes it impossible to run a server and anything else in one process. */
@@ -618,9 +1007,11 @@ static JSValue js_serve(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     JS_SetPropertyStr(ctx, handle, "stop",
                       JS_NewCFunctionData(ctx, js_serve_stop, 0, 0, 1, data));
     JS_SetPropertyStr(ctx, handle, "port", JS_NewInt32(ctx, port));
+    JS_SetPropertyStr(ctx, handle, "hostname", JS_NewString(ctx, host));
     {
-        char u[64];
-        snprintf(u, sizeof(u), "http://127.0.0.1:%d", port);
+        /* A bare IPv6 address needs brackets in a URL. */
+        char u[320];
+        snprintf(u, sizeof(u), strchr(host, ':') ? "http://[%s]:%d" : "http://%s:%d", host, port);
         JS_SetPropertyStr(ctx, handle, "url", JS_NewString(ctx, u));
     }
     return handle;
@@ -637,10 +1028,12 @@ static JSValue js_serve(JSContext *ctx, JSValueConst this_val, int argc, JSValue
 /* --- Borrow lock: guards native chunk memory handed to JS zero-copy -----
    (Task 4.) Nothing in this codebase constructs an SX20xx diagnostic
    before this file: include/sxfe.h's SX2001-SX2004 were unused enum
-   values (only referenced by frontend.c's name-lookup switch), and there
-   is no compile-time borrow checker anywhere -- this is the first real
-   runtime use of one of them (SX2002_BORROW_CONFLICT, in
+   values (only referenced by frontend.c's name-lookup switch) -- this is
+   the first real runtime use of one of them (SX2002_BORROW_CONFLICT, in
    sxn_throw_borrow_conflict below), and it stays a runtime notion only.
+   The parser has since grown one compile-time ownership rule of its own
+   (SX2003, `&mut` on an immutable binding), but it is a separate notion:
+   it never reaches this lock, and this lock never consults it.
 
    Single-threaded-cooperative, like the rest of this file: fetch_write_cb
    (libcurl's data callback) only ever runs from inside curl_multi_socket_action,
@@ -697,7 +1090,7 @@ typedef struct FetchState {
     JSContext *ctx;
     CURL *easy;
     struct curl_slist *req_headers;
-    char *request_body;
+    char *request_body; size_t request_body_len;
     char *url;
 
     long status;
@@ -1267,10 +1660,20 @@ static JSValue js_sxn_fetch_raw(JSContext *ctx, JSValueConst this_val, int argc,
         }
     }
 
-    char *request_body = NULL;
+    /* argv[4], when given, is the redirect mode. */
+    long follow = 1;
+    if (argc > 4 && JS_IsString(argv[4])) {
+        const char *mode = JS_ToCString(ctx, argv[4]);
+        if (mode) { follow = strcmp(mode, "follow") == 0; JS_FreeCString(ctx, mode); }
+    }
+    char *request_body = NULL; size_t request_body_len = 0;
     if (argc > 3 && !JS_IsUndefined(argv[3]) && !JS_IsNull(argv[3])) {
-        const char *b = JS_ToCString(ctx, argv[3]);
-        if (b) request_body = strdup(b);
+        /* Counted, not NUL terminated: a request body may contain a 0x00
+           byte, and strlen would send everything before it and drop the
+           rest. */
+        size_t len = 0;
+        const char *b = JS_ToCStringLen(ctx, &len, argv[3]);
+        if (b) { request_body = malloc(len + 1); memcpy(request_body, b, len); request_body[len] = 0; request_body_len = len; }
         JS_FreeCString(ctx, b);
     }
 
@@ -1285,13 +1688,16 @@ static JSValue js_sxn_fetch_raw(JSContext *ctx, JSValueConst this_val, int argc,
     fs->ctx = ctx; fs->easy = easy; fs->refcount = 1;
     fs->url = strdup(url);
     fs->req_headers = headers;
-    fs->request_body = request_body;
+    fs->request_body = request_body; fs->request_body_len = request_body_len;
     fs->header_pairs = JS_UNDEFINED;
     fs->pending_read_resolve = JS_UNDEFINED; fs->pending_read_reject = JS_UNDEFINED;
 
     curl_easy_setopt(easy, CURLOPT_URL, url);
-    curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(easy, CURLOPT_USERAGENT, "sxn/0.0.1");
+    /* Fetch's `redirect` option: "follow" is the default, "manual" hands the
+       3xx back as it arrived, and "error" is rejected by the JS wrapper --
+       both need the transfer to stop at the first response. */
+    curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, follow ? 1L : 0L);
+    curl_easy_setopt(easy, CURLOPT_USERAGENT, "sxn/0.0.2");
     curl_easy_setopt(easy, CURLOPT_PRIVATE, fs);
     curl_easy_setopt(easy, CURLOPT_HEADERFUNCTION, fetch_header_cb);
     curl_easy_setopt(easy, CURLOPT_HEADERDATA, fs);
@@ -1299,13 +1705,17 @@ static JSValue js_sxn_fetch_raw(JSContext *ctx, JSValueConst this_val, int argc,
     curl_easy_setopt(easy, CURLOPT_WRITEDATA, fs);
     if (headers) curl_easy_setopt(easy, CURLOPT_HTTPHEADER, headers);
     if (method) curl_easy_setopt(easy, CURLOPT_CUSTOMREQUEST, method);
+    /* A HEAD response carries the length of a body it does not send, so the
+       transfer has to be told there is nothing to wait for. Without this a
+       fetch of a HEAD hung until the server closed the connection. */
+    if (method && !sxn_strcasecmp(method, "HEAD")) curl_easy_setopt(easy, CURLOPT_NOBODY, 1L);
     if (request_body) {
         /* POSTFIELDSIZE must be set BEFORE COPYPOSTFIELDS: libcurl reads the
            size at the moment the fields are copied. Setting it afterwards
            left curl expecting an upload it had no read callback for, so it
            connected and then sent nothing at all -- every POST, PUT and PATCH
            hung until it timed out. */
-        curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, (long)strlen(request_body));
+        curl_easy_setopt(easy, CURLOPT_POSTFIELDSIZE, (long)request_body_len);
         curl_easy_setopt(easy, CURLOPT_COPYPOSTFIELDS, request_body);
     }
     JS_FreeCString(ctx, url); JS_FreeCString(ctx, method);
@@ -1428,6 +1838,62 @@ static JSValue sxn_random_bytes(JSContext *ctx, JSValueConst this_val, int argc,
     JSValue result = JS_NewUint8ArrayCopy(ctx, buf, (size_t)n);
     free(buf);
     return result;
+}
+
+
+/* HMAC, from the library that already does the digests. It was built here in
+   JavaScript out of two padded key buffers and three digest calls, with a
+   Uint8Array allocated per update. */
+
+/* Buffer#compare: Node orders by unsigned byte value, then by length. A
+   JavaScript loop compared a byte at a time; memcmp compares a word at a
+   time and is what the C library is for. */
+static JSValue sxn_bytes_compare(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    size_t a_len = 0, b_len = 0;
+    uint8_t *a = argc > 0 ? JS_GetUint8Array(ctx, &a_len, argv[0]) : NULL;
+    uint8_t *b = argc > 1 ? JS_GetUint8Array(ctx, &b_len, argv[1]) : NULL;
+    if (!a || !b) return JS_ThrowTypeError(ctx, "compare expects two Uint8Arrays");
+    size_t n = a_len < b_len ? a_len : b_len;
+    int rc = n ? memcmp(a, b, n) : 0;
+    if (rc == 0) rc = a_len == b_len ? 0 : (a_len < b_len ? -1 : 1);
+    return JS_NewInt32(ctx, rc < 0 ? -1 : (rc > 0 ? 1 : 0));
+}
+
+static JSValue sxn_hmac(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    const char *algo = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+    if (!algo) return JS_EXCEPTION;
+    size_t key_len = 0, data_len = 0;
+    uint8_t *key = argc > 1 ? JS_GetUint8Array(ctx, &key_len, argv[1]) : NULL;
+    uint8_t *data = argc > 2 ? JS_GetUint8Array(ctx, &data_len, argv[2]) : NULL;
+    if (!key || !data) { JS_FreeCString(ctx, algo); return JS_ThrowTypeError(ctx, "hmac expects two Uint8Arrays"); }
+    char normalized[32]; size_t j = 0;
+    for (size_t i = 0; algo[i] && j + 1 < sizeof(normalized); i++)
+        if (algo[i] != '-') normalized[j++] = (char)tolower((unsigned char)algo[i]);
+    normalized[j] = 0;
+    const EVP_MD *md = EVP_get_digestbyname(normalized);
+    JS_FreeCString(ctx, algo);
+    if (!md) return JS_ThrowTypeError(ctx, "unsupported digest algorithm");
+    uint8_t out[EVP_MAX_MD_SIZE];
+    unsigned int out_len = 0;
+    /* An empty key is legal and HMAC() wants a non-NULL pointer for it. */
+    if (!HMAC(md, key_len ? (const void *)key : (const void *)"", (int)key_len,
+              data, data_len, out, &out_len))
+        return JS_ThrowInternalError(ctx, "hmac failed");
+    return JS_NewUint8ArrayCopy(ctx, out, out_len);
+}
+
+/* Comparison that takes the same time whether the bytes match or not, which
+   is the whole point of it and is not something JavaScript can promise. */
+static JSValue sxn_timing_safe_equal(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    size_t a_len = 0, b_len = 0;
+    uint8_t *a = argc > 0 ? JS_GetUint8Array(ctx, &a_len, argv[0]) : NULL;
+    uint8_t *b = argc > 1 ? JS_GetUint8Array(ctx, &b_len, argv[1]) : NULL;
+    if (!a || !b) return JS_ThrowTypeError(ctx, "timingSafeEqual expects two Uint8Arrays");
+    if (a_len != b_len) return JS_ThrowRangeError(ctx, "input length mismatch");
+    return JS_NewBool(ctx, CRYPTO_memcmp(a, b, a_len) == 0);
 }
 
 static JSValue sxn_digest(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -1832,6 +2298,655 @@ static JSValue sxn_file(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     JS_FreeCString(ctx, path); return file;
 }
 
+/* The only way to reach fd 2 from JS: console.error/warn and
+   process.stderr are built on this, so a diagnostic does not land in the
+   program's own stdout. */
+/* node:os, from libuv rather than from guesses. The JS layer used to answer
+   "localhost" for the hostname and 0 for the memory sizes, which is worse
+   than not answering: a program cannot tell a stub from the truth. */
+/* node:fs's stat, from libuv. The JS layer had no way to ask a file's size
+   or kind at all, so `stat` and everything built on it -- a static file
+   server, a build step that skips unchanged files -- was out of reach. */
+static JSValue sxn_stat(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    const char *path = argc > 0 ? JS_ToCString(ctx, argv[0]) : NULL;
+    if (!path) return JS_ThrowTypeError(ctx, "stat(path) requires a path");
+    bool follow = argc < 2 || JS_ToBool(ctx, argv[1]);
+    uv_fs_t req;
+    int rc = follow ? uv_fs_stat(NULL, &req, path, NULL) : uv_fs_lstat(NULL, &req, path, NULL);
+    if (rc != 0) {
+        JSValue error = JS_ThrowInternalError(ctx, "%s: %s", uv_strerror(rc), path);
+        JSValue exception = JS_GetException(ctx);
+        JS_SetPropertyStr(ctx, exception, "code", JS_NewString(ctx, uv_err_name(rc)));
+        JS_SetPropertyStr(ctx, exception, "path", JS_NewString(ctx, path));
+        JS_Throw(ctx, exception);
+        JS_FreeCString(ctx, path);
+        uv_fs_req_cleanup(&req);
+        return error;
+    }
+    const uv_stat_t *st = &req.statbuf;
+    /* The caller passes Stats.prototype, so the object comes back already
+       being a Stats -- node:fs used to copy every field of this onto a fresh
+       one with a for-in loop. */
+    JSValue out = (argc > 2 && JS_IsObject(argv[2])) ? JS_NewObjectProto(ctx, argv[2]) : JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, out, "dev", JS_NewFloat64(ctx, (double)st->st_dev));
+    JS_SetPropertyStr(ctx, out, "ino", JS_NewFloat64(ctx, (double)st->st_ino));
+    JS_SetPropertyStr(ctx, out, "mode", JS_NewInt64(ctx, (int64_t)st->st_mode));
+    JS_SetPropertyStr(ctx, out, "nlink", JS_NewFloat64(ctx, (double)st->st_nlink));
+    JS_SetPropertyStr(ctx, out, "uid", JS_NewInt64(ctx, (int64_t)st->st_uid));
+    JS_SetPropertyStr(ctx, out, "gid", JS_NewInt64(ctx, (int64_t)st->st_gid));
+    JS_SetPropertyStr(ctx, out, "size", JS_NewFloat64(ctx, (double)st->st_size));
+    JS_SetPropertyStr(ctx, out, "blksize", JS_NewFloat64(ctx, (double)st->st_blksize));
+    JS_SetPropertyStr(ctx, out, "blocks", JS_NewFloat64(ctx, (double)st->st_blocks));
+    JS_SetPropertyStr(ctx, out, "atimeMs", JS_NewFloat64(ctx, st->st_atim.tv_sec * 1000.0 + st->st_atim.tv_nsec / 1e6));
+    JS_SetPropertyStr(ctx, out, "mtimeMs", JS_NewFloat64(ctx, st->st_mtim.tv_sec * 1000.0 + st->st_mtim.tv_nsec / 1e6));
+    JS_SetPropertyStr(ctx, out, "ctimeMs", JS_NewFloat64(ctx, st->st_ctim.tv_sec * 1000.0 + st->st_ctim.tv_nsec / 1e6));
+    JS_SetPropertyStr(ctx, out, "birthtimeMs", JS_NewFloat64(ctx, st->st_birthtim.tv_sec * 1000.0 + st->st_birthtim.tv_nsec / 1e6));
+    /* Node's Stats carries the same four times over again as Dates. */
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue date_class = JS_GetPropertyStr(ctx, global, "Date");
+    JS_FreeValue(ctx, global);
+    static const char *time_names[4] = { "atime", "mtime", "ctime", "birthtime" };
+    double times[4] = {
+        st->st_atim.tv_sec * 1000.0 + st->st_atim.tv_nsec / 1e6,
+        st->st_mtim.tv_sec * 1000.0 + st->st_mtim.tv_nsec / 1e6,
+        st->st_ctim.tv_sec * 1000.0 + st->st_ctim.tv_nsec / 1e6,
+        st->st_birthtim.tv_sec * 1000.0 + st->st_birthtim.tv_nsec / 1e6,
+    };
+    for (int i = 0; i < 4; i++) {
+        JSValue ms = JS_NewFloat64(ctx, times[i]);
+        JSValueConst args[1] = { ms };
+        JS_SetPropertyStr(ctx, out, time_names[i], JS_CallConstructor(ctx, date_class, 1, args));
+        JS_FreeValue(ctx, ms);
+    }
+    JS_FreeValue(ctx, date_class);
+    JS_FreeCString(ctx, path);
+    uv_fs_req_cleanup(&req);
+    return out;
+}
+
+/* fs's open/access flags, taken from this platform's own headers rather than
+   written down: O_CREAT alone is 0x200 on macOS and 0x40 on Linux. */
+static JSValue js_fs_constants(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    JSValue out = JS_NewObject(ctx);
+#define SXN_CONST(name, value) JS_SetPropertyStr(ctx, out, name, JS_NewInt32(ctx, (int32_t)(value)))
+    SXN_CONST("O_RDONLY", O_RDONLY);
+    SXN_CONST("O_WRONLY", O_WRONLY);
+    SXN_CONST("O_RDWR", O_RDWR);
+    SXN_CONST("O_CREAT", O_CREAT);
+    SXN_CONST("O_EXCL", O_EXCL);
+    SXN_CONST("O_TRUNC", O_TRUNC);
+    SXN_CONST("O_APPEND", O_APPEND);
+    SXN_CONST("F_OK", 0);
+    SXN_CONST("R_OK", 4);
+    SXN_CONST("W_OK", 2);
+    SXN_CONST("X_OK", 1);
+    SXN_CONST("S_IFMT", 0170000);
+    SXN_CONST("S_IFREG", 0100000);
+    SXN_CONST("S_IFDIR", 0040000);
+    SXN_CONST("S_IFLNK", 0120000);
+    SXN_CONST("COPYFILE_EXCL", 1);
+#undef SXN_CONST
+    return out;
+}
+
+/* ---------------- UDP (node:dgram) ----------------
+   A uv_udp_t on the same loop everything else runs on, with the socket's
+   callbacks handed straight to JavaScript. node_compat.js puts the
+   EventEmitter shape around it. */
+static JSClassID sxn_udp_class_id;
+
+typedef struct {
+    uv_udp_t handle;
+    JSContext *ctx;
+    JSValue on_message;
+    bool open, reading;
+} SxnUdp;
+
+static void sxn_udp_closed(uv_handle_t *handle) { free(handle->data); }
+
+static void sxn_udp_finalizer(JSRuntime *rt, JSValue val) {
+    SxnUdp *u = JS_GetOpaque(val, sxn_udp_class_id);
+    if (!u) return;
+    JS_FreeValueRT(rt, u->on_message);
+    u->on_message = JS_UNDEFINED;
+    if (u->open) {
+        u->open = false;
+        u->handle.data = u;
+        uv_close((uv_handle_t *)&u->handle, sxn_udp_closed);
+    } else {
+        free(u);
+    }
+}
+
+static JSClassDef sxn_udp_class_def = {
+    .class_name = "UdpSocket",
+    .finalizer = sxn_udp_finalizer,
+};
+
+static void sxn_udp_alloc(uv_handle_t *handle, size_t suggested, uv_buf_t *buf) {
+    (void)handle;
+    buf->base = malloc(suggested);
+    buf->len = buf->base ? suggested : 0;
+}
+
+static void sxn_udp_recv(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
+                         const struct sockaddr *addr, unsigned flags) {
+    (void)flags;
+    SxnUdp *u = handle->data;
+    if (nread > 0 && addr && u && JS_IsFunction(u->ctx, u->on_message)) {
+        JSContext *ctx = u->ctx;
+        char text[INET6_ADDRSTRLEN] = {0};
+        int port = 0;
+        if (addr->sa_family == AF_INET6) {
+            uv_ip6_name((struct sockaddr_in6 *)addr, text, sizeof(text));
+            port = ntohs(((struct sockaddr_in6 *)addr)->sin6_port);
+        } else {
+            uv_ip4_name((struct sockaddr_in *)addr, text, sizeof(text));
+            port = ntohs(((struct sockaddr_in *)addr)->sin_port);
+        }
+        JSValue args[3];
+        args[0] = JS_NewUint8ArrayCopy(ctx, (const uint8_t *)buf->base, (size_t)nread);
+        args[1] = JS_NewString(ctx, text);
+        args[2] = JS_NewInt32(ctx, port);
+        JSValue r = JS_Call(ctx, u->on_message, JS_UNDEFINED, 3, (JSValueConst *)args);
+        if (JS_IsException(r)) JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, r);
+        for (int i = 0; i < 3; i++) JS_FreeValue(ctx, args[i]);
+    }
+    free(buf->base);
+}
+
+/* __sxnUdpOpen(ipv6, onMessage) */
+static JSValue js_udp_open(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    SxnUdp *u = calloc(1, sizeof(*u));
+    if (!u) return JS_ThrowOutOfMemory(ctx);
+    u->ctx = ctx;
+    u->on_message = argc > 1 ? JS_DupValue(ctx, argv[1]) : JS_UNDEFINED;
+    if (uv_udp_init(sxn_loop(), &u->handle) != 0) {
+        JS_FreeValue(ctx, u->on_message);
+        free(u);
+        return JS_ThrowInternalError(ctx, "udp init failed");
+    }
+    u->handle.data = u;
+    u->open = true;
+    JS_NewClassID(JS_GetRuntime(ctx), &sxn_udp_class_id);
+    JS_NewClass(JS_GetRuntime(ctx), sxn_udp_class_id, &sxn_udp_class_def);
+    JSValue obj = JS_NewObjectClass(ctx, sxn_udp_class_id);
+    if (JS_IsException(obj)) return obj;
+    JS_SetOpaque(obj, u);
+    return obj;
+}
+
+static SxnUdp *sxn_udp_of(JSContext *ctx, JSValueConst val) {
+    SxnUdp *u = JS_GetOpaque(val, sxn_udp_class_id);
+    return (u && u->open) ? u : NULL;
+}
+
+/* __sxnUdpBind(socket, port, address) -> the port actually bound */
+static JSValue js_udp_bind(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    SxnUdp *u = argc > 0 ? sxn_udp_of(ctx, argv[0]) : NULL;
+    if (!u) return JS_ThrowTypeError(ctx, "not an open udp socket");
+    int32_t port = 0;
+    if (argc > 1) JS_ToInt32(ctx, &port, argv[1]);
+    const char *address = argc > 2 && JS_IsString(argv[2]) ? JS_ToCString(ctx, argv[2]) : NULL;
+    struct sockaddr_storage addr;
+    int rc = uv_ip4_addr(address ? address : "0.0.0.0", port, (struct sockaddr_in *)&addr);
+    if (rc != 0) rc = uv_ip6_addr(address ? address : "::", port, (struct sockaddr_in6 *)&addr);
+    if (address) JS_FreeCString(ctx, address);
+    if (rc == 0) rc = uv_udp_bind(&u->handle, (const struct sockaddr *)&addr, 0);
+    if (rc != 0) return JS_ThrowInternalError(ctx, "udp bind failed: %s", uv_strerror(rc));
+    if (!u->reading) {
+        rc = uv_udp_recv_start(&u->handle, sxn_udp_alloc, sxn_udp_recv);
+        if (rc != 0) return JS_ThrowInternalError(ctx, "udp listen failed: %s", uv_strerror(rc));
+        u->reading = true;
+    }
+    struct sockaddr_storage bound;
+    int len = sizeof(bound);
+    if (uv_udp_getsockname(&u->handle, (struct sockaddr *)&bound, &len) != 0)
+        return JS_NewInt32(ctx, port);
+    return JS_NewInt32(ctx, bound.ss_family == AF_INET6
+        ? ntohs(((struct sockaddr_in6 *)&bound)->sin6_port)
+        : ntohs(((struct sockaddr_in *)&bound)->sin_port));
+}
+
+static void sxn_udp_sent(uv_udp_send_t *req, int status) { (void)status; free(req); }
+
+/* __sxnUdpSend(socket, bytes, port, address) */
+static JSValue js_udp_send(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    SxnUdp *u = argc > 0 ? sxn_udp_of(ctx, argv[0]) : NULL;
+    if (!u) return JS_ThrowTypeError(ctx, "not an open udp socket");
+    size_t len = 0;
+    uint8_t *bytes = argc > 1 ? JS_GetUint8Array(ctx, &len, argv[1]) : NULL;
+    if (!bytes) return JS_ThrowTypeError(ctx, "udp send expects bytes");
+    int32_t port = 0;
+    if (argc > 2) JS_ToInt32(ctx, &port, argv[2]);
+    const char *address = argc > 3 && JS_IsString(argv[3]) ? JS_ToCString(ctx, argv[3]) : NULL;
+    struct sockaddr_storage addr;
+    int rc = uv_ip4_addr(address ? address : "127.0.0.1", port, (struct sockaddr_in *)&addr);
+    if (rc != 0) rc = uv_ip6_addr(address ? address : "::1", port, (struct sockaddr_in6 *)&addr);
+    if (address) JS_FreeCString(ctx, address);
+    if (rc != 0) return JS_ThrowTypeError(ctx, "udp send: bad address");
+    /* uv_udp_send copies nothing, so the write has to finish before the
+       caller's bytes can move: uv_udp_try_send does it inline, and the
+       queued path gets its own copy. */
+    uv_buf_t buf = uv_buf_init((char *)bytes, (unsigned int)len);
+    rc = uv_udp_try_send(&u->handle, &buf, 1, (const struct sockaddr *)&addr);
+    if (rc >= 0) return JS_NewInt32(ctx, rc);
+    uv_udp_send_t *req = malloc(sizeof(*req) + len);
+    if (!req) return JS_ThrowOutOfMemory(ctx);
+    char *copy = (char *)(req + 1);
+    memcpy(copy, bytes, len);
+    uv_buf_t queued = uv_buf_init(copy, (unsigned int)len);
+    rc = uv_udp_send(req, &u->handle, &queued, 1, (const struct sockaddr *)&addr, sxn_udp_sent);
+    if (rc != 0) { free(req); return JS_ThrowInternalError(ctx, "udp send failed: %s", uv_strerror(rc)); }
+    return JS_NewInt32(ctx, (int32_t)len);
+}
+
+/* __sxnUdpClose(socket) */
+static JSValue js_udp_close(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    SxnUdp *u = argc > 0 ? JS_GetOpaque(argv[0], sxn_udp_class_id) : NULL;
+    if (!u || !u->open) return JS_UNDEFINED;
+    JS_FreeValue(ctx, u->on_message);
+    u->on_message = JS_UNDEFINED;
+    u->open = false;
+    u->handle.data = u;
+    uv_close((uv_handle_t *)&u->handle, sxn_udp_closed);
+    JS_SetOpaque(argv[0], NULL);
+    return JS_UNDEFINED;
+}
+
+/* ---------------- process spawning (node:child_process) ----------------
+   One child, run to completion on a loop of its own so that nothing else
+   queued on the default loop runs re-entrantly while we wait. That makes
+   this the synchronous form; the asynchronous forms in node_compat.js are
+   built on it, and say so. */
+typedef struct { char *data; size_t len, cap; } SxnGrow;
+
+static void sxn_grow_push(SxnGrow *b, const char *p, size_t n) {
+    if (b->len + n > b->cap) {
+        size_t want = b->cap ? b->cap * 2 : 8192;
+        while (want < b->len + n) want *= 2;
+        char *next = realloc(b->data, want);
+        if (!next) return;
+        b->data = next; b->cap = want;
+    }
+    memcpy(b->data + b->len, p, n);
+    b->len += n;
+}
+
+static void sxn_spawn_alloc(uv_handle_t *handle, size_t suggested, uv_buf_t *buf) {
+    (void)handle;
+    buf->base = malloc(suggested);
+    buf->len = buf->base ? suggested : 0;
+}
+
+static void sxn_spawn_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
+    if (nread > 0) sxn_grow_push((SxnGrow *)stream->data, buf->base, (size_t)nread);
+    else if (nread < 0) uv_close((uv_handle_t *)stream, NULL);
+    free(buf->base);
+}
+
+typedef struct { int64_t status; int signal; } SxnExit;
+
+static void sxn_spawn_exit(uv_process_t *proc, int64_t status, int signal) {
+    SxnExit *out = proc->data;
+    out->status = status; out->signal = signal;
+    uv_close((uv_handle_t *)proc, NULL);
+}
+
+/* A loop that is closed while a handle is still registered leaves libuv's
+   own child-process bookkeeping behind it, and the next uv_spawn walks into
+   what is left: on Linux that is a segfault, not a leak. So everything still
+   open is closed, the loop is run until those closes complete, and only then
+   is it closed. */
+static void sxn_spawn_close_walk(uv_handle_t *handle, void *arg) {
+    (void)arg;
+    if (!uv_is_closing(handle)) uv_close(handle, NULL);
+}
+
+static void sxn_spawn_teardown(uv_loop_t *loop) {
+    uv_walk(loop, sxn_spawn_close_walk, NULL);
+    while (uv_run(loop, UV_RUN_DEFAULT) != 0) { }
+    uv_loop_close(loop);
+}
+
+static void sxn_spawn_written(uv_write_t *req, int status) {
+    (void)status;
+    uv_close((uv_handle_t *)req->handle, NULL);
+    free(req);
+}
+
+/* __sxnSpawnSync(file, args, options) -> { pid, status, signal, stdout, stderr, error } */
+static JSValue js_spawn_sync(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "spawn needs a command");
+    const char *file = JS_ToCString(ctx, argv[0]);
+    if (!file) return JS_EXCEPTION;
+
+    uint32_t nargs = 0;
+    if (argc > 1 && JS_IsArray(argv[1])) {
+        JSValue len = JS_GetPropertyStr(ctx, argv[1], "length");
+        JS_ToUint32(ctx, &nargs, len);
+        JS_FreeValue(ctx, len);
+    }
+    char **args = calloc(nargs + 2, sizeof(char *));
+    args[0] = (char *)file;
+    for (uint32_t i = 0; i < nargs; i++) {
+        JSValue item = JS_GetPropertyUint32(ctx, argv[1], i);
+        const char *s = JS_ToCString(ctx, item);
+        args[i + 1] = s ? strdup(s) : strdup("");
+        if (s) JS_FreeCString(ctx, s);
+        JS_FreeValue(ctx, item);
+    }
+
+    char *cwd = NULL, **env = NULL;
+    const char *input = NULL;
+    size_t input_len = 0;
+    if (argc > 2 && JS_IsObject(argv[2])) {
+        JSValue v = JS_GetPropertyStr(ctx, argv[2], "cwd");
+        if (JS_IsString(v)) { const char *s = JS_ToCString(ctx, v); if (s) { cwd = strdup(s); JS_FreeCString(ctx, s); } }
+        JS_FreeValue(ctx, v);
+        v = JS_GetPropertyStr(ctx, argv[2], "input");
+        if (JS_IsString(v)) input = JS_ToCStringLen(ctx, &input_len, v);
+        JS_FreeValue(ctx, v);
+        v = JS_GetPropertyStr(ctx, argv[2], "env");
+        if (JS_IsObject(v)) {
+            JSPropertyEnum *props = NULL; uint32_t count = 0;
+            if (JS_GetOwnPropertyNames(ctx, &props, &count, v, JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0) {
+                env = calloc(count + 1, sizeof(char *));
+                uint32_t written = 0;
+                for (uint32_t i = 0; i < count; i++) {
+                    JSValue val = JS_GetProperty(ctx, v, props[i].atom);
+                    const char *key = JS_AtomToCString(ctx, props[i].atom);
+                    const char *sval = JS_ToCString(ctx, val);
+                    if (key && sval) {
+                        size_t n = strlen(key) + strlen(sval) + 2;
+                        char *entry = malloc(n);
+                        snprintf(entry, n, "%s=%s", key, sval);
+                        env[written++] = entry;
+                    }
+                    if (key) JS_FreeCString(ctx, key);
+                    if (sval) JS_FreeCString(ctx, sval);
+                    JS_FreeValue(ctx, val);
+                    JS_FreeAtom(ctx, props[i].atom);
+                }
+                js_free(ctx, props);
+            }
+        }
+        JS_FreeValue(ctx, v);
+    }
+
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+    SxnGrow out = {0}, err = {0};
+    uv_pipe_t in_pipe, out_pipe, err_pipe;
+    uv_pipe_init(&loop, &in_pipe, 0);
+    uv_pipe_init(&loop, &out_pipe, 0);
+    uv_pipe_init(&loop, &err_pipe, 0);
+    out_pipe.data = &out;
+    err_pipe.data = &err;
+
+    uv_stdio_container_t stdio[3];
+    stdio[0].flags = UV_CREATE_PIPE | UV_READABLE_PIPE;
+    stdio[0].data.stream = (uv_stream_t *)&in_pipe;
+    stdio[1].flags = UV_CREATE_PIPE | UV_WRITABLE_PIPE;
+    stdio[1].data.stream = (uv_stream_t *)&out_pipe;
+    stdio[2].flags = UV_CREATE_PIPE | UV_WRITABLE_PIPE;
+    stdio[2].data.stream = (uv_stream_t *)&err_pipe;
+
+    SxnExit exit_state = { -1, 0 };
+    uv_process_t proc;
+    proc.data = &exit_state;
+    uv_process_options_t options;
+    memset(&options, 0, sizeof(options));
+    options.file = file;
+    options.args = args;
+    options.cwd = cwd;
+    options.env = env;
+    options.stdio = stdio;
+    options.stdio_count = 3;
+    options.exit_cb = sxn_spawn_exit;
+
+    int rc = uv_spawn(&loop, &proc, &options);
+    JSValue result = JS_NewObject(ctx);
+    if (rc != 0) {
+        uv_close((uv_handle_t *)&in_pipe, NULL);
+        uv_close((uv_handle_t *)&out_pipe, NULL);
+        uv_close((uv_handle_t *)&err_pipe, NULL);
+        sxn_spawn_teardown(&loop);
+        JS_SetPropertyStr(ctx, result, "error", JS_NewString(ctx, uv_strerror(rc)));
+        JS_SetPropertyStr(ctx, result, "errno", JS_NewString(ctx, uv_err_name(rc)));
+        JS_SetPropertyStr(ctx, result, "status", JS_NULL);
+    } else {
+        uv_read_start((uv_stream_t *)&out_pipe, sxn_spawn_alloc, sxn_spawn_read);
+        uv_read_start((uv_stream_t *)&err_pipe, sxn_spawn_alloc, sxn_spawn_read);
+        if (input) {
+            uv_write_t *req = calloc(1, sizeof(*req));
+            uv_buf_t buf = uv_buf_init((char *)input, (unsigned int)input_len);
+            if (!req || uv_write(req, (uv_stream_t *)&in_pipe, &buf, 1, sxn_spawn_written) != 0) {
+                free(req);
+                uv_close((uv_handle_t *)&in_pipe, NULL);
+            }
+        } else {
+            uv_close((uv_handle_t *)&in_pipe, NULL);
+        }
+        uv_run(&loop, UV_RUN_DEFAULT);
+        sxn_spawn_teardown(&loop);
+        JS_SetPropertyStr(ctx, result, "pid", JS_NewInt32(ctx, proc.pid));
+        JS_SetPropertyStr(ctx, result, "status",
+                          exit_state.signal ? JS_NULL : JS_NewInt64(ctx, exit_state.status));
+        JS_SetPropertyStr(ctx, result, "signal",
+                          exit_state.signal ? JS_NewInt32(ctx, exit_state.signal) : JS_NULL);
+    }
+    JS_SetPropertyStr(ctx, result, "stdout",
+                      JS_NewUint8ArrayCopy(ctx, (const uint8_t *)(out.data ? out.data : ""), out.len));
+    JS_SetPropertyStr(ctx, result, "stderr",
+                      JS_NewUint8ArrayCopy(ctx, (const uint8_t *)(err.data ? err.data : ""), err.len));
+
+    if (input) JS_FreeCString(ctx, input);
+    free(out.data); free(err.data);
+    for (uint32_t i = 0; i < nargs; i++) free(args[i + 1]);
+    free(args);
+    free(cwd);
+    if (env) { for (char **e = env; *e; e++) free(*e); free(env); }
+    JS_FreeCString(ctx, file);
+    return result;
+}
+
+/* __sxnDnsLookup(hostname, family) -> [{ address, family }, ...]
+   uv_getaddrinfo with no callback resolves on this thread, which is what
+   node:dns's callback forms then hand back on a later tick. */
+static JSValue js_dns_lookup(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "lookup needs a hostname");
+    const char *host = JS_ToCString(ctx, argv[0]);
+    if (!host) return JS_EXCEPTION;
+    int32_t family = 0;
+    if (argc > 1) JS_ToInt32(ctx, &family, argv[1]);
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = family == 4 ? AF_INET : family == 6 ? AF_INET6 : AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    uv_getaddrinfo_t req;
+    int rc = uv_getaddrinfo(uv_default_loop(), &req, NULL, host, NULL, &hints);
+    JS_FreeCString(ctx, host);
+    if (rc != 0) {
+        JSValue error = JS_NewError(ctx);
+        JS_SetPropertyStr(ctx, error, "message", JS_NewString(ctx, uv_strerror(rc)));
+        JS_SetPropertyStr(ctx, error, "code", JS_NewString(ctx, rc == UV_EAI_NONAME ? "ENOTFOUND" : uv_err_name(rc)));
+        return JS_Throw(ctx, error);
+    }
+    JSValue list = JS_NewArray(ctx);
+    uint32_t n = 0;
+    for (struct addrinfo *ai = req.addrinfo; ai; ai = ai->ai_next) {
+        char text[INET6_ADDRSTRLEN] = {0};
+        int is6 = ai->ai_family == AF_INET6;
+        if (is6) uv_ip6_name((struct sockaddr_in6 *)ai->ai_addr, text, sizeof(text));
+        else if (ai->ai_family == AF_INET) uv_ip4_name((struct sockaddr_in *)ai->ai_addr, text, sizeof(text));
+        else continue;
+        JSValue entry = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, entry, "address", JS_NewString(ctx, text));
+        JS_SetPropertyStr(ctx, entry, "family", JS_NewInt32(ctx, is6 ? 6 : 4));
+        JS_SetPropertyUint32(ctx, list, n++, entry);
+    }
+    uv_freeaddrinfo(req.addrinfo);
+    return list;
+}
+
+static JSValue sxn_os_hostname(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    char name[UV_MAXHOSTNAMESIZE];
+    size_t size = sizeof(name);
+    if (uv_os_gethostname(name, &size) != 0) return JS_NewString(ctx, "localhost");
+    return JS_NewString(ctx, name);
+}
+
+static JSValue sxn_os_dir(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic) {
+    (void)this_val; (void)argc; (void)argv;
+    char path[4096];
+    size_t size = sizeof(path);
+    int rc = magic == 0 ? uv_os_homedir(path, &size) : uv_os_tmpdir(path, &size);
+    if (rc != 0) return JS_NewString(ctx, magic == 0 ? "/" : "/tmp");
+    return JS_NewString(ctx, path);
+}
+
+static JSValue sxn_os_uname(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    uv_utsname_t name;
+    JSValue out = JS_NewObject(ctx);
+    if (uv_os_uname(&name) != 0) return out;
+    JS_SetPropertyStr(ctx, out, "sysname", JS_NewString(ctx, name.sysname));
+    JS_SetPropertyStr(ctx, out, "release", JS_NewString(ctx, name.release));
+    JS_SetPropertyStr(ctx, out, "version", JS_NewString(ctx, name.version));
+    JS_SetPropertyStr(ctx, out, "machine", JS_NewString(ctx, name.machine));
+    return out;
+}
+
+static JSValue sxn_os_numbers(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    double avg[3] = {0, 0, 0};
+    uv_loadavg(avg);
+    JSValue out = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, out, "totalmem", JS_NewFloat64(ctx, (double)uv_get_total_memory()));
+    JS_SetPropertyStr(ctx, out, "freemem", JS_NewFloat64(ctx, (double)uv_get_free_memory()));
+    JS_SetPropertyStr(ctx, out, "uptime", JS_NewFloat64(ctx, ({ double up = 0; uv_uptime(&up); up; })));
+    JS_SetPropertyStr(ctx, out, "parallelism", JS_NewInt32(ctx, (int32_t)uv_available_parallelism()));
+    JSValue load = JS_NewArray(ctx);
+    for (int i = 0; i < 3; i++) JS_SetPropertyUint32(ctx, load, i, JS_NewFloat64(ctx, avg[i]));
+    JS_SetPropertyStr(ctx, out, "loadavg", load);
+    return out;
+}
+
+static JSValue sxn_os_cpus(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    uv_cpu_info_t *info = NULL;
+    int count = 0;
+    JSValue out = JS_NewArray(ctx);
+    if (uv_cpu_info(&info, &count) != 0) return out;
+    for (int i = 0; i < count; i++) {
+        JSValue cpu = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, cpu, "model", JS_NewString(ctx, info[i].model));
+        JS_SetPropertyStr(ctx, cpu, "speed", JS_NewInt32(ctx, info[i].speed));
+        JSValue times = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, times, "user", JS_NewFloat64(ctx, (double)info[i].cpu_times.user));
+        JS_SetPropertyStr(ctx, times, "nice", JS_NewFloat64(ctx, (double)info[i].cpu_times.nice));
+        JS_SetPropertyStr(ctx, times, "sys", JS_NewFloat64(ctx, (double)info[i].cpu_times.sys));
+        JS_SetPropertyStr(ctx, times, "idle", JS_NewFloat64(ctx, (double)info[i].cpu_times.idle));
+        JS_SetPropertyStr(ctx, times, "irq", JS_NewFloat64(ctx, (double)info[i].cpu_times.irq));
+        JS_SetPropertyStr(ctx, cpu, "times", times);
+        JS_SetPropertyUint32(ctx, out, (uint32_t)i, cpu);
+    }
+    uv_free_cpu_info(info, count);
+    return out;
+}
+
+/* How many leading one-bits a netmask has, which is what a CIDR suffix is. */
+static int sxn_mask_prefix(const uint8_t *bytes, int len) {
+    int bits = 0;
+    for (int i = 0; i < len; i++) {
+        if (bytes[i] == 0xff) { bits += 8; continue; }
+        uint8_t b = bytes[i];
+        while (b & 0x80) { bits++; b <<= 1; }
+        break;
+    }
+    return bits;
+}
+
+static JSValue sxn_os_interfaces(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    uv_interface_address_t *addresses = NULL;
+    int count = 0;
+    JSValue out = JS_NewObject(ctx);
+    if (uv_interface_addresses(&addresses, &count) != 0) return out;
+    for (int i = 0; i < count; i++) {
+        uv_interface_address_t *a = &addresses[i];
+        bool v6 = a->address.address4.sin_family == AF_INET6;
+        char address[INET6_ADDRSTRLEN] = {0}, netmask[INET6_ADDRSTRLEN] = {0};
+        int prefix;
+        if (v6) {
+            uv_ip6_name(&a->address.address6, address, sizeof(address));
+            uv_ip6_name(&a->netmask.netmask6, netmask, sizeof(netmask));
+            prefix = sxn_mask_prefix((const uint8_t *)&a->netmask.netmask6.sin6_addr, 16);
+        } else {
+            uv_ip4_name(&a->address.address4, address, sizeof(address));
+            uv_ip4_name(&a->netmask.netmask4, netmask, sizeof(netmask));
+            prefix = sxn_mask_prefix((const uint8_t *)&a->netmask.netmask4.sin_addr, 4);
+        }
+        char mac[18];
+        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 (unsigned char)a->phys_addr[0], (unsigned char)a->phys_addr[1],
+                 (unsigned char)a->phys_addr[2], (unsigned char)a->phys_addr[3],
+                 (unsigned char)a->phys_addr[4], (unsigned char)a->phys_addr[5]);
+        char cidr[INET6_ADDRSTRLEN + 8];
+        snprintf(cidr, sizeof(cidr), "%s/%d", address, prefix);
+
+        JSValue entry = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, entry, "address", JS_NewString(ctx, address));
+        JS_SetPropertyStr(ctx, entry, "netmask", JS_NewString(ctx, netmask));
+        JS_SetPropertyStr(ctx, entry, "family", JS_NewString(ctx, v6 ? "IPv6" : "IPv4"));
+        JS_SetPropertyStr(ctx, entry, "mac", JS_NewString(ctx, mac));
+        JS_SetPropertyStr(ctx, entry, "internal", JS_NewBool(ctx, a->is_internal));
+        JS_SetPropertyStr(ctx, entry, "cidr", JS_NewString(ctx, cidr));
+        if (v6)
+            JS_SetPropertyStr(ctx, entry, "scopeid", JS_NewInt32(ctx, (int32_t)a->address.address6.sin6_scope_id));
+
+        JSValue list = JS_GetPropertyStr(ctx, out, a->name);
+        if (!JS_IsArray(list)) {
+            JS_FreeValue(ctx, list);
+            list = JS_NewArray(ctx);
+            JS_SetPropertyStr(ctx, out, a->name, JS_DupValue(ctx, list));
+        }
+        uint32_t length = 0;
+        JSValue size = JS_GetPropertyStr(ctx, list, "length");
+        JS_ToUint32(ctx, &length, size);
+        JS_FreeValue(ctx, size);
+        JS_SetPropertyUint32(ctx, list, length, entry);
+        JS_FreeValue(ctx, list);
+    }
+    uv_free_interface_addresses(addresses, count);
+    return out;
+}
+
+static JSValue sxn_write_stderr(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_UNDEFINED;
+    size_t length = 0;
+    const char *text = JS_ToCStringLen(ctx, &length, argv[0]);
+    if (!text) return JS_EXCEPTION;
+    fwrite(text, 1, length, stderr);
+    fflush(stderr);
+    JS_FreeCString(ctx, text);
+    return JS_UNDEFINED;
+}
+
 static JSValue sxn_write(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     if (argc < 2) return JS_ThrowTypeError(ctx, "Sxn.write(destination, data) requires two arguments");
     const char *path = JS_ToCString(ctx, argv[0]); size_t length = 0;
@@ -1866,11 +2981,12 @@ int sxn_install_network(JSContext *ctx) {
 
     JSValue global = JS_GetGlobalObject(ctx);
     JSValue runtime = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, runtime, "version", JS_NewString(ctx, "0.0.1"));
+    JS_SetPropertyStr(ctx, runtime, "version", JS_NewString(ctx, "0.0.2"));
     JS_SetPropertyStr(ctx, runtime, "serve", JS_NewCFunction(ctx, js_serve, "serve", 2));
     JS_SetPropertyStr(ctx, runtime, "file", JS_NewCFunction(ctx, sxn_file, "file", 1));
     JS_SetPropertyStr(ctx, runtime, "write", JS_NewCFunction(ctx, sxn_write, "write", 2));
     JS_SetPropertyStr(ctx, runtime, "memoryUsage", JS_NewCFunction(ctx, sxn_memory_usage, "memoryUsage", 0));
+    JS_SetPropertyStr(ctx, runtime, "gc", JS_NewCFunction(ctx, sxn_gc, "gc", 0));
     sxn_ffi_init(ctx);
     JS_SetPropertyStr(ctx, runtime, "ffi", JS_NewCFunction(ctx, sxn_ffi, "ffi", 4));
     JS_SetPropertyStr(ctx, global, "Sxn", runtime);
@@ -1880,9 +2996,27 @@ int sxn_install_network(JSContext *ctx) {
        networking primitive, the monotonic clock, and OpenSSL-backed
        crypto); bootstrap.js builds the spec-shaped globals on top of them
        and installs fetch/TextEncoder/URL/Headers/etc. on `global` itself. */
-    JS_SetPropertyStr(ctx, global, "__sxnFetchRaw", JS_NewCFunction(ctx, js_sxn_fetch_raw, "__sxnFetchRaw", 4));
+    JS_SetPropertyStr(ctx, global, "__sxnFetchRaw", JS_NewCFunction(ctx, js_sxn_fetch_raw, "__sxnFetchRaw", 5));
     /* Named "now" because bootstrap.js binds this straight onto performance
        rather than wrapping it, so this is the function user code sees. */
+    JS_SetPropertyStr(ctx, global, "__sxnParseJSONBytes", JS_NewCFunction(ctx, sxn_parse_json_bytes, "__sxnParseJSONBytes", 3));
+    JS_SetPropertyStr(ctx, global, "__sxnStat", JS_NewCFunction(ctx, sxn_stat, "__sxnStat", 3));
+    JS_SetPropertyStr(ctx, global, "__sxnFsConstants", JS_NewCFunction(ctx, js_fs_constants, "__sxnFsConstants", 0));
+    JS_SetPropertyStr(ctx, global, "__sxnUdpOpen", JS_NewCFunction(ctx, js_udp_open, "__sxnUdpOpen", 2));
+    JS_SetPropertyStr(ctx, global, "__sxnUdpBind", JS_NewCFunction(ctx, js_udp_bind, "__sxnUdpBind", 3));
+    JS_SetPropertyStr(ctx, global, "__sxnUdpSend", JS_NewCFunction(ctx, js_udp_send, "__sxnUdpSend", 4));
+    JS_SetPropertyStr(ctx, global, "__sxnUdpClose", JS_NewCFunction(ctx, js_udp_close, "__sxnUdpClose", 1));
+    JS_SetPropertyStr(ctx, global, "__sxnSpawnSync", JS_NewCFunction(ctx, js_spawn_sync, "__sxnSpawnSync", 3));
+    JS_SetPropertyStr(ctx, global, "__sxnDnsLookup", JS_NewCFunction(ctx, js_dns_lookup, "__sxnDnsLookup", 2));
+    JS_SetPropertyStr(ctx, global, "__sxnOsHostname", JS_NewCFunction(ctx, sxn_os_hostname, "__sxnOsHostname", 0));
+    JS_SetPropertyStr(ctx, global, "__sxnOsHomedir", JS_NewCFunctionMagic(ctx, sxn_os_dir, "__sxnOsHomedir", 0, JS_CFUNC_generic_magic, 0));
+    JS_SetPropertyStr(ctx, global, "__sxnOsTmpdir", JS_NewCFunctionMagic(ctx, sxn_os_dir, "__sxnOsTmpdir", 0, JS_CFUNC_generic_magic, 1));
+    JS_SetPropertyStr(ctx, global, "__sxnOsUname", JS_NewCFunction(ctx, sxn_os_uname, "__sxnOsUname", 0));
+    JS_SetPropertyStr(ctx, global, "__sxnOsNumbers", JS_NewCFunction(ctx, sxn_os_numbers, "__sxnOsNumbers", 0));
+    JS_SetPropertyStr(ctx, global, "__sxnOsCpus", JS_NewCFunction(ctx, sxn_os_cpus, "__sxnOsCpus", 0));
+    JS_SetPropertyStr(ctx, global, "__sxnOsInterfaces", JS_NewCFunction(ctx, sxn_os_interfaces, "__sxnOsInterfaces", 0));
+    JS_SetPropertyStr(ctx, global, "__sxnPid", JS_NewInt32(ctx, (int32_t)uv_os_getpid()));
+    JS_SetPropertyStr(ctx, global, "__sxnWriteStderr", JS_NewCFunction(ctx, sxn_write_stderr, "__sxnWriteStderr", 1));
     JS_SetPropertyStr(ctx, global, "__sxnNow", JS_NewCFunction(ctx, sxn_now, "now", 0));
 #ifdef SXN_ABLATE_FUSION
     JS_SetPropertyStr(ctx, global, "__ablNop",
@@ -1895,6 +3029,9 @@ int sxn_install_network(JSContext *ctx) {
                       JS_NewCFunction(ctx, sxn_abl_emit, "__ablEmit", 2));
 #endif
     JS_SetPropertyStr(ctx, global, "__sxnRandomBytes", JS_NewCFunction(ctx, sxn_random_bytes, "__sxnRandomBytes", 1));
+    JS_SetPropertyStr(ctx, global, "__sxnBytesCompare", JS_NewCFunction(ctx, sxn_bytes_compare, "__sxnBytesCompare", 2));
+    JS_SetPropertyStr(ctx, global, "__sxnHmac", JS_NewCFunction(ctx, sxn_hmac, "__sxnHmac", 3));
+    JS_SetPropertyStr(ctx, global, "__sxnTimingSafeEqual", JS_NewCFunction(ctx, sxn_timing_safe_equal, "__sxnTimingSafeEqual", 2));
     JS_SetPropertyStr(ctx, global, "__sxnDigest", JS_NewCFunction(ctx, sxn_digest, "__sxnDigest", 2));
     /* Consumed only by bootstrap.js's TextEncoder/TextDecoder. */
     JS_SetPropertyStr(ctx, global, "__sxnUtf8Encode", JS_NewCFunction(ctx, sxn_utf8_encode, "__sxnUtf8Encode", 1));
@@ -1936,9 +3073,16 @@ int sxn_install_network(JSContext *ctx) {
    forever -- the promise could only be settled by work that never got a
    chance to run. Mirrors js_std_await's contract: consumes obj, returns the
    fulfilled value or throws the rejection, and passes non-promises through. */
+/* Defined below with the rest of the idle-sweep machinery. Both loops in this
+   file call it: a module with top-level await never reaches
+   sxn_run_event_loop, so hooking only that one leaves every `await` daemon
+   uncollected. */
+static void sxn_maybe_idle_gc(JSContext *ctx, JSRuntime *rt, uint64_t blocked_ns);
+
 JSValue sxn_await_with_loop(JSContext *ctx, JSValue obj) {
     JSRuntime *rt = JS_GetRuntime(ctx);
     uv_loop_t *loop = sxn_loop();
+    uint64_t blocked_ns = 0, before;
     for (;;) {
         int state = JS_PromiseState(ctx, obj);
         if (state == JS_PROMISE_FULFILLED) {
@@ -1965,25 +3109,112 @@ JSValue sxn_await_with_loop(JSContext *ctx, JSValue obj) {
            blocks until something is ready rather than spinning. If nothing is
            pending either, the promise can never settle -- return it and let
            the caller see a still-pending module rather than hang. */
-        if (!uv_run(loop, UV_RUN_ONCE) && !JS_IsJobPending(rt))
+        sxn_maybe_idle_gc(ctx, rt, blocked_ns);
+        before = uv_hrtime();
+        int more_handles = uv_run(loop, UV_RUN_ONCE);
+        blocked_ns = uv_hrtime() - before;
+        if (!more_handles && !JS_IsJobPending(rt))
             return obj;
     }
+}
+
+/* Set by the rejection tracker in src/main.c when a promise is rejected with
+   nothing watching it. The loop below runs on every batch of I/O, so it asks
+   this variable rather than the global object: with no rejection in flight
+   the whole report costs one comparison. */
+int sxn_rejections_pending = 0;
+
+/* Calls the JavaScript half of the rejection report, if it is installed. */
+static void sxn_flush_rejections(JSContext *ctx) {
+    if (!sxn_rejections_pending) return;
+    sxn_rejections_pending = 0;
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue fn = JS_GetPropertyStr(ctx, global, "__sxnFlushRejections");
+    if (JS_IsFunction(ctx, fn)) {
+        JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 0, NULL);
+        if (JS_IsException(r)) JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, r);
+    }
+    JS_FreeValue(ctx, fn);
+    JS_FreeValue(ctx, global);
+}
+
+/* --- Idle cycle sweeping -------------------------------------------------
+   QuickJS only collects from an allocation, so a process that stops
+   allocating stops collecting. That is fine for a script and wrong for a
+   daemon: a burst that leaves cyclic garbage behind and then goes quiet keeps
+   every byte of it, and because js_trigger_gc sized the threshold for the
+   peak, the next burst has to be half again as large before anything
+   notices. Measured, 200k cyclic objects dropped and then 96 MB of further
+   churn produced zero collections and held 229 MB.
+
+   The loop below knows something no allocation site does: when it is about to
+   block in uv_run there is no request in flight, so a collection costs
+   nothing anyone is waiting on. The gate is deliberately narrow.
+
+   - Above a floor, 32 MB by default. Under it there is not enough to reclaim
+     to be worth a pause, so a small server keeps exactly the pause profile it
+     has today and this code is a load and a compare.
+   - The previous uv_run actually blocked for a while. That is the direct
+     measurement of "quiet" and it is why this is timed rather than inferred
+     from the allocation rate: a first attempt gated on tracked size not
+     growing between turns never fired, because a loop with any timer on it
+     allocates a trickle every turn and the size always crept up.
+   - At least half a second since the last sweep, so a loop woken constantly
+     by short timers cannot turn this into a collection per turn. */
+#define SXN_IDLE_GC_FLOOR_DEFAULT (32u * 1024u * 1024u)
+#define SXN_IDLE_GC_INTERVAL_NS   (500u * 1000u * 1000u)
+#define SXN_IDLE_GC_BLOCKED_NS    (20u * 1000u * 1000u)
+
+static int sxn_idle_gc_enabled = 1;
+static size_t sxn_idle_gc_floor = SXN_IDLE_GC_FLOOR_DEFAULT;
+
+void sxn_configure_idle_gc(int enabled, size_t floor_bytes) {
+    sxn_idle_gc_enabled = enabled;
+    if (floor_bytes) sxn_idle_gc_floor = floor_bytes;
+}
+
+/* blocked_ns is how long the previous uv_run waited for work. */
+static void sxn_maybe_idle_gc(JSContext *ctx, JSRuntime *rt, uint64_t blocked_ns) {
+    static uint64_t last_sweep_ns;
+    uint64_t now;
+
+    if (!sxn_idle_gc_enabled) return;
+    if (blocked_ns < SXN_IDLE_GC_BLOCKED_NS) return;
+    if (JS_GetMallocSize(rt) < sxn_idle_gc_floor) return;
+    now = uv_hrtime();
+    if (last_sweep_ns && now - last_sweep_ns < SXN_IDLE_GC_INTERVAL_NS) return;
+    last_sweep_ns = now;
+    sxn_free_ee_memo(ctx);
+    sxn_sweep_cycles(rt);
 }
 
 int sxn_run_event_loop(JSContext *ctx) {
     uv_loop_t *loop = sxn_loop();
     JSRuntime *rt = JS_GetRuntime(ctx);
+    uint64_t blocked_ns = 0;
     for (;;) {
         JSContext *ctx1; int err;
+        uint64_t before;
         while ((err = JS_ExecutePendingJob(rt, &ctx1)) > 0) {}
         if (err < 0) break;
+        /* Every job that could still settle a rejected promise has now run,
+           so anything still on the list is unhandled: report it (which is
+           what fires onunhandledrejection) before waiting for more I/O. */
+        sxn_flush_rejections(ctx);
+        /* Nothing is in flight here and uv_run is about to block, so this is
+           the cheapest moment in the process to spend a collection -- and how
+           long the last one blocked says whether there was anything to do. */
+        sxn_maybe_idle_gc(ctx, rt, blocked_ns);
         /* UV_RUN_ONCE blocks (no busy-loop) until the next batch of I/O is
            ready, then returns so we can drain any jobs it just enqueued
            before waiting on the next batch. Exits once nothing is left:
            no active/ref'd handles (e.g. no serve() was ever called) and no
            pending job, which is what keeps a plain script's exit identical
            to before this loop existed. */
+        before = uv_hrtime();
         int more_handles = uv_run(loop, UV_RUN_ONCE);
+        blocked_ns = uv_hrtime() - before;
         if (!more_handles && !JS_IsJobPending(rt)) break;
     }
     return JS_HasException(ctx);

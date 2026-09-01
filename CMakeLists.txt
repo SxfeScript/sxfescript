@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(sxn VERSION 0.0.1 LANGUAGES C)
+project(sxn VERSION 0.0.2 LANGUAGES C)
 # Every other dependency here (curl, zlib, libuv, libffi) resolves to a
 # dylib under /usr/lib on macOS - part of the OS, present on every Mac.
 # OpenSSL doesn't ship there anymore, so find_package(OpenSSL) resolves to
@@ -9,8 +9,32 @@ project(sxn VERSION 0.0.1 LANGUAGES C)
 if(APPLE)
   set(OPENSSL_USE_STATIC_LIBS TRUE)
 endif()
-find_package(OpenSSL REQUIRED)
-find_package(CURL REQUIRED)
+if(DEFINED SXN_CROSS_DEPS_ROOT)
+  # Cross builds cannot use the host's FindOpenSSL/CURL/ZLIB results.  The
+  # release builder supplies a target sysroot containing import libraries.
+  set(_cross_root "${SXN_CROSS_DEPS_ROOT}")
+  add_library(OpenSSL::Crypto UNKNOWN IMPORTED)
+  set_target_properties(OpenSSL::Crypto PROPERTIES
+    IMPORTED_LOCATION "${_cross_root}/lib/libcrypto.dll.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${_cross_root}/include")
+  add_library(OpenSSL::SSL UNKNOWN IMPORTED)
+  set_target_properties(OpenSSL::SSL PROPERTIES
+    IMPORTED_LOCATION "${_cross_root}/lib/libssl.dll.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${_cross_root}/include"
+    INTERFACE_LINK_LIBRARIES OpenSSL::Crypto)
+  add_library(CURL::libcurl UNKNOWN IMPORTED)
+  set_target_properties(CURL::libcurl PROPERTIES
+    IMPORTED_LOCATION "${_cross_root}/lib/libcurl.dll.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${_cross_root}/include"
+    INTERFACE_LINK_LIBRARIES "ws2_32;crypt32;bcrypt;advapi32")
+  add_library(ZLIB::ZLIB UNKNOWN IMPORTED)
+  set_target_properties(ZLIB::ZLIB PROPERTIES
+    IMPORTED_LOCATION "${_cross_root}/lib/libz.dll.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${_cross_root}/include")
+else()
+  find_package(OpenSSL REQUIRED)
+  find_package(CURL REQUIRED)
+endif()
 # libuv ships a CMake config package from Homebrew and vcpkg, but Ubuntu's
 # libuv1-dev provides only pkg-config, so fall back to that rather than
 # requiring the config package everywhere.
@@ -71,7 +95,7 @@ endif()
 # writing to a directory the other one hasn't created yet.
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
-# WinterCG globals (TextEncoder, URL, Headers, fetch's JS glue, ...) are
+# WinterTC globals (TextEncoder, URL, Headers, fetch's JS glue, ...) are
 # authored as plain JS in src/bootstrap.js and compiled to bytecode at build
 # time, so startup reads a prepared function instead of parsing 140KB of
 # JavaScript on every launch -- worth about 3ms of a 10ms cold start.
@@ -94,7 +118,7 @@ add_custom_target(sxn_bootstrap_header DEPENDS ${SXN_BOOTSTRAP_HEADER})
 
 # node:buffer/path/events/process are authored and compiled the same way
 # (src/node_compat.js), kept as a separate file/header from bootstrap.js
-# since it's a distinct WinterCG-vs-Node-compat concern.
+# since it's a distinct WinterTC-vs-Node-compat concern.
 set(SXN_NODE_COMPAT_JS ${CMAKE_CURRENT_SOURCE_DIR}/src/node_compat.js)
 set(SXN_NODE_COMPAT_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/sxn_node_compat.h)
 add_custom_command(
@@ -186,6 +210,42 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   add_test(NAME sxn-sx-module COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/import-main.sx)
   add_test(NAME sxn-reject-enum COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/reject-enum.sx)
   set_tests_properties(sxn-reject-enum PROPERTIES WILL_FAIL TRUE)
+  # `&mut` requires a mutable owner. The legal direction is covered by
+  # sxn-example (velocity.sx) and sxn-example-hello, both of which borrow a
+  # `let mut`; this is the rejection side.
+  add_test(NAME sxn-reject-mut-borrow COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/reject-mut-borrow.sx)
+  set_tests_properties(sxn-reject-mut-borrow PROPERTIES WILL_FAIL TRUE)
+  # `safe` specializes on the declared type, so i32 wraps and every other
+  # annotation keeps exact JS arithmetic. Both right-hand-side shapes are
+  # covered: a constant and a local compile through different peephole
+  # branches and used to disagree.
+  add_test(NAME sxn-typed-overflow COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/typed_overflow.sx)
+  set_tests_properties(sxn-typed-overflow PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # A call to a small function with a declared scalar signature is spliced
+  # into its caller. This asserts the splice changes nothing observable: same
+  # values, same coercions, same exceptions, and no splice at all when the
+  # binding is reassigned, captured, or the shape does not qualify. Every
+  # expected value here is Node's, checked with the annotations stripped.
+  add_test(NAME sxn-typed-inline COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/typed_inline.sx)
+  set_tests_properties(sxn-typed-inline PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # Reference cycles are invisible to refcounting and reclaimable only by the
+  # cycle collector, which runs only on allocation. Sxn.gc() is the explicit
+  # ask; this asserts a burst of 100k cyclic closures comes back.
+  add_test(NAME sxn-leak-cycle-stress COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/leak_cycle_stress.sx)
+  set_tests_properties(sxn-leak-cycle-stress PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # And the same reclamation with nobody asking: a daemon that takes a burst
+  # and then waits must give the memory back on its own. Run both ways, since
+  # the whole point of --no-idle-gc is that it does not.
+  add_test(NAME sxn-leak-idle-sweep COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/leak_idle_sweep.mjs)
+  set_tests_properties(sxn-leak-idle-sweep PROPERTIES TIMEOUT 60 FAIL_REGULAR_EXPRESSION "FAIL")
+  add_test(NAME sxn-leak-idle-sweep-off
+           COMMAND sxn --no-idle-gc ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/leak_idle_sweep.mjs --expect-no-sweep)
+  set_tests_properties(sxn-leak-idle-sweep-off PROPERTIES TIMEOUT 60 FAIL_REGULAR_EXPRESSION "FAIL")
+  # Listeners added and never removed are how a server grows one closure at a
+  # time. Every expectation here is Node's: the fixture passes unchanged under
+  # `node tests/fixtures/events_maxlisteners.mjs`.
+  add_test(NAME sxn-events-maxlisteners COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/events_maxlisteners.mjs)
+  set_tests_properties(sxn-events-maxlisteners PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   # Regression coverage: SX's contextual `interface` grammar hook must not
   # leak into ordinary .cjs execution (see update_token_ident in quickjs.c).
   add_test(NAME sxn-interface-ident COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/interface-ident.cjs)
@@ -325,6 +385,9 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # node:stream: flowing and paused modes, pipe, transform, pipeline, the
   # Buffer conversion outside objectMode, and the Web Streams bridges.
   add_test(NAME sxn-node-stream COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_stream.mjs)
+  # This one prints its results in one go at the end, so silence is failure:
+  # require the last line rather than merely the absence of FAIL.
+  set_tests_properties(sxn-node-stream PROPERTIES PASS_REGULAR_EXPRESSION "bytes join into one read")
   set_tests_properties(sxn-node-stream PROPERTIES TIMEOUT 40)
   # node:http: the (req, res) server, headers, chunked writes, request bodies
   # and a response finished after the handler returns.
@@ -334,6 +397,55 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   add_test(NAME sxn-node-http COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_http.mjs)
   add_test(NAME sxn-node-zlib COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_zlib.mjs)
   add_test(NAME sxn-node-crypto-net COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_crypto_net.mjs)
+  # node:os and the parts of node:fs a server needs, against the real machine
+  # rather than against stubbed answers.
+  add_test(NAME sxn-node-os-fs COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_os_fs.mjs)
+  set_tests_properties(sxn-node-os-fs PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # node:querystring, now native C, against what Node itself printed.
+  add_test(NAME sxn-node-querystring COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_querystring.mjs)
+  set_tests_properties(sxn-node-querystring PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # node:path, posix and win32, against what Node prints for the same corpus.
+  add_test(NAME sxn-node-path COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_path.mjs)
+  set_tests_properties(sxn-node-path PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # net.isIP, against Node's own answers.
+  add_test(NAME sxn-node-isip COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_isip.mjs)
+  set_tests_properties(sxn-node-isip PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # HMAC and timingSafeEqual, against Node's own digests.
+  add_test(NAME sxn-node-hmac COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_hmac.mjs)
+  set_tests_properties(sxn-node-hmac PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # Buffer's numeric accessors and compare, against Node's own answers.
+  add_test(NAME sxn-node-buffer-numbers COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_buffer_numbers.mjs)
+  set_tests_properties(sxn-node-buffer-numbers PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # require() of every builtin, both spellings, now a native table lookup.
+  add_test(NAME sxn-node-builtin-require COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_builtin_require.mjs)
+  set_tests_properties(sxn-node-builtin-require PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # latin1/ascii/utf16le in both directions, now native, against Node.
+  add_test(NAME sxn-node-buffer-units COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_buffer_units.mjs)
+  set_tests_properties(sxn-node-buffer-units PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # StringDecoder's utf-8 path, native, against every way of splitting a
+  # multi-byte character across chunks.
+  add_test(NAME sxn-node-string-decoder COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_string_decoder.mjs)
+  set_tests_properties(sxn-node-string-decoder PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # zlib keeps its stream between calls and resets it; the bytes must not
+  # change, across window bits, levels and sizes.
+  add_test(NAME sxn-node-zlib-reuse COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_zlib_reuse.mjs)
+  set_tests_properties(sxn-node-zlib-reuse PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # util.inspect, native: every kind of value, the depth limit and a cycle.
+  add_test(NAME sxn-node-inspect COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_inspect.mjs)
+  set_tests_properties(sxn-node-inspect PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # process.nextTick carries its arguments natively.
+  add_test(NAME sxn-node-next-tick COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_next_tick.mjs)
+  set_tests_properties(sxn-node-next-tick PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # process.cwd() is cached; process.chdir() is what clears it.
+  add_test(NAME sxn-node-process-cwd COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_process_cwd.mjs)
+  set_tests_properties(sxn-node-process-cwd PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # node:assert's structural comparison, now native C, against Node's answers
+  # for the same 130 pairs.
+  add_test(NAME sxn-node-assert COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_assert.mjs)
+  set_tests_properties(sxn-node-assert PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # util.format, against Node's own output.
+  add_test(NAME sxn-node-format COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_format.mjs)
+  set_tests_properties(sxn-node-format PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   # Every Buffer encoding in both directions, including Node's lenient hex and
   # base64 readers. Expectations are Node's own output, so a divergence fails.
   add_test(NAME sxn-buffer-encodings COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/buffer_encodings.mjs)
@@ -388,6 +500,43 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   add_test(NAME sxn-serve-headers COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_headers.mjs)
   set_tests_properties(sxn-serve-headers PROPERTIES TIMEOUT 30 FAIL_REGULAR_EXPRESSION "FAIL")
   add_test(NAME sxn-serve-fetch-shape COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_fetch_shape.mjs)
+  # A request larger than one read: the server has to accumulate reads until
+  # the head and the announced body are both in hand.
+  add_test(NAME sxn-serve-large-body COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_large_body.mjs)
+  set_tests_properties(sxn-serve-large-body PROPERTIES TIMEOUT 60 FAIL_REGULAR_EXPRESSION "FAIL")
+  # HTTP keep-alive: a connection is reused for the next request, and stop()
+  # closes the ones still open.
+  add_test(NAME sxn-serve-keepalive COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_keepalive.mjs)
+  set_tests_properties(sxn-serve-keepalive PROPERTIES TIMEOUT 60 FAIL_REGULAR_EXPRESSION "FAIL")
+  # Where a server binds: the hostname option, and reusePort for running one
+  # process per core.
+  add_test(NAME sxn-serve-bind COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_bind.mjs)
+  set_tests_properties(sxn-serve-bind PROPERTIES TIMEOUT 60 FAIL_REGULAR_EXPRESSION "FAIL")
+  # A served request's headers are built on first read; they still have to
+  # behave as if they had been built up front.
+  add_test(NAME sxn-serve-lazy-headers COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_lazy_headers.mjs)
+  set_tests_properties(sxn-serve-lazy-headers PROPERTIES TIMEOUT 60 FAIL_REGULAR_EXPRESSION "FAIL")
+  # The request body reaches a handler as the bytes the server read, without
+  # a string in between -- including over a reused connection.
+  add_test(NAME sxn-serve-body-bytes COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/serve_body_bytes.mjs)
+  set_tests_properties(sxn-serve-body-bytes PROPERTIES TIMEOUT 60 FAIL_REGULAR_EXPRESSION "FAIL")
+  # JSON.parse/JSON.stringify at the edges of their fast paths: escapes,
+  # surrogates, non-ASCII, control characters and every number form. The
+  # expectations are Node's own output, so a divergence fails.
+  add_test(NAME sxn-json-edges COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/json_edges.mjs)
+  set_tests_properties(sxn-json-edges PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # Every name the Minimum Common API asks for, and what the new ones do:
+  # URLPattern's matching, the compression streams, BYOB reads.
+  add_test(NAME sxn-wintertc-surface COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/wintertc_surface.mjs)
+  set_tests_properties(sxn-wintertc-surface PROPERTIES TIMEOUT 60 FAIL_REGULAR_EXPRESSION "FAIL")
+  # The builtins beyond the original 24, exercised rather than probed: a real
+  # child process, a real DNS answer, a real UDP round trip.
+  add_test(NAME sxn-node-new-builtins COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_new_builtins.mjs)
+  set_tests_properties(sxn-node-new-builtins PROPERTIES TIMEOUT 60 FAIL_REGULAR_EXPRESSION "FAIL")
+  # 4000 seeded-random documents through parse and stringify, hashed. The
+  # expected hash is Node's, so one byte of divergence anywhere fails.
+  add_test(NAME sxn-json-fuzz COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/json_fuzz.mjs)
+  set_tests_properties(sxn-json-fuzz PROPERTIES TIMEOUT 120 FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-serve-fetch-shape PROPERTIES TIMEOUT 30 FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-performance-now PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")

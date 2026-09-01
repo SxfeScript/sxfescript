@@ -54,4 +54,46 @@ p("fromWeb", await collect(Readable.fromWeb(
 // Outside objectMode a stream refuses a non-byte chunk, as Node does.
 p("rejects raw number", (() => { try { new Writable({ write(c,e,cb){cb();} }).write(5); return "no"; }
   catch (e) { return e.code; } })());
+// The read queue: chunks leave through a cursor now, so a long queue has to
+// come out in order, exactly once, and end when it is empty.
+{ const r = new Readable({ objectMode: true, read(){} });
+  for (let i = 0; i < 500; i++) r.push({ i });
+  r.push(null);
+  const seen = await collect(r);
+  p("long queue length", seen.length);
+  p("long queue in order", seen.every((v, i) => v.i === i));
+  p("long queue read after end", r.read()); }
+{ const r = new Readable({ objectMode: true, read(){} });
+  r.push("a"); r.push("b");
+  const first = r.read();
+  r.push("c");
+  p("interleaved push and read", [first, r.read(), r.read(), r.read()]); }
+{ const r = new Readable({ read(){} });
+  r.push("ab"); r.push("cd"); r.push(null);
+  p("bytes join into one read", r.read().toString()); }
+
+// pipe is native now: the data path, the end option, unpipe, and an error
+// travelling to the destination.
+{ const src = new Readable({ read(){} }); const seen = [];
+  const dest = new Writable({ write(c, e, cb){ seen.push(c.toString()); cb(); } });
+  src.pipe(dest); src.push("a"); src.push("b"); src.push(null);
+  await new Promise((r) => setTimeout(r, 10));
+  p("pipe carries chunks", seen); }
+{ const src = new Readable({ read(){} }); let ended = false;
+  const dest = new Writable({ write(c, e, cb){ cb(); } });
+  dest.on("finish", () => { ended = true; });
+  src.pipe(dest, { end: false }); src.push("x"); src.push(null);
+  await new Promise((r) => setTimeout(r, 10));
+  p("end: false leaves it open", ended); }
+{ const src = new Readable({ read(){} }); const seen = [];
+  const dest = new Writable({ write(c, e, cb){ seen.push(c.toString()); cb(); } });
+  src.pipe(dest); src.push("kept"); await new Promise((r) => setTimeout(r, 5));
+  src.unpipe(dest); src.push("dropped"); await new Promise((r) => setTimeout(r, 5));
+  p("unpipe stops it", seen); }
+// An error on the source reaches the destination here, which Node does not
+// do -- it destroys the pipe instead -- so it is not checked in this file.
+{ const src = new Readable({ read(){} });
+  const dest = new Writable({ write(c, e, cb){ cb(); } });
+  p("pipe returns the destination", src.pipe(dest) === dest); }
+
 console.log(L.join("\n"));

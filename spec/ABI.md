@@ -9,6 +9,14 @@ The production engine will expose distinct `sx_*` bytecodes for allocation,
 move, shared borrow, mutable borrow, release, field access, and owned drop.
 QuickJS `OP_drop` remains untouched because it is an operand-stack operation.
 
+None of those exist yet, and the ownership rules are still erased at runtime:
+`&mut` aliases through JavaScript object identity, so it mutates a struct in
+place but cannot write back to a caller's number. One rule is enforced ahead
+of them at parse time -- `&mut` requires a `let mut` owner, SX2003 -- and the
+declared scalar types are recorded rather than stripped, which is what gates
+the i32 arithmetic semantics and the typed-call inlining. `spec/LANGUAGE.md`
+has the contract and `spec/IMPLEMENTATION.md` has what is checked today.
+
 Moving a layout value into JavaScript consumes it and boxes a copy. Borrowing it
 into JavaScript creates a revocable proxy. Typed JavaScript objects crossing
 into SX use shared/exclusive header locks, and incompatible property writes

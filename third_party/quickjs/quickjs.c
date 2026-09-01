@@ -837,7 +837,7 @@ typedef struct JSClosureVar {
     uint8_t is_const : 1; /* const variable (is_lexical = 1 if is_const = 1) */
     uint8_t var_kind : 4; /* see JSVarKindEnum */
     uint8_t is_safe_i32 : 1; /* SX `safe ... : i32` binding: stores must wrap */
-    /* 6 bits available */
+    /* 2 bits available */
     uint16_t var_idx; /* JS_CLOSURE_LOCAL/JS_CLOSURE_ARG: index to a normal variable of the
                     parent function. otherwise: index to a closure
                     variable of the parent function */
@@ -875,6 +875,25 @@ typedef enum {
                             allocated immediately after it). */
 } JSVarKindEnum;
 
+/* SX declared types. What an annotation said, recorded rather than thrown
+   away, so codegen can specialize on the type that was actually written
+   instead of on the single `safe` bit. SX_TYPE_NONE means no annotation;
+   SX_TYPE_OTHER means one was written that codegen cannot act on (a union,
+   a generic, an inline object type). Four bits, so any addition past
+   SX_TYPE_NUMBER needs the bitfields below widened. Only the types codegen
+   acts on are named: a struct, a borrow, `string` and `void` are all
+   SX_TYPE_OTHER, because nothing reads them and a value nothing reads is a
+   value that goes stale. Add one back with its consumer, not before. */
+typedef enum SxType {
+    SX_TYPE_NONE = 0,
+    SX_TYPE_OTHER,
+    SX_TYPE_I32,
+    SX_TYPE_F32,
+    SX_TYPE_F64,
+    SX_TYPE_BOOL,
+    SX_TYPE_NUMBER,
+} SxType;
+
 /* XXX: could use a different structure in bytecode functions to save
    memory */
 typedef struct JSVarDef {
@@ -899,6 +918,14 @@ typedef struct JSVarDef {
     uint8_t is_sx_module_local : 1; /* module top-level `safe let` kept as a plain
                                        local; demotable back to a module var if a
                                        later `export {}` clause names it */
+    uint8_t is_sx_mut : 1; /* SX `let mut`: a mutable owner, so `&mut` may
+                              borrow it exclusively (spec/LANGUAGE.md) */
+    /* SxType: the declared annotation, or SX_TYPE_NONE. Compile-time only,
+       like is_safe_i32, and so deliberately not written to .sxbc: everything
+       that reads it -- the i32 opcode gating and sx_inline_typed_calls --
+       has already run by the time bytecode is serialized, and its effect is
+       baked into the emitted code. */
+    uint8_t sx_type : 4;
     uint8_t var_kind : 4; /* see JSVarKindEnum */
     /* if is_captured = true, provides the index of the corresponding
        JSVarRef on stack */
@@ -943,6 +970,9 @@ typedef struct JSFunctionBytecode {
     uint8_t gc_free_candidate : 1; /* no potentially allocating bytecodes */
     /* 0=unknown, 1=the immutable captured-add callback shape, 2=not it. */
     uint8_t fast_captured_add : 2;
+    /* SxType of the declared return annotation. Parameter types need no
+       field: vardefs[0..arg_count) are JSVarDefs and carry their own. */
+    uint8_t sx_ret_type : 4;
     /* Closure cell used by the cached captured-add shape. */
     uint16_t fast_captured_add_ref;
     uint8_t *byte_code_buf; /* (self pointer) */
@@ -4746,6 +4776,20 @@ static no_inline int string_buffer_putc16_slow(StringBuffer *s, uint32_t c)
 }
 
 /* 0 <= c <= 0xff */
+static int string_buffer_putc8(StringBuffer *s, uint32_t c);
+
+/* The one-byte case, inline: JSON.stringify calls this for every brace,
+   comma, colon and quote -- half a dozen times per property -- and the call
+   itself was costing more than the store. */
+static inline int string_buffer_putc8_fast(StringBuffer *s, uint32_t c)
+{
+    if (likely(s->len < s->size && !s->is_wide_char)) {
+        str8(s->str)[s->len++] = c;
+        return 0;
+    }
+    return string_buffer_putc8(s, c);
+}
+
 static int string_buffer_putc8(StringBuffer *s, uint32_t c)
 {
     if (unlikely(s->len >= s->size)) {
@@ -4936,6 +4980,20 @@ static int string_buffer_concat_value_free(StringBuffer *s, JSValue v)
         return -1;
     }
     tag = JS_VALUE_GET_TAG(v);
+    /* An integer's digits, and the three literals, go straight into the
+       buffer. The general path below asks JS_ToString for them, which
+       allocates a string, copies it in and frees it -- once per value, and a
+       JSON document is mostly these. */
+    if (tag == JS_TAG_INT) {
+        char buf[16];
+        size_t len = i64toa(buf, JS_VALUE_GET_INT(v));
+        return string_buffer_write8(s, (const uint8_t *)buf, (int)len);
+    }
+    if (tag == JS_TAG_BOOL)
+        return JS_VALUE_GET_BOOL(v) ? string_buffer_write8(s, (const uint8_t *)"true", 4)
+                                    : string_buffer_write8(s, (const uint8_t *)"false", 5);
+    if (tag == JS_TAG_NULL)
+        return string_buffer_write8(s, (const uint8_t *)"null", 4);
     if (tag == JS_TAG_STRING_ROPE) {
         /* concatenate rope (don't free since concat_value doesn't free) */
         res = string_buffer_concat_value(s, v);
@@ -5497,7 +5555,14 @@ const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1,
            strings, which is the most common case.
          */
         count = 0;
-        for (pos = 0; pos < len; pos++) {
+        pos = 0;
+        /* Eight bytes at a time while they stay ASCII, which for the common
+           case -- an ASCII string, returned below without a copy at all --
+           is the whole scan. Only a string that does contain a non-ASCII
+           byte pays the per-byte count, and only from where it starts. */
+        while (pos + 8 <= len && !(get_u64(src + pos) & 0x8080808080808080ULL))
+            pos += 8;
+        for (; pos < len; pos++) {
             count += src[pos] >> 7;
         }
         if (count == 0 && str->kind == JS_STRING_KIND_NORMAL) {
@@ -5529,6 +5594,27 @@ const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1,
         q = str8(str_new);
         pos = 0;
         while (pos < len) {
+            /* Four code points at a time while they are all ASCII: text is
+               mostly ASCII even when one accent makes the whole string
+               wide, and this loop is what every JS_ToCString of such a
+               string spends its time in. */
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+            while (pos + 4 <= len) {
+                uint64_t v = get_u64((const uint8_t *)(src + pos));
+                /* Little-endian only: the mask says "the high byte of each
+                   16-bit unit is zero and its low byte is below 0x80". */
+                if (v & 0xff80ff80ff80ff80ULL)
+                    break;
+                q[0] = (uint8_t)src[pos];
+                q[1] = (uint8_t)src[pos + 1];
+                q[2] = (uint8_t)src[pos + 2];
+                q[3] = (uint8_t)src[pos + 3];
+                q += 4;
+                pos += 4;
+            }
+#endif
+            if (pos >= len)
+                break;
             c = src[pos++];
             if (c < 0x80) {
                 *q++ = c;
@@ -15964,26 +16050,91 @@ static JSValue JS_ToStringCheckObject(JSContext *ctx, JSValueConst val)
     return JS_ToString(ctx, val);
 }
 
-static JSValue JS_ToQuotedString(JSContext *ctx, JSValueConst val1)
+/* Characters a JSON string can carry unescaped: not a quote, not a
+   backslash, not a control character. Eight bytes at a time -- most strings
+   need no escaping at all, and the per-character loop this replaces was the
+   largest single cost in JSON.stringify. */
+static int json_quote_run8(const uint8_t *p, int len)
 {
+    int i = 0;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    while (i + 8 <= len) {
+        uint64_t v = get_u64(p + i);
+        uint64_t quote = v ^ 0x2222222222222222ULL;
+        uint64_t slash = v ^ 0x5c5c5c5c5c5c5c5cULL;
+        /* (x - 0x01..) & ~x sets the high bit of any byte that was zero,
+           which is how each of these three tests finds its byte. */
+        uint64_t mask = (((quote - 0x0101010101010101ULL) & ~quote)
+                       | ((slash - 0x0101010101010101ULL) & ~slash)
+                       | ((v - 0x2020202020202020ULL) & ~v))
+                      & 0x8080808080808080ULL;
+        if (mask)
+            return i + (ctz64(mask) >> 3);
+        i += 8;
+    }
+#endif
+    while (i < len) {
+        uint8_t c = p[i];
+        if (c == '"' || c == '\\' || c < 0x20)
+            break;
+        i++;
+    }
+    return i;
+}
+
+/* The same for a wide string. A surrogate ends the run, so the character
+   loop below still pairs it up or escapes it as it always did. */
+static int json_quote_run16(const uint16_t *p, int len)
+{
+    int i = 0;
+    while (i < len) {
+        uint16_t c = p[i];
+        if (c == '"' || c == '\\' || c < 0x20 || is_surrogate(c))
+            break;
+        i++;
+    }
+    return i;
+}
+
+/* Writes the quoted form of `val1` into a buffer the caller already has.
+   JSON.stringify used to allocate a quoted string for every key and every
+   string value, copy it into its output buffer, and free it again. */
+static int string_buffer_quote(StringBuffer *b, JSValueConst val1)
+{
+    JSContext *ctx = b->ctx;
     JSValue val;
     JSString *p;
-    int i;
+    int i, run;
     uint32_t c;
-    StringBuffer b_s, *b = &b_s;
     char buf[16];
 
     val = JS_ToStringCheckObject(ctx, val1);
     if (JS_IsException(val))
-        return val;
+        return -1;
     p = JS_VALUE_GET_STRING(val);
 
-    if (string_buffer_init(ctx, b, p->len + 2))
-        goto fail;
-
-    if (string_buffer_putc8(b, '\"'))
+    if (string_buffer_putc8_fast(b, '\"'))
         goto fail;
     for(i = 0; i < p->len; ) {
+        /* Everything up to the next character needing an escape goes over in
+           one copy; in the common case that is the whole string. */
+        if (p->is_wide_char) {
+            run = json_quote_run16(str16(p) + i, p->len - i);
+            if (run > 0) {
+                if (string_buffer_write16(b, str16(p) + i, run))
+                    goto fail;
+                i += run;
+                continue;
+            }
+        } else {
+            run = json_quote_run8(str8(p) + i, p->len - i);
+            if (run > 0) {
+                if (string_buffer_write8(b, str8(p) + i, run))
+                    goto fail;
+                i += run;
+                continue;
+            }
+        }
         c = string_getc(p, &i);
         switch(c) {
         case '\t':
@@ -16004,9 +16155,9 @@ static JSValue JS_ToQuotedString(JSContext *ctx, JSValueConst val1)
         case '\"':
         case '\\':
         quote:
-            if (string_buffer_putc8(b, '\\'))
+            if (string_buffer_putc8_fast(b, '\\'))
                 goto fail;
-            if (string_buffer_putc8(b, c))
+            if (string_buffer_putc8_fast(b, c))
                 goto fail;
             break;
         default:
@@ -16021,14 +16172,26 @@ static JSValue JS_ToQuotedString(JSContext *ctx, JSValueConst val1)
             break;
         }
     }
-    if (string_buffer_putc8(b, '\"'))
+    if (string_buffer_putc8_fast(b, '\"'))
         goto fail;
     JS_FreeValue(ctx, val);
-    return string_buffer_end(b);
+    return 0;
  fail:
     JS_FreeValue(ctx, val);
-    string_buffer_free(b);
-    return JS_EXCEPTION;
+    return -1;
+}
+
+static JSValue JS_ToQuotedString(JSContext *ctx, JSValueConst val1)
+{
+    StringBuffer b_s, *b = &b_s;
+
+    if (string_buffer_init(ctx, b, 32))
+        return JS_EXCEPTION;
+    if (string_buffer_quote(b, val1)) {
+        string_buffer_free(b);
+        return JS_EXCEPTION;
+    }
+    return string_buffer_end(b);
 }
 
 static __maybe_unused void JS_DumpObjectHeader(JSRuntime *rt)
@@ -19478,8 +19641,20 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     alloca_size = sizeof(JSValue) * (arg_allocated_size + b->var_count +
                                      b->stack_size) +
         sizeof(JSVarRef *) * b->var_ref_count;
+    /* arcsx: -DSXN_ABLATE_CALL_PROLOGUE removes the two pieces of prologue
+       work a statically known callee could be proven not to need -- the
+       stack-overflow check and the GC-free section -- so an A/B measures the
+       exact upper bound of specializing this path on a declared signature.
+       The rest of the prologue is not ablatable: the var_buf fill, the
+       var_refs fill and the realm switch change meaning rather than merely
+       repeating known work, and a build without them crashes during
+       bootstrap. Their cost is in any case zero for the shape that matters,
+       a small function with no locals and no closure. Behaviourally
+       identical on code that does not exhaust the stack. */
+#ifndef SXN_ABLATE_CALL_PROLOGUE
     if (js_check_stack_overflow(rt, alloca_size))
         return JS_ThrowStackOverflow(caller_ctx);
+#endif
 
     sf->is_strict_mode = b->is_strict_mode;
     arg_buf = (JSValue *)argv;
@@ -19513,10 +19688,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     sf->cur_gc_obj = NULL;
     sp = stack_buf;
     pc = b->byte_code_buf;
+#ifndef SXN_ABLATE_CALL_PROLOGUE
     if (b->gc_free_candidate && b->func_kind == JS_FUNC_NORMAL) {
         JS_EnterGCFreeSection(rt);
         gc_free_entered = true;
     }
+#endif
     /* sf->cur_pc must we set to pc before any recursive calls to JS_CallInternal. */
     sf->cur_pc = NULL;
     sf->prev_frame = rt->current_stack_frame;
@@ -23941,6 +24118,9 @@ typedef struct JSGlobalVar {
     uint8_t is_lexical : 1; /* global let/const definition */
     uint8_t is_const   : 1; /* const definition */
     uint8_t is_safe_i32 : 1; /* SX `safe ... : i32` binding: stores must wrap */
+    uint8_t is_sx_mut : 1; /* SX `let mut`, for a module/script top-level
+                              binding, which lives here rather than in
+                              fd->vars. Same meaning as JSVarDef.is_sx_mut. */
     int scope_level;    /* scope of definition */
     JSAtom var_name;  /* variable name */
 } JSGlobalVar;
@@ -24032,6 +24212,7 @@ typedef struct JSFunctionDef {
     bool safe_next_decl : 1; /* contextual `safe let/const` prefix */
     bool sx_safe_module_local : 1; /* the define_var() call in progress must keep
                                       the binding a plain local, not a module var */
+    uint8_t sx_ret_type : 4; /* SxType of this function's return annotation */
 
     JSFunctionKindEnum func_kind : 8;
     JSParseFunctionEnum func_type : 7;
@@ -24132,6 +24313,12 @@ typedef struct JSToken {
         struct {
             JSValue str;
             int sep;
+            /* JSON only: an escape-free ASCII string is left as a slice of
+               the source here, and turned into a string -- or straight into
+               an atom, for a property name -- only once its use is known.
+               NULL when `str` already holds the value. */
+            const uint8_t *raw;
+            int raw_len;
         } str;
         struct {
             JSValue val;
@@ -24163,6 +24350,16 @@ typedef struct JSParseState {
     const uint8_t *buf_end;
     const uint8_t *eol;  // most recently seen end-of-line character
     const uint8_t *mark; // first token character, invariant: eol < mark
+
+    /* JSON only: the last few property names seen, so a key that repeats
+       from one object to the next -- which is every key in a document of
+       records -- is not hashed into the atom table again. Each entry holds
+       one reference; json_free_key_cache drops them. */
+    struct {
+        const uint8_t *ptr;
+        uint32_t len;
+        JSAtom atom;
+    } json_keys[4];
 
     /* current function code */
     JSFunctionDef *cur_func;
@@ -25345,6 +25542,31 @@ static int json_parse_error(JSParseState *s, const uint8_t *curp, const char *ms
                           msg, position, line, (int)(p - line_start) + 1);
 }
 
+/* The first byte a JSON string cannot pass through untouched: a closing
+   quote, a backslash, a control character, or anything non-ASCII. Eight
+   bytes at a time -- byte-at-a-time scanning was the largest single cost in
+   JSON.parse. */
+static const uint8_t *json_scan_plain(const uint8_t *p, const uint8_t *end)
+{
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    while (p + 8 <= end) {
+        uint64_t v = get_u64(p);
+        uint64_t quote = v ^ 0x2222222222222222ULL;
+        uint64_t slash = v ^ 0x5c5c5c5c5c5c5c5cULL;
+        uint64_t mask = (((quote - 0x0101010101010101ULL) & ~quote)
+                       | ((slash - 0x0101010101010101ULL) & ~slash)
+                       | ((v - 0x2020202020202020ULL) & ~v)
+                       | v) & 0x8080808080808080ULL;
+        if (mask)
+            return p + (ctz64(mask) >> 3);
+        p += 8;
+    }
+#endif
+    while (p < end && *p != '"' && *p != '\\' && *p >= 0x20 && *p < 0x80)
+        p++;
+    return p;
+}
+
 static int json_parse_string(JSParseState *s, const uint8_t **pp)
 {
     const uint8_t *p, *p_next;
@@ -25356,6 +25578,26 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
         goto fail;
 
     p = *pp;
+
+    /* A string with no escape and nothing above ASCII -- most strings in most
+       JSON -- is handed on as a slice of the source, with no string built at
+       all: a property name becomes an atom directly, and only a value is
+       allocated. The StringBuffer below starts at 48 characters and is then
+       grown, copied and trimmed, which is what this skips. */
+    {
+        const uint8_t *q = json_scan_plain(p, s->buf_end);
+        if (q < s->buf_end && *q == '"') {
+            string_buffer_free(b);
+            s->token.val = TOK_STRING;
+            s->token.u.str.sep = '"';
+            s->token.u.str.str = JS_UNDEFINED;
+            s->token.u.str.raw = p;
+            s->token.u.str.raw_len = (int)(q - p);
+            *pp = q + 1;
+            return 0;
+        }
+    }
+
     for(;;) {
         if (p >= s->buf_end) {
             goto end_of_input;
@@ -25363,9 +25605,7 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
 
         // Fast path: batch consecutive ASCII characters
         const uint8_t *p_start = p;
-        while (p < s->buf_end && *p != '"' && *p != '\\' && *p >= 0x20 && *p < 0x80) {
-            p++;
-        }
+        p = json_scan_plain(p, s->buf_end);
 
         // Write batched ASCII in one call
         if (p > p_start) {
@@ -25426,6 +25666,7 @@ static int json_parse_string(JSParseState *s, const uint8_t **pp)
     s->token.val = TOK_STRING;
     s->token.u.str.sep = '"';
     s->token.u.str.str = string_buffer_end(b);
+    s->token.u.str.raw = NULL;
     *pp = p;
     return 0;
 
@@ -25453,6 +25694,7 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
     while (is_digit(*p))
         p++;
 
+    const uint8_t *p_int_end = p;
     if (*p == '.') {
         p++;
         if (!is_digit(*p))
@@ -25470,7 +25712,26 @@ static int json_parse_number(JSParseState *s, const uint8_t **pp)
             p++;
     }
     s->token.val = TOK_NUMBER;
-    s->token.u.num.val = js_float64(strtod((const char *)p_start, NULL));
+    /* A plain integer is converted here: strtod is locale-aware -- it takes a
+       lock to find the decimal separator -- and rescans the digits. 18 digits
+       is the widest that always fits in an int64. */
+    if (p == p_int_end && (size_t)(p_int_end - p_start) <= 18) {
+        const uint8_t *d = p_start;
+        int negative = (*d == '-' || *d == '+') ? (*d++ == '-') : 0;
+        int64_t v = 0;
+        while (d < p_int_end)
+            v = v * 10 + (*d++ - '0');
+        if (negative)
+            v = -v;
+        if (negative && v == 0)
+            s->token.u.num.val = js_float64(-0.0);   /* -0 is not 0 */
+        else if (v >= INT32_MIN && v <= INT32_MAX)
+            s->token.u.num.val = js_int32((int32_t)v);
+        else
+            s->token.u.num.val = js_float64((double)v);
+    } else {
+        s->token.u.num.val = js_float64(strtod((const char *)p_start, NULL));
+    }
     *pp = p;
     return 0;
 }
@@ -26408,6 +26669,7 @@ static JSGlobalVar *add_global_var(JSContext *ctx, JSFunctionDef *s,
     hf->is_lexical = false;
     hf->is_const = false;
     hf->is_safe_i32 = false;
+    hf->is_sx_mut = false;
     hf->scope_level = s->scope_level;
     hf->var_name = JS_DupAtom(ctx, name);
     if (update_global_var_htab(ctx, s))
@@ -26598,7 +26860,8 @@ static __exception int js_parse_function_decl2(JSParseState *s,
 static __exception int js_parse_assign_expr2(JSParseState *s, int parse_flags);
 static __exception int js_parse_assign_expr(JSParseState *s);
 static __exception int js_parse_unary(JSParseState *s, int parse_flags);
-static __exception int js_parse_type_annotation(JSParseState *s, bool return_type);
+static __exception int js_parse_type_annotation(JSParseState *s, bool return_type,
+                                                SxType *out);
 static void push_break_entry(JSFunctionDef *fd, BlockEnv *be,
                              JSAtom label_name,
                              int label_break, int label_cont,
@@ -27054,7 +27317,9 @@ static int js_parse_skip_parens_token(JSParseState *s, int *pbits, bool no_line_
                ternary's `(a, b) : c`, etc.) is ordinary JS and must not be
                swallowed. */
             if (tok == ':' && skip_return_type) {
-                if (js_parse_type_annotation(s, true))
+                /* This is lookahead only -- js_parse_seek_token rewinds
+                   below and the real parse records the type. */
+                if (js_parse_type_annotation(s, true, NULL))
                     tok = TOK_EOF;
                 else
                     tok = s->token.val;
@@ -29712,6 +29977,38 @@ static __exception int js_parse_unary(JSParseState *s, int parse_flags)
         if (s->token.val == TOK_IDENT && s->token.u.ident.atom == JS_ATOM_mut) {
             if (next_token(s))
                 return -1;
+            /* `&mut value` is an exclusive borrow and requires a mutable
+               owner (spec/LANGUAGE.md). Only a bare identifier can be
+               resolved here, and only against this function's lexical
+               scope chain: a miss is a parameter, a global, a captured
+               outer binding or a name not yet declared, none of which this
+               parser can rule on, so it stays silent rather than guessing.
+               `&mut this.x` and `&mut f()` never reach the lookup. */
+            if (s->token.val == TOK_IDENT) {
+                JSAtom name = s->token.u.ident.atom;
+                JSFunctionDef *fd = s->cur_func;
+                int idx = find_lexical_decl(s->ctx, fd, name,
+                                            fd->scope_first, false);
+                bool found = false, is_mut = false;
+                if (idx >= 0 && idx < GLOBAL_VAR_OFFSET) {
+                    found = true;
+                    is_mut = fd->vars[idx].is_sx_mut;
+                } else {
+                    /* Module and script top-level lexicals live in
+                       fd->global_vars instead (see js_define_var). */
+                    JSGlobalVar *hf = find_lexical_global_var(fd, name);
+                    if (hf) {
+                        found = true;
+                        is_mut = hf->is_sx_mut;
+                    }
+                }
+                if (found && !is_mut) {
+                    char buf[ATOM_GET_STR_BUF_SIZE];
+                    return js_parse_error(s,
+                        "SX2003: cannot borrow immutable binding '%s' as '&mut'; declare it 'let mut'",
+                        JS_AtomGetStr(s->ctx, buf, sizeof(buf), name));
+                }
+            }
         }
         return js_parse_unary(s, parse_flags);
     case '+':
@@ -29835,16 +30132,53 @@ static __exception int js_parse_unary(JSParseState *s, int parse_flags)
     return 0;
 }
 
-/* Skip an erasable SX/TypeScript type after the colon. The parser keeps the
-   declaration and its binding metadata while discarding only type tokens. */
-static __exception int js_parse_type_annotation(JSParseState *s, bool return_type)
+/* An SX `safe` binding earns the wrapping i32 opcodes only when i32 is what
+   was declared. `safe` alone used to select them, which is why
+   `safe let mut x: f64` reached an integer opcode at all and had to be
+   rescued by its runtime tag test. Note this is deliberately *not* the same
+   condition as is_i32_inferred, which is a plain-JS induction guess and
+   carries no promise about staying in range. */
+static inline bool sx_is_safe_i32(const JSVarDef *vd)
+{
+    return vd->is_safe && vd->sx_type == SX_TYPE_I32;
+}
+
+/* Name the current token if it is a scalar type codegen can act on. */
+static SxType sx_classify_type_token(JSParseState *s)
+{
+    if (s->token.val != TOK_IDENT) return SX_TYPE_OTHER;
+    switch (s->token.u.ident.atom) {
+    case JS_ATOM_i32: return SX_TYPE_I32;
+    case JS_ATOM_f32: return SX_TYPE_F32;
+    case JS_ATOM_f64: return SX_TYPE_F64;
+    case JS_ATOM_bool:
+    case JS_ATOM_boolean: return SX_TYPE_BOOL;
+    case JS_ATOM_number: return SX_TYPE_NUMBER;
+    default: return SX_TYPE_OTHER;
+    }
+}
+
+/* Skip an erasable SX/TypeScript type after the colon, classifying it on the
+   way past. The declaration and its binding metadata are kept; only the type
+   tokens are discarded from the emitted code.
+
+   `out` receives the SxType, which codegen may specialize on, so it has to be
+   exact rather than optimistic: only an annotation that is a single scalar
+   type token is named. A union, a generic, an array, an inline object type
+   and a borrow are all more than one token, and report SX_TYPE_OTHER. The
+   skipping itself is unchanged: it is what lets arbitrary TypeScript still
+   parse, and narrowing it would reject real programs. */
+static __exception int js_parse_type_annotation(JSParseState *s, bool return_type,
+                                                SxType *out)
 {
     int depth = 0;
-    if (s->token.val != ':') return 0;
+    int content = 0;
+    SxType first = SX_TYPE_NONE;
+    if (s->token.val != ':') { if (out) *out = SX_TYPE_NONE; return 0; }
     for (;;) {
         if (next_token(s)) return -1;
         if (!depth && return_type && (s->token.val == '{' || s->token.val == TOK_ARROW))
-            return 0;
+            break;
         if (s->token.val == '<' || s->token.val == '[' || s->token.val == '{' || s->token.val == '(')
             depth++;
         else if ((s->token.val == '>' || s->token.val == ']' || s->token.val == '}' || s->token.val == ')') && depth)
@@ -29856,8 +30190,16 @@ static __exception int js_parse_type_annotation(JSParseState *s, bool return_typ
         if (!depth && (s->token.val == '=' || s->token.val == ',' || s->token.val == ';' ||
                        s->token.val == ')' ||
                        (return_type && (s->token.val == TOK_ARROW))))
-            return 0;
+            break;
+        if (content == 0)
+            first = sx_classify_type_token(s);
+        content++;
     }
+    if (out)
+        *out = content == 0 ? SX_TYPE_NONE
+             : content == 1 ? first
+             : SX_TYPE_OTHER;
+    return 0;
 }
 
 /* arcsx: skip a type expression that is not introduced by ':' -- the operand
@@ -30750,6 +31092,32 @@ static __exception int js_parse_block(JSParseState *s)
     return 0;
 }
 
+/* Attach SX metadata to a binding that was just declared. A function-scoped
+   lexical is a JSVarDef in fd->vars; a module or script top-level one is a
+   JSGlobalVar instead -- the same split fd->sx_safe_module_local exists for.
+   Only `is_sx_mut` needs to reach the JSGlobalVar, because that is the one
+   thing `&mut` asks about at top level; `is_safe` and the declared type are
+   read only off fd->vars, and a `safe` module-level binding is kept there by
+   fd->sx_safe_module_local. SX_TYPE_NONE leaves the recorded type alone, so
+   a later call cannot erase an earlier one. */
+static void sx_mark_decl(JSFunctionDef *fd, JSAtom name,
+                         bool set_safe, bool set_mut, SxType type)
+{
+    JSGlobalVar *hf;
+    int idx;
+    for (idx = fd->var_count - 1; idx >= 0; --idx) {
+        if (fd->vars[idx].var_name == name) {
+            if (set_safe) fd->vars[idx].is_safe = 1;
+            if (set_mut) fd->vars[idx].is_sx_mut = 1;
+            if (type != SX_TYPE_NONE) fd->vars[idx].sx_type = type;
+            return;
+        }
+    }
+    hf = find_lexical_global_var(fd, name);
+    if (!hf) return;
+    if (set_mut) hf->is_sx_mut = 1;
+}
+
 /* allowed parse_flags: PF_IN_ACCEPTED */
 static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
                                     bool export_flag)
@@ -30761,10 +31129,15 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
     for (;;) {
         /* `let mut` erases the mutability qualifier unconditionally --
            not just under `safe`, matching the compatibility frontend's
-           `let mut` -> `let ` rewrite. */
+           `let mut` -> `let ` rewrite. The qualifier is erased from the
+           emitted code but remembered on the JSVarDef, because `&mut x`
+           requires a mutable owner (spec/LANGUAGE.md). Declared per
+           declarator, so `let mut a = 1, b = 2` marks only `a`. */
+        bool is_mut = false;
         if (tok == TOK_LET &&
             s->token.val == TOK_IDENT && s->token.u.ident.atom == JS_ATOM_mut) {
             if (next_token(s)) goto var_error;
+            is_mut = true;
         }
         if (s->token.val == TOK_IDENT) {
             if (s->token.u.ident.is_reserved) {
@@ -30792,14 +31165,8 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
                 goto var_error;
             }
             fd->sx_safe_module_local = 0;
-            if (fd->safe_next_decl) {
-                int safe_idx;
-                for (safe_idx = fd->var_count - 1; safe_idx >= 0; --safe_idx) {
-                    if (fd->vars[safe_idx].var_name == name) {
-                        fd->vars[safe_idx].is_safe = 1;
-                        break;
-                    }
-                }
+            if (fd->safe_next_decl || is_mut) {
+                sx_mark_decl(fd, name, fd->safe_next_decl, is_mut, SX_TYPE_NONE);
                 fd->safe_next_decl = 0;
             }
             /* peek_token() is the lightweight simple_next_token() lookahead,
@@ -30819,11 +31186,14 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
                     }
                 }
             }
-            /* Minimal native SX annotation support for bindings. Type names
-               are compile-time metadata; skip the token sequence while
-               retaining the declaration for QuickJS bytecode generation. */
+            /* Native SX annotation support for bindings. Type names emit no
+               code, so the token sequence is skipped -- but which type was
+               written is recorded on the binding, because codegen specializes
+               on it (see the SX_TYPE_I32 sites in optimize_bytecode). */
             if (s->token.val == ':') {
-                if (js_parse_type_annotation(s, false)) goto var_error;
+                SxType declared;
+                if (js_parse_type_annotation(s, false, &declared)) goto var_error;
+                sx_mark_decl(fd, name, false, false, declared);
             }
             if (tok == TOK_USING) {
                 /* Allocate a paired hidden local for the cached dispose
@@ -38189,7 +38559,7 @@ static bool i32al_try_match(JSFunctionDef *fd, const uint8_t *buf, int bc_len,
 
     if (!i32al_match_get_loc(buf, bc_len, &pos, &i_idx))
         return false;
-    if (!(fd->vars[i_idx].is_safe || fd->vars[i_idx].is_i32_inferred) ||
+    if (!(sx_is_safe_i32(&fd->vars[i_idx]) || fd->vars[i_idx].is_i32_inferred) ||
         fd->vars[i_idx].is_captured)
         return false;
 
@@ -38234,7 +38604,7 @@ static bool i32al_try_match(JSFunctionDef *fd, const uint8_t *buf, int bc_len,
         return false;
     /* a captured local is observable mid-loop through its JSVarRef, so the
        fused native loop (which only writes var_buf back at the end) is unsound */
-    if (!fd->vars[accum_idx].is_safe || fd->vars[accum_idx].is_captured)
+    if (!sx_is_safe_i32(&fd->vars[accum_idx]) || fd->vars[accum_idx].is_captured)
         return false;
 
     {
@@ -38357,6 +38727,311 @@ static __exception int fuse_i32_accum_loops(JSContext *ctx, JSFunctionDef *fd)
         }
         dbuf_put(&bc_out, bc_buf + pos, len);
     }
+    if (dbuf_error(&bc_out)) {
+        dbuf_free(&bc_out);
+        return -1;
+    }
+    if (!changed) {
+        dbuf_free(&bc_out);
+        return 0;
+    }
+    dbuf_free(&fd->byte_code);
+    fd->byte_code = bc_out;
+    return 0;
+}
+
+/* --- SX typed-call inlining --------------------------------------------
+
+   An interpreted call costs about 10 ns of frame setup on an M4 before a
+   single argument is passed, measured against an empty loop. Hand-inlining a
+   two-argument `i32` add recovered 11.8 of the 17.1 ns the call took, so the
+   frame is the cost and the arguments are not. This pass takes that back for
+   the one shape where doing so is provably free of consequence.
+
+   It runs where fuse_i32_accum_loops runs -- after resolve_variables, before
+   resolve_labels -- so locals are already get_loc/put_loc and jumps still
+   carry label ids rather than byte offsets. Bytes can therefore be removed
+   without repairing a single jump target.
+
+   A call site qualifies only when all of this holds statically:
+
+     - The callee is a local written exactly once, by an `fclosure` naming a
+       constant-pool function, and never captured. The binding cannot be
+       anything else at runtime, so the splice needs no guard -- unlike the
+       Buffer.from and emit fusions, whose callees are ordinary dynamic values.
+     - Every parameter and the return carry a declared scalar SX type. That is
+       what makes this opt-in through the type system rather than a general
+       JavaScript optimization: plain .js and .mjs code never qualifies.
+     - The callee body loads each parameter exactly once, in declaration
+       order, before anything else, then runs only operand-free arithmetic and
+       constants before returning. The arguments the caller has already pushed
+       then sit on the stack in exactly the order the body wants, so the
+       splice is: drop the callee load, drop the call, append the body's tail.
+       Nothing is reordered and no temporary is needed. Argument evaluation is
+       untouched, including any exception it throws.
+     - The argument expressions are themselves branch-free loads, constants
+       and arithmetic, so the stack depth between the callee load and its call
+       is trackable without a control-flow analysis.
+
+   Two mechanical hazards worth naming, because both are silent if missed.
+   The callee's bytecode is final-pass and uses short opcodes, whose byte
+   values overlap the temporary opcodes that are still legal in the caller at
+   this point (OP_TEMP_START == OP_nop + 1); every spliced byte is therefore
+   required to be below OP_TEMP_START, and the small constant pushes are
+   rewritten to OP_push_i32 on the way in. And the callee is read through
+   short_opcode_info() while the caller is read through opcode_info[].
+
+   One observable difference remains, the same one every inlining compiler
+   has: the callee no longer appears in a stack trace if the spliced
+   arithmetic throws -- `a + b` on a Symbol, say. */
+
+static bool sx_type_is_scalar(int t)
+{
+    return t == SX_TYPE_I32 || t == SX_TYPE_F32 || t == SX_TYPE_F64 ||
+           t == SX_TYPE_BOOL || t == SX_TYPE_NUMBER;
+}
+
+/* Operand-free arithmetic: what a spliceable callee tail and an inlinable
+   argument expression may both contain. Nothing here branches, allocates,
+   reads a local, or touches an atom, the constant pool, `this` or
+   `arguments`. */
+static bool sx_inline_pure_op(int op)
+{
+    switch (op) {
+    case OP_add: case OP_sub: case OP_mul: case OP_div: case OP_mod:
+    case OP_pow:
+    case OP_and: case OP_or: case OP_xor:
+    case OP_shl: case OP_shr: case OP_sar:
+    case OP_lt: case OP_lte: case OP_gt: case OP_gte:
+    case OP_eq: case OP_neq: case OP_strict_eq: case OP_strict_neq:
+    case OP_neg: case OP_plus: case OP_not: case OP_lnot:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Rewrite one final-pass constant push into its long form, so the result can
+   be spliced into pre-final bytecode without colliding with a temporary
+   opcode. Returns the value in *val, or false if this is not one. */
+static bool sx_inline_const_push(const uint8_t *bc, int pos, int32_t *val)
+{
+    int op = bc[pos];
+    if (op >= OP_push_0 && op <= OP_push_7) { *val = op - OP_push_0; return true; }
+    if (op == OP_push_i8)  { *val = (int8_t)bc[pos + 1]; return true; }
+    if (op == OP_push_i16) { *val = (int16_t)get_u16(bc + pos + 1); return true; }
+    if (op == OP_push_i32) { *val = (int32_t)get_u32(bc + pos + 1); return true; }
+    return false;
+}
+
+/* Append the callee's post-argument tail to `out`, translating what has to be
+   translated and refusing anything that cannot be spliced. Also used as the
+   eligibility test, with out == NULL for a dry run. */
+static bool sx_inline_emit_tail(const JSFunctionBytecode *b, int tail_start,
+                                DynBuf *out)
+{
+    const uint8_t *bc = b->byte_code_buf;
+    int len = b->byte_code_len;
+    int pos = tail_start;
+    bool any = false;
+    while (pos < len && bc[pos] != OP_return) {
+        int32_t val;
+        int op = bc[pos];
+        if (sx_inline_const_push(bc, pos, &val)) {
+            if (out) {
+                dbuf_putc(out, OP_push_i32);
+                dbuf_put_u32(out, (uint32_t)val);
+            }
+            pos += short_opcode_info(op).size;
+        } else if (sx_inline_pure_op(op) && op < OP_TEMP_START) {
+            if (out)
+                dbuf_putc(out, op);
+            pos += short_opcode_info(op).size;
+        } else {
+            return false;
+        }
+        any = true;
+    }
+    /* The return must be the last byte: a tail that falls through, or has
+       anything after it, is not a single expression. */
+    return any && pos + 1 == len;
+}
+
+/* Does `b` load every parameter once, in order, before doing anything else?
+   On success *tail_start is the first byte after those loads. */
+static bool sx_inline_candidate(const JSFunctionBytecode *b, int argc,
+                                int *tail_start)
+{
+    const uint8_t *bc;
+    int len, pos, i;
+
+    if (!b || !b->vardefs || !b->byte_code_buf)
+        return false;
+    if (b->arg_count != argc || argc < 1 || argc > 4)
+        return false;
+    if (b->var_count != 0 || b->closure_var_count != 0 ||
+        b->var_ref_count != 0 || b->cpool_count != 0)
+        return false;
+    if (b->func_kind != JS_FUNC_NORMAL || !b->has_simple_parameter_list)
+        return false;
+    if (b->defined_arg_count != argc)
+        return false;
+    if (!sx_type_is_scalar(b->sx_ret_type))
+        return false;
+    for (i = 0; i < argc; i++)
+        if (!sx_type_is_scalar(b->vardefs[i].sx_type))
+            return false;
+
+    bc = b->byte_code_buf;
+    len = b->byte_code_len;
+    pos = 0;
+    for (i = 0; i < argc; i++) {
+        int op;
+        if (pos >= len)
+            return false;
+        op = bc[pos];
+        if (op >= OP_get_arg0 && op <= OP_get_arg3) {
+            if (op - OP_get_arg0 != i)
+                return false;
+            pos += 1;
+        } else if (op == OP_get_arg) {
+            if (pos + 3 > len || get_u16(bc + pos + 1) != (uint32_t)i)
+                return false;
+            pos += 3;
+        } else {
+            return false;
+        }
+    }
+    *tail_start = pos;
+    return sx_inline_emit_tail(b, pos, NULL);
+}
+
+/* An argument expression this pass can scan past while tracking stack depth.
+   Deliberately branch-free: a label or a jump between the callee load and its
+   call abandons the match rather than being reasoned about. */
+static bool sx_inline_arg_op(int op)
+{
+    switch (op) {
+    case OP_get_loc: case OP_get_loc_check:
+    case OP_get_arg: case OP_get_var_ref: case OP_get_var_ref_check:
+    case OP_push_i32: case OP_push_const: case OP_push_atom_value:
+    case OP_push_true: case OP_push_false: case OP_null: case OP_undefined:
+    case OP_source_loc:
+        return true;
+    default:
+        return sx_inline_pure_op(op);
+    }
+}
+
+static __exception int sx_inline_typed_calls(JSContext *ctx, JSFunctionDef *fd)
+{
+    DynBuf bc_out;
+    uint8_t *bc_buf = fd->byte_code.buf;
+    int bc_len = fd->byte_code.size;
+    int pos, pos_next, i;
+    bool changed = false;
+    int *func_of_loc = NULL;
+    int pending_out = -1, pending_cpool = -1, pending_depth = 0;
+
+    if (fd->var_count <= 0 || fd->cpool_count <= 0)
+        return 0;
+    /* A direct eval can assign to any local by name, so nothing in this
+       function is provably written once. */
+    if (fd->has_eval_call)
+        return 0;
+
+    /* Which locals hold a constant-pool function and nothing else, ever. */
+    func_of_loc = js_malloc(ctx, sizeof(*func_of_loc) * fd->var_count);
+    if (!func_of_loc)
+        return -1;
+    for (i = 0; i < fd->var_count; i++)
+        func_of_loc[i] = fd->vars[i].is_captured ? -2 : -1;
+    for (pos = 0; pos < bc_len; pos = pos_next) {
+        int op = bc_buf[pos];
+        int idx;
+        pos_next = pos + opcode_info[op].size;
+        if (op == OP_fclosure && pos_next < bc_len &&
+            bc_buf[pos_next] == OP_put_loc) {
+            int cpool_idx = (int)get_u32(bc_buf + pos + 1);
+            idx = (int)get_u16(bc_buf + pos_next + 1);
+            if (idx < fd->var_count && func_of_loc[idx] == -1 &&
+                cpool_idx >= 0 && cpool_idx < fd->cpool_count) {
+                func_of_loc[idx] = cpool_idx;
+                pos_next += opcode_info[OP_put_loc].size;
+            } else if (idx < fd->var_count) {
+                func_of_loc[idx] = -2;
+                pos_next += opcode_info[OP_put_loc].size;
+            }
+            continue;
+        }
+        /* Any other mention of a local as anything but a plain read makes it
+           unusable: a second store, a TDZ init, a closure capture. */
+        if (opcode_info[op].fmt == OP_FMT_loc &&
+            op != OP_get_loc && op != OP_get_loc_check) {
+            idx = (int)get_u16(bc_buf + pos + 1);
+            if (idx < fd->var_count)
+                func_of_loc[idx] = -2;
+        }
+        /* make_loc_ref hands a local out as a writable reference and is the
+           one local-touching opcode whose format is not OP_FMT_loc: its
+           index sits after the atom. */
+        if (op == OP_make_loc_ref) {
+            idx = (int)get_u16(bc_buf + pos + 5);
+            if (idx < fd->var_count)
+                func_of_loc[idx] = -2;
+        }
+    }
+
+    js_dbuf_init(ctx, &bc_out);
+    for (pos = 0; pos < bc_len; pos = pos_next) {
+        int op = bc_buf[pos];
+        int len = opcode_info[op].size;
+        pos_next = pos + len;
+
+        if (pending_out >= 0 && op == OP_call) {
+            int argc = (int)get_u16(bc_buf + pos + 1);
+            JSValue cv = fd->cpool[pending_cpool];
+            JSFunctionBytecode *cb =
+                JS_VALUE_GET_TAG(cv) == JS_TAG_FUNCTION_BYTECODE
+                ? JS_VALUE_GET_PTR(cv) : NULL;
+            int tail_start;
+            if (pending_depth == argc &&
+                sx_inline_candidate(cb, argc, &tail_start)) {
+                /* Erase the callee load; the arguments already emitted after
+                   it shift down and stay in their original order. */
+                int drop = opcode_info[OP_get_loc].size;
+                memmove(bc_out.buf + pending_out, bc_out.buf + pending_out + drop,
+                        bc_out.size - pending_out - drop);
+                bc_out.size -= drop;
+                sx_inline_emit_tail(cb, tail_start, &bc_out);
+                pending_out = -1;
+                changed = true;
+                continue;               /* the OP_call is not emitted */
+            }
+            pending_out = -1;
+        }
+
+        if (pending_out >= 0) {
+            if (!sx_inline_arg_op(op)) {
+                pending_out = -1;
+            } else {
+                pending_depth += opcode_info[op].n_push - opcode_info[op].n_pop;
+                if (pending_depth < 0)
+                    pending_out = -1;
+            }
+        }
+
+        if (pending_out < 0 && op == OP_get_loc) {
+            int idx = (int)get_u16(bc_buf + pos + 1);
+            if (idx < fd->var_count && func_of_loc[idx] >= 0) {
+                pending_out = bc_out.size;
+                pending_cpool = func_of_loc[idx];
+                pending_depth = 0;
+            }
+        }
+        dbuf_put(&bc_out, bc_buf + pos, len);
+    }
+    js_free(ctx, func_of_loc);
     if (dbuf_error(&bc_out)) {
         dbuf_free(&bc_out);
         return -1;
@@ -39082,21 +39757,23 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     if (cc.col_num >= 0) col_num = cc.col_num;
                     add_pc2line_info(s, bc_out.size, line_num, col_num);
                     put_short_code(&bc_out, OP_get_loc_check, cc.idx);
-                    dbuf_putc(&bc_out, s->vars[idx].is_safe ? OP_add_loc_safe_i32 : OP_add_loc);
+                    dbuf_putc(&bc_out, sx_is_safe_i32(&s->vars[idx]) ? OP_add_loc_safe_i32 : OP_add_loc);
                     dbuf_putc(&bc_out, idx);
                     pos_next = cc.pos;
                     break;
                 }
-                /* Same for a constant right-hand side. */
+                /* Same for a constant right-hand side. This used to exclude
+                   `safe` locals outright, so `safe let mut n: i32` wrapped on
+                   `n += step` and promoted on `n += 1` -- one declaration,
+                   two answers. Both shapes now pick the opcode the same way. */
                 if (op == OP_get_loc_check && idx < s->var_count && idx < 256 &&
-                    !s->vars[idx].is_safe &&
                     code_match(&cc, pos_next, OP_push_i32, OP_add, OP_dup,
                                OP_put_loc_check, idx, OP_drop, -1)) {
                     if (cc.line_num >= 0) line_num = cc.line_num;
                     if (cc.col_num >= 0) col_num = cc.col_num;
                     add_pc2line_info(s, bc_out.size, line_num, col_num);
                     push_short_int(&bc_out, cc.label);
-                    dbuf_putc(&bc_out, OP_add_loc);
+                    dbuf_putc(&bc_out, sx_is_safe_i32(&s->vars[idx]) ? OP_add_loc_safe_i32 : OP_add_loc);
                     dbuf_putc(&bc_out, idx);
                     pos_next = cc.pos;
                     break;
@@ -39105,7 +39782,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     goto no_change;
                 /* arcsx: the same fusion for a TDZ-checked local; OP_inc_loc /
                    OP_dec_loc carry their own uninitialized check. */
-                if (op == OP_get_loc_check && idx < s->var_count && !s->vars[idx].is_safe &&
+                if (op == OP_get_loc_check && idx < s->var_count && !sx_is_safe_i32(&s->vars[idx]) &&
                     (code_match(&cc, pos_next, M2(OP_post_dec, OP_post_inc), OP_put_loc_check, idx, OP_drop, -1) ||
                      code_match(&cc, pos_next, M2(OP_dec, OP_inc), OP_dup, OP_put_loc_check, idx, OP_drop, -1))) {
                     if (cc.line_num >= 0) line_num = cc.line_num;
@@ -39123,7 +39800,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     add_pc2line_info(s, bc_out.size, line_num, col_num);
                     dbuf_putc(&bc_out,
                               (cc.op == OP_inc || cc.op == OP_post_inc) &&
-                              (s->vars[idx].is_safe || s->vars[idx].is_i32_inferred)
+                              (sx_is_safe_i32(&s->vars[idx]) || s->vars[idx].is_i32_inferred)
                               ? OP_inc_loc_safe_i32
                               : ((cc.op == OP_inc || cc.op == OP_post_inc) ? OP_inc_loc : OP_dec_loc));
                     dbuf_putc(&bc_out, idx);
@@ -39144,7 +39821,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                         dbuf_putc(&bc_out, OP_push_atom_value);
                         dbuf_put_u32(&bc_out, cc.atom);
                     }
-                    dbuf_putc(&bc_out, (s->vars[idx].is_safe || s->vars[idx].is_i32_inferred) ? OP_add_loc_safe_i32 : OP_add_loc);
+                    dbuf_putc(&bc_out, (sx_is_safe_i32(&s->vars[idx]) || s->vars[idx].is_i32_inferred) ? OP_add_loc_safe_i32 : OP_add_loc);
                     dbuf_putc(&bc_out, idx);
                     pos_next = cc.pos;
                     break;
@@ -39157,7 +39834,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     if (cc.col_num >= 0) col_num = cc.col_num;
                     add_pc2line_info(s, bc_out.size, line_num, col_num);
                     push_short_int(&bc_out, cc.label);
-                    dbuf_putc(&bc_out, (s->vars[idx].is_safe || s->vars[idx].is_i32_inferred) ? OP_add_loc_safe_i32 : OP_add_loc);
+                    dbuf_putc(&bc_out, (sx_is_safe_i32(&s->vars[idx]) || s->vars[idx].is_i32_inferred) ? OP_add_loc_safe_i32 : OP_add_loc);
                     dbuf_putc(&bc_out, idx);
                     pos_next = cc.pos;
                     break;
@@ -39172,7 +39849,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                     if (cc.col_num >= 0) col_num = cc.col_num;
                     add_pc2line_info(s, bc_out.size, line_num, col_num);
                     put_short_code(&bc_out, cc.op, cc.idx);
-                    dbuf_putc(&bc_out, (s->vars[idx].is_safe || s->vars[idx].is_i32_inferred) ? OP_add_loc_safe_i32 : OP_add_loc);
+                    dbuf_putc(&bc_out, (sx_is_safe_i32(&s->vars[idx]) || s->vars[idx].is_i32_inferred) ? OP_add_loc_safe_i32 : OP_add_loc);
                     dbuf_putc(&bc_out, idx);
                     pos_next = cc.pos;
                     break;
@@ -39185,7 +39862,7 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                    arg slot; check the trailing byte directly instead of
                    trying to pack six alternatives into one mask.
                  */
-                if (idx < 256 && (s->vars[idx].is_safe || s->vars[idx].is_i32_inferred)) {
+                if (idx < 256 && (sx_is_safe_i32(&s->vars[idx]) || s->vars[idx].is_i32_inferred)) {
                     bool rhs_is_push_i32 = code_match(&cc, pos_next, OP_push_i32, -1);
                     bool rhs_matched = rhs_is_push_i32 ||
                         code_match(&cc, pos_next, M3(OP_get_loc, OP_get_arg, OP_get_var_ref), -1, -1);
@@ -39867,6 +40544,9 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     if (fuse_i32_accum_loops(ctx, fd))
         goto fail;
 
+    if (sx_inline_typed_calls(ctx, fd))
+        goto fail;
+
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_PASS2
     if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_PASS2)) {
         printf("pass 2\n");
@@ -39908,6 +40588,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     fd->byte_code.buf = NULL;
 
     b->func_name = fd->func_name;
+    b->sx_ret_type = fd->sx_ret_type;
     if (fd->arg_count + fd->var_count > 0) {
         b->vardefs = (void *)((uint8_t*)b + vardefs_offset);
         if (fd->arg_count > 0)
@@ -40494,8 +41175,16 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                    and an absent argument is already undefined here. */
                 if (s->token.val == '?' && next_token(s))
                     goto fail;
-                if (s->token.val == ':' && js_parse_type_annotation(s, false))
-                    goto fail;
+                if (s->token.val == ':') {
+                    SxType declared;
+                    if (js_parse_type_annotation(s, false, &declared))
+                        goto fail;
+                    /* fd->args is a JSVarDef[], so a parameter carries its
+                       declared type in the same field a local does, and it
+                       reaches JSFunctionBytecode->vardefs by the memcpy in
+                       js_create_function. */
+                    fd->args[idx].sx_type = declared;
+                }
                 if (rest) {
                     emit_op(s, OP_rest);
                     emit_u16(s, idx);
@@ -40611,8 +41300,10 @@ static __exception int js_parse_function_decl2(JSParseState *s,
        type (`(...): T => ...` / `(...): T {`) is compile-time metadata,
        skip it while leaving the token positioned at the body. */
     if (s->token.val == ':') {
-        if (js_parse_type_annotation(s, true))
+        SxType declared;
+        if (js_parse_type_annotation(s, true, &declared))
             goto fail;
+        fd->sx_ret_type = declared;
     }
 
     /* generator function: yield after the parameters are evaluated */
@@ -53622,6 +54313,37 @@ static void json_free_parse_record(JSContext *ctx, JSONParseRecord *pr)
 }
 
 /* 'pr' can be NULL */
+/* The atom for a JSON property name, remembering the last few. The pointer
+   is into the document being parsed, which outlives the parse, so a hit is
+   confirmed with a compare of the bytes themselves. */
+static JSAtom json_key_atom(JSParseState *s, const uint8_t *p, uint32_t len)
+{
+    uint32_t slot = (len * 31u + (len ? p[0] : 0u)) & 3u;
+    JSAtom atom = s->json_keys[slot].atom;
+
+    if (atom != JS_ATOM_NULL && s->json_keys[slot].len == len
+        && !memcmp(s->json_keys[slot].ptr, p, len))
+        return JS_DupAtom(s->ctx, atom);
+    atom = JS_NewAtomLen(s->ctx, (const char *)p, len);
+    if (atom == JS_ATOM_NULL)
+        return JS_ATOM_NULL;
+    if (s->json_keys[slot].atom != JS_ATOM_NULL)
+        JS_FreeAtom(s->ctx, s->json_keys[slot].atom);
+    s->json_keys[slot].ptr = p;
+    s->json_keys[slot].len = len;
+    s->json_keys[slot].atom = JS_DupAtom(s->ctx, atom);
+    return atom;
+}
+
+static void json_free_key_cache(JSParseState *s)
+{
+    uint32_t i;
+    for (i = 0; i < countof(s->json_keys); i++) {
+        JS_FreeAtom(s->ctx, s->json_keys[i].atom);
+        s->json_keys[i].atom = JS_ATOM_NULL;
+    }
+}
+
 static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
 {
     JSContext *ctx = s->ctx;
@@ -53656,7 +54378,11 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
             if (s->token.val != '}') {
                 for(;;) {
                     if (s->token.val == TOK_STRING) {
-                        prop_name = JS_ValueToAtom(ctx, s->token.u.str.str);
+                        if (s->token.u.str.raw)
+                            prop_name = json_key_atom(s, s->token.u.str.raw,
+                                                      s->token.u.str.raw_len);
+                        else
+                            prop_name = JS_ValueToAtom(ctx, s->token.u.str.str);
                         if (prop_name == JS_ATOM_NULL)
                             goto fail;
                     } else {
@@ -53684,8 +54410,29 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
                         JS_FreeAtom(ctx, prop_name);
                         goto fail;
                     }
-                    ret = JS_DefinePropertyValue(ctx, val, prop_name,
-                                                 prop_val, JS_PROP_C_W_E);
+                    /* The object was created by JS_NewObject just above and
+                       nothing but this loop can see it, so an own data
+                       property goes in without the descriptor machinery.
+                       A key that repeats -- legal in JSON, last one wins --
+                       is the only case that finds an existing slot. */
+                    {
+                        JSObject *po = JS_VALUE_GET_OBJ(val);
+                        JSProperty *pr1;
+                        JSShapeProperty *prs1 = find_own_property(&pr1, po, prop_name);
+                        if (prs1) {
+                            set_value(ctx, &pr1->u.value, prop_val);
+                            ret = 0;
+                        } else {
+                            pr1 = add_property(ctx, po, prop_name, JS_PROP_C_W_E);
+                            if (!pr1) {
+                                JS_FreeValue(ctx, prop_val);
+                                ret = -1;
+                            } else {
+                                pr1->u.value = prop_val;
+                                ret = 0;
+                            }
+                        }
+                    }
                     JS_FreeAtom(ctx, prop_name);
                     if (ret < 0)
                         goto fail;
@@ -53734,7 +54481,11 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
                     el = json_parse_value(s, pr1);
                     if (JS_IsException(el))
                         goto fail;
-                    ret = JS_DefinePropertyValueUint32(ctx, val, idx, el, JS_PROP_C_W_E);
+                    /* Appending to the fresh fast array this loop is
+                       filling, rather than defining an indexed property on
+                       an object that might be anything. */
+                    ret = add_fast_array_element(ctx, JS_VALUE_GET_OBJ(val),
+                                                 el, JS_PROP_THROW);
                     if (ret < 0)
                         goto fail;
                     if (s->token.val == ']')
@@ -53752,7 +54503,14 @@ static JSValue json_parse_value(JSParseState *s, JSONParseRecord *pr)
         }
         break;
     case TOK_STRING:
-        val = js_dup(s->token.u.str.str);
+        if (s->token.u.str.raw) {
+            val = js_new_string8_len(ctx, (const char *)s->token.u.str.raw,
+                                     s->token.u.str.raw_len);
+            if (JS_IsException(val))
+                goto fail;
+        } else {
+            val = js_dup(s->token.u.str.str);
+        }
         if (pr) {
             json_parse_record_init_primitive(ctx, pr, val,
                                              s->token.ptr - s->buf_start,
@@ -53820,6 +54578,7 @@ static JSValue JS_ParseJSON_internal(JSContext *ctx, const char *buf, size_t buf
     if (json_next_token(s))
         goto fail;
     val = json_parse_value(s, pr);
+    json_free_key_cache(s);
     if (JS_IsException(val))
         goto fail;
     if (s->token.val != TOK_EOF) {
@@ -54055,6 +54814,49 @@ static JSValue js_json_rawJSON(JSContext *ctx, JSValueConst this_val,
     return JS_EXCEPTION;
 }
 
+/* The property names of a plain object, straight from its shape into the
+   caller's array, when they are all ordinary string keys. JSON.stringify
+   runs this per object, and the general enumerator allocates an array and
+   classifies every key by kind first. Returns false -- having taken no
+   references -- when anything about the object is not ordinary, and the
+   caller falls back to the general path. */
+static bool json_collect_plain_keys(JSContext *ctx, JSObject *p,
+                                    JSPropertyEnum *tab, uint16_t *slots,
+                                    uint32_t size, uint32_t *plen)
+{
+    JSShape *sh = p->shape;
+    JSShapeProperty *prs;
+    uint32_t i, n = 0, num_key;
+
+    if (sh->prop_count > size)
+        return false;
+    for(i = 0, prs = get_shape_prop(sh); i < sh->prop_count; i++, prs++) {
+        JSAtom atom = prs->atom;
+        if (atom == JS_ATOM_NULL)
+            continue;
+        /* A numeric key would have to be sorted ahead of the others, and a
+           symbol is not a JSON key at all: leave both to the general path,
+           along with anything that is not a plain stored value -- a getter
+           has to be called, and the caller reads the slot directly. */
+        if (JS_AtomGetKind(ctx, atom) != JS_ATOM_KIND_STRING
+            || JS_AtomIsArrayIndex(ctx, &num_key, atom))
+            return false;
+        if ((prs->flags & JS_PROP_TMASK) != JS_PROP_NORMAL)
+            return false;
+        /* Enumerability is decided here, once, the way the specification's
+           EnumerableOwnPropertyNames decides it -- not again per property
+           after a getter has had the chance to change it. */
+        if (!(prs->flags & JS_PROP_ENUMERABLE))
+            continue;
+        tab[n].atom = JS_DupAtom(ctx, atom);
+        tab[n].is_enumerable = true;
+        slots[n] = (uint16_t)i;
+        n++;
+    }
+    *plen = n;
+    return true;
+}
+
 typedef struct JSONStringifyContext {
     JSValueConst replacer_func;
     JSValue stack;
@@ -54062,7 +54864,46 @@ typedef struct JSONStringifyContext {
     JSValue gap;
     JSValue empty;
     StringBuffer *b;
+    /* The last shape found to have no `toJSON` anywhere on its prototype
+       chain, valid while the runtime's property-location generation is
+       unchanged. A document is thousands of objects of a handful of shapes,
+       and each one otherwise walks its prototype chain for a property that
+       is not there. */
+    JSShape *no_tojson_shape;
+    uint32_t no_tojson_gen;
+    /* The objects on the path from the root, for the circular-reference
+       check. It used to be a JavaScript array, so every object cost an
+       Array#includes, a push and a pop through the generic property paths.
+       Borrowed pointers: an entry is on the path only while the frame
+       holding a reference to it is running. */
+    JSObject **path;
+    int path_len, path_size;
 } JSONStringifyContext;
+
+/* Is `p` already on the path from the root -- that is, a cycle? The path is
+   a few entries deep in any real document. */
+static bool json_path_has(JSONStringifyContext *jsc, JSObject *p)
+{
+    int i;
+    for (i = 0; i < jsc->path_len; i++)
+        if (jsc->path[i] == p)
+            return true;
+    return false;
+}
+
+static int json_path_push(JSContext *ctx, JSONStringifyContext *jsc, JSObject *p)
+{
+    if (jsc->path_len >= jsc->path_size) {
+        int size = jsc->path_size ? jsc->path_size * 2 : 16;
+        JSObject **path = js_realloc(ctx, jsc->path, sizeof(*path) * size);
+        if (!path)
+            return -1;
+        jsc->path = path;
+        jsc->path_size = size;
+    }
+    jsc->path[jsc->path_len++] = p;
+    return 0;
+}
 
 static JSValue JS_ToQuotedStringFree(JSContext *ctx, JSValue val) {
     JSValue r = JS_ToQuotedString(ctx, val);
@@ -54078,9 +54919,33 @@ static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
     JSValueConst args[2];
 
     if (JS_IsObject(val) || JS_IsBigInt(val)) {
-		JSValue f = JS_GetProperty(ctx, val, JS_ATOM_toJSON);
+		JSValue f;
+		JSObject *o = JS_IsObject(val) ? JS_VALUE_GET_OBJ(val) : NULL;
+		if (o && o->shape == jsc->no_tojson_shape
+		    && jsc->no_tojson_gen == ctx->rt->prop_cache_gen)
+			goto no_tojson;
+		f = JS_GetProperty(ctx, val, JS_ATOM_toJSON);
 		if (JS_IsException(f))
 			goto exception;
+		/* Only when nothing on the chain is exotic -- every Proxy shares one
+		   shape and answers from its own trap -- and nothing on it carries a
+		   `toJSON` property at all. A shape records which properties exist,
+		   not what they hold, so a sibling object of the same shape can have a
+		   function where this one had undefined, and storing a value does not
+		   move it and so does not bump the generation. */
+		if (o && JS_IsUndefined(f) && !o->is_exotic) {
+			JSObject *chain = o;
+			JSProperty *pr1;
+			while (!chain->is_exotic
+			       && !find_own_property(&pr1, chain, JS_ATOM_toJSON)) {
+				chain = chain->shape->proto;
+				if (chain == NULL) {
+					jsc->no_tojson_shape = o->shape;
+					jsc->no_tojson_gen = ctx->rt->prop_cache_gen;
+					break;
+				}
+			}
+		}
 		if (JS_IsFunction(ctx, f)) {
 			v = JS_CallFree(ctx, f, val, 1, &key);
 			JS_FreeValue(ctx, val);
@@ -54091,6 +54956,7 @@ static JSValue js_json_check(JSContext *ctx, JSONStringifyContext *jsc,
 			JS_FreeValue(ctx, f);
 		}
 	}
+ no_tojson:
 
     if (!JS_IsUndefined(jsc->replacer_func)) {
         args[0] = key;
@@ -54133,9 +54999,16 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
 {
     JSValue indent1, sep, sep1, tab, v, prop;
     JSObject *p;
+    JSPropertyEnum *atoms = NULL, stack_atoms[16];
+    uint16_t stack_slots[16];
+    JSShape *keys_shape = NULL;
+    uint32_t keys_gen = 0, atom_count = 0;
     int64_t i, len;
     int cl, ret;
     bool has_content;
+    /* With no gap both separators are the empty string, and every one of
+       these is a call that copies nothing. */
+    bool indented = !JS_IsEmptyString(jsc->gap);
 
     indent1 = JS_UNDEFINED;
     sep = JS_UNDEFINED;
@@ -54173,10 +55046,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
             val = val1;
             goto concat_value;
         }
-        v = js_array_includes(ctx, jsc->stack, 1, vc(&val));
-        if (JS_IsException(v))
-            goto exception;
-        if (JS_ToBoolFree(ctx, v)) {
+        if (json_path_has(jsc, JS_VALUE_GET_OBJ(val))) {
             JS_ThrowTypeError(ctx, "circular reference");
             goto exception;
         }
@@ -54194,8 +55064,7 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
             sep = js_dup(jsc->empty);
             sep1 = js_dup(jsc->empty);
         }
-        v = js_array_push(ctx, jsc->stack, 1, vc(&val), 0);
-        if (check_exception_free(ctx, v))
+        if (json_path_push(ctx, jsc, JS_VALUE_GET_OBJ(val)))
             goto exception;
         ret = js_is_array(ctx, val);
         if (ret < 0)
@@ -54203,11 +55072,12 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
         if (ret) {
             if (js_get_length64(ctx, &len, val))
                 goto exception;
-            string_buffer_putc8(jsc->b, '[');
+            string_buffer_putc8_fast(jsc->b, '[');
             for(i = 0; i < len; i++) {
                 if (i > 0)
-                    string_buffer_putc8(jsc->b, ',');
-                string_buffer_concat_value(jsc->b, sep);
+                    string_buffer_putc8_fast(jsc->b, ',');
+                if (indented)
+                    string_buffer_concat_value(jsc->b, sep);
                 v = JS_GetPropertyInt64(ctx, val, i);
                 if (JS_IsException(v))
                     goto exception;
@@ -54226,28 +55096,92 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                     goto exception;
             }
             if (len > 0 && !JS_IsEmptyString(jsc->gap)) {
-                string_buffer_putc8(jsc->b, '\n');
+                string_buffer_putc8_fast(jsc->b, '\n');
                 string_buffer_concat_value(jsc->b, indent);
             }
-            string_buffer_putc8(jsc->b, ']');
+            string_buffer_putc8_fast(jsc->b, ']');
         } else {
-            if (!JS_IsUndefined(jsc->property_list))
-                tab = js_dup(jsc->property_list);
-            else
-                tab = js_object_keys(ctx, JS_UNDEFINED, 1, vc(&val),
-                                     JS_ITERATOR_KIND_KEY);
-            if (JS_IsException(tab))
-                goto exception;
-            if (js_get_length64(ctx, &len, tab))
-                goto exception;
-            string_buffer_putc8(jsc->b, '{');
+            /* An ordinary object with no replacer list: walk its own atoms
+               rather than building an array of key strings and looking each
+               one back up by string. Same enumeration -- own string keys,
+               enumerable when read -- from the same place js_object_keys
+               takes it. */
+            if (JS_IsUndefined(jsc->property_list)
+                && JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT
+                && JS_VALUE_GET_OBJ(val)->class_id == JS_CLASS_OBJECT
+                && !JS_VALUE_GET_OBJ(val)->is_exotic) {
+                if (json_collect_plain_keys(ctx, JS_VALUE_GET_OBJ(val),
+                                            stack_atoms, stack_slots,
+                                            countof(stack_atoms), &atom_count)) {
+                    atoms = stack_atoms;
+                    keys_shape = JS_VALUE_GET_OBJ(val)->shape;
+                    keys_gen = ctx->rt->prop_cache_gen;
+                } else if (JS_GetOwnPropertyNamesInternal(ctx, &atoms, &atom_count,
+                                                          JS_VALUE_GET_OBJ(val),
+                                                          JS_GPN_STRING_MASK)) {
+                    goto exception;
+                } else {
+                    /* Drop what is not enumerable now, before any getter can
+                       run: the list js_object_keys would have built is a
+                       snapshot, and so is this one. */
+                    uint32_t k = 0, j;
+                    for (j = 0; j < atom_count; j++) {
+                        int desc_flags, res;
+                        res = JS_GetOwnPropertyFlagsInternal(ctx, &desc_flags,
+                                                             JS_VALUE_GET_OBJ(val),
+                                                             atoms[j].atom);
+                        if (res < 0) {
+                            for (; j < atom_count; j++)
+                                JS_FreeAtom(ctx, atoms[j].atom);
+                            atom_count = k;
+                            goto exception;
+                        }
+                        if (!res || !(desc_flags & JS_PROP_ENUMERABLE)) {
+                            JS_FreeAtom(ctx, atoms[j].atom);
+                            continue;
+                        }
+                        atoms[k++] = atoms[j];
+                    }
+                    atom_count = k;
+                }
+                len = atom_count;
+            } else {
+                if (!JS_IsUndefined(jsc->property_list))
+                    tab = js_dup(jsc->property_list);
+                else
+                    tab = js_object_keys(ctx, JS_UNDEFINED, 1, vc(&val),
+                                         JS_ITERATOR_KIND_KEY);
+                if (JS_IsException(tab))
+                    goto exception;
+                if (js_get_length64(ctx, &len, tab))
+                    goto exception;
+            }
+            string_buffer_putc8_fast(jsc->b, '{');
             has_content = false;
             for(i = 0; i < len; i++) {
                 JS_FreeValue(ctx, prop);
-                prop = JS_GetPropertyInt64(ctx, tab, i);
-                if (JS_IsException(prop))
-                    goto exception;
-                v = JS_GetPropertyValue(ctx, val, js_dup(prop));
+                if (atoms) {
+                    JSAtom atom = atoms[i].atom;
+                    JSObject *po = JS_VALUE_GET_OBJ(val);
+                    /* Nothing has moved since the keys were collected -- same
+                       shape, and the runtime's property-location generation
+                       has not been bumped -- so the slot recorded then is
+                       still this property's. */
+                    if (po->shape == keys_shape && ctx->rt->prop_cache_gen == keys_gen)
+                        v = js_dup(po->prop[stack_slots[i]].u.value);
+                    else
+                        v = JS_GetProperty(ctx, val, atom);
+                    prop = JS_AtomToValue(ctx, atom);
+                    if (JS_IsException(prop)) {
+                        JS_FreeValue(ctx, v);
+                        goto exception;
+                    }
+                } else {
+                    prop = JS_GetPropertyInt64(ctx, tab, i);
+                    if (JS_IsException(prop))
+                        goto exception;
+                    v = JS_GetPropertyValue(ctx, val, js_dup(prop));
+                }
                 if (JS_IsException(v))
                     goto exception;
                 v = js_json_check(ctx, jsc, val, v, prop);
@@ -54255,29 +55189,38 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
                     goto exception;
                 if (!JS_IsUndefined(v)) {
                     if (has_content)
-                        string_buffer_putc8(jsc->b, ',');
-                    prop = JS_ToQuotedStringFree(ctx, prop);
-                    if (JS_IsException(prop)) {
+                        string_buffer_putc8_fast(jsc->b, ',');
+                    if (indented)
+                        if (indented)
+                    string_buffer_concat_value(jsc->b, sep);
+                    if (string_buffer_quote(jsc->b, prop)) {
                         JS_FreeValue(ctx, v);
                         goto exception;
                     }
-                    string_buffer_concat_value(jsc->b, sep);
-                    string_buffer_concat_value(jsc->b, prop);
-                    string_buffer_putc8(jsc->b, ':');
-                    string_buffer_concat_value(jsc->b, sep1);
+                    string_buffer_putc8_fast(jsc->b, ':');
+                    if (indented)
+                        string_buffer_concat_value(jsc->b, sep1);
                     if (js_json_to_str(ctx, jsc, val, v, indent1))
                         goto exception;
                     has_content = true;
                 }
             }
             if (has_content && JS_VALUE_GET_STRING(jsc->gap)->len != 0) {
-                string_buffer_putc8(jsc->b, '\n');
+                string_buffer_putc8_fast(jsc->b, '\n');
                 string_buffer_concat_value(jsc->b, indent);
             }
-            string_buffer_putc8(jsc->b, '}');
+            string_buffer_putc8_fast(jsc->b, '}');
+            if (atoms) {
+                if (atoms == stack_atoms) {
+                    for (i = 0; i < atom_count; i++)
+                        JS_FreeAtom(ctx, atoms[i].atom);
+                } else {
+                    js_free_prop_enum(ctx, atoms, atom_count);
+                }
+                atoms = NULL;
+            }
         }
-        if (check_exception_free(ctx, js_array_pop(ctx, jsc->stack, 0, NULL, 0)))
-            goto exception;
+        jsc->path_len--;
         JS_FreeValue(ctx, val);
         JS_FreeValue(ctx, tab);
         JS_FreeValue(ctx, sep);
@@ -54290,10 +55233,9 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
     switch (JS_VALUE_GET_NORM_TAG(val)) {
     case JS_TAG_STRING:
     case JS_TAG_STRING_ROPE:
-        val = JS_ToQuotedStringFree(ctx, val);
-        if (JS_IsException(val))
-            goto exception;
-        goto concat_value;
+        ret = string_buffer_quote(jsc->b, val);
+        JS_FreeValue(ctx, val);
+        return ret;
     case JS_TAG_FLOAT64:
         if (!isfinite(JS_VALUE_GET_FLOAT64(val))) {
             val = JS_NULL;
@@ -54314,6 +55256,12 @@ static int js_json_to_str(JSContext *ctx, JSONStringifyContext *jsc,
     }
 
 exception:
+    if (atoms == stack_atoms) {
+        for (i = 0; i < atom_count; i++)
+            JS_FreeAtom(ctx, atoms[i].atom);
+    } else if (atoms) {
+        js_free_prop_enum(ctx, atoms, atom_count);
+    }
     JS_FreeValue(ctx, val);
     JS_FreeValue(ctx, tab);
     JS_FreeValue(ctx, sep);
@@ -54333,7 +55281,12 @@ JSValue JS_JSONStringify(JSContext *ctx, JSValueConst obj,
     int64_t i, j, n;
 
     jsc->replacer_func = JS_UNDEFINED;
+    jsc->no_tojson_shape = NULL;
+    jsc->no_tojson_gen = 0;
     jsc->stack = JS_UNDEFINED;
+    jsc->path = NULL;
+    jsc->path_len = 0;
+    jsc->path_size = 0;
     jsc->property_list = JS_UNDEFINED;
     jsc->gap = JS_UNDEFINED;
     jsc->b = &b_s;
@@ -54458,6 +55411,7 @@ done:
     JS_FreeValue(ctx, jsc->gap);
     JS_FreeValue(ctx, jsc->property_list);
     JS_FreeValue(ctx, jsc->stack);
+    js_free(ctx, jsc->path);
     return ret;
 }
 

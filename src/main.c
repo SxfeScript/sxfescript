@@ -494,6 +494,58 @@ static char *sxn_pkg_entry(JSContext *ctx, const char *pkg_dir) {
     return out;
 }
 
+/* An uncaught exception, and a promise rejection nothing ever handled, are
+   both reportable events before they are fatal: the page-style handlers
+   (onerror, onunhandledrejection, onrejectionhandled) get first refusal, and
+   only what they decline is printed. The dispatch itself is JavaScript, in
+   src/bootstrap.js; this is the wiring. */
+static bool sxn_dispatch_uncaught(JSContext *ctx) {
+    JSValue error = JS_GetException(ctx);
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue fn = JS_GetPropertyStr(ctx, global, "__sxnUncaught");
+    bool handled = false;
+    if (JS_IsFunction(ctx, fn)) {
+        JSValueConst args[1] = { error };
+        JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 1, args);
+        if (JS_IsException(r)) JS_FreeValue(ctx, JS_GetException(ctx));
+        else handled = JS_ToBool(ctx, r);
+        JS_FreeValue(ctx, r);
+    }
+    JS_FreeValue(ctx, fn);
+    JS_FreeValue(ctx, global);
+    if (!handled) {
+        JS_Throw(ctx, error);          /* put it back for the usual report */
+        return false;
+    }
+    JS_FreeValue(ctx, error);
+    return true;
+}
+
+static void sxn_report_uncaught(JSContext *ctx) {
+    if (!sxn_dispatch_uncaught(ctx)) js_std_dump_error(ctx);
+}
+
+/* Both halves of the rejection tracker are handed to JavaScript, which keeps
+   the list and decides when a rejection has gone unhandled for good. */
+extern int sxn_rejections_pending;   /* src/network.c, read by its loop */
+
+static void sxn_rejection_tracker(JSContext *ctx, JSValueConst promise,
+                                  JSValueConst reason, bool is_handled, void *opaque) {
+    (void)opaque;
+    if (!is_handled) sxn_rejections_pending = 1;
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue fn = JS_GetPropertyStr(ctx, global,
+                                   is_handled ? "__sxnRejectionHandled" : "__sxnRejectionRaised");
+    if (JS_IsFunction(ctx, fn)) {
+        JSValueConst args[2] = { promise, reason };
+        JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 2, args);
+        if (JS_IsException(r)) JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, r);
+    }
+    JS_FreeValue(ctx, fn);
+    JS_FreeValue(ctx, global);
+}
+
 static char *sxn_module_normalize(JSContext *ctx, const char *base_name,
                                   const char *name, void *opaque);
 
@@ -832,14 +884,15 @@ static char *sxn_module_normalize(JSContext *ctx, const char *base_name,
 
 static JSModuleDef *sxn_module_loader(JSContext *ctx, const char *name, void *opaque,
                                       JSValueConst attributes) {
-    /* node:buffer/path/events/process/fs/fs-promises are pre-registered by
-       sxn_install_node_compat via JS_NewCModule (same mechanism as
-       qjs:std/qjs:os/qjs:bjson below), so `import ... from "node:xxx"`
-       resolves to them without ever reaching this loader. Only an
-       unregistered node: specifier gets here -- report it clearly instead
-       of falling through to file-based resolution, which would otherwise
-       try (and fail confusingly) to open a file literally named "node:xxx". */
+    /* A node: specifier is registered here, on the way through, rather than
+       at startup: JS_NewCModule plus an atom per export name is real work,
+       and a program that imports two builtins used to pay for all of them.
+       A name this runtime does not have is reported clearly instead of
+       falling through to file-based resolution, which would otherwise try
+       (and fail confusingly) to open a file literally named "node:xxx". */
     if (has_prefix(name, "node:")) {
+        JSModuleDef *m = sxn_node_module_load(ctx, name);
+        if (m) return m;
         JS_ThrowReferenceError(ctx, "unsupported node: module '%s'", name);
         return NULL;
     }
@@ -921,7 +974,7 @@ static int execute_file(int argc, char **argv, const char *filename,
         goto failure;
     }
     JS_SetModuleLoaderFunc2(runtime, sxn_module_normalize, sxn_module_loader, js_module_check_attributes, NULL);
-    JS_SetHostPromiseRejectionTracker(runtime, js_std_promise_rejection_tracker, NULL);
+    JS_SetHostPromiseRejectionTracker(runtime, sxn_rejection_tracker, NULL);
 
     bool is_sxbc = suffix(filename, ".sxbc");
     if (!is_sxbc) {
@@ -996,13 +1049,13 @@ static int execute_file(int argc, char **argv, const char *filename,
        it has to drive the uv loop too, or any await on a timer, a fetch or a
        server never resumes. */
     if (!JS_IsException(value)) value = sxn_await_with_loop(context, value);
-    if (JS_IsException(value)) { js_std_dump_error(context); JS_FreeValue(context, value); goto failure; }
+    if (JS_IsException(value)) { sxn_report_uncaught(context); JS_FreeValue(context, value); goto failure; }
     JS_FreeValue(context, value);
-    if (js_std_loop(context)) { js_std_dump_error(context); goto failure; }
+    if (js_std_loop(context)) { sxn_report_uncaught(context); goto failure; }
     /* Drains any server sockets / async file reads registered by network.c;
        a no-op that returns immediately for scripts that never called
        Sxn.serve or Sxn.file(...).text(). */
-    if (sxn_run_event_loop(context)) { js_std_dump_error(context); goto failure; }
+    if (sxn_run_event_loop(context)) { sxn_report_uncaught(context); goto failure; }
     if (memory_report) {
         JSMemoryUsage usage;
         JS_ComputeMemoryUsage(runtime, &usage);
@@ -1049,6 +1102,12 @@ static int sxn_compile_command(int argc, char **argv) {
     js_std_init_handlers(runtime);
     JSContext *context = JS_NewContext(runtime);
     if (!context) { JS_FreeRuntime(runtime); return 2; }
+    /* A module's imports are resolved while it is compiled, so compiling
+       needs the same loader running a file does. Without it, `sxn compile`
+       failed on any file with a relative import -- which is every file in a
+       program of more than one. */
+    JS_SetModuleLoaderFunc2(runtime, sxn_module_normalize, sxn_module_loader,
+                            js_module_check_attributes, NULL);
     int rc = sxn_compile_file(context, in, out, strip);
     js_std_free_handlers(runtime);
     JS_FreeContext(context);
@@ -1058,7 +1117,7 @@ static int sxn_compile_command(int argc, char **argv) {
 }
 
 static void usage(void) {
-    puts("SXN 0.0.1\n"
+    puts("SXN 0.0.2\n"
          "Usage:\n"
          "  sxn <file.sx|file.ts|file.js|file.mjs|file.cjs> [args...]\n"
          "  sxn run [script] -- [args...]\n"
@@ -1068,6 +1127,7 @@ static void usage(void) {
          "  sxn remove package\n"
          "  sxn init\n"
          "  sxn [--memory-report] [--leak-check] [--compile-cache] <file.sx|file.ts|file.js|file.mjs|file.cjs> [args...]\n"
+         "  sxn [--no-idle-gc] [--idle-gc-floor=<MB>] <file>   -- cycle sweeping while the event loop is quiet\n"
          "  sxn compile <file> [-o out.sxbc] [--strip]   -- compile to bytecode for distribution\n"
          "  sxn <file.sxbc> [args...]          -- run precompiled bytecode directly\n"
          "  sxn lsp --stdio\n"
@@ -1085,22 +1145,37 @@ int main(int argc, char **argv) {
     _setmode(_fileno(stdin), _O_BINARY);
 #endif
     if (argc < 2 || !strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) { usage(); return 0; }
-    if (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v")) { puts("sxn 0.0.1"); return 0; }
+    if (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v")) { puts("sxn 0.0.2"); return 0; }
     if (!strcmp(argv[1], "lsp")) return sxn_lsp_main();
     if (!strcmp(argv[1], "compile")) return sxn_compile_command(argc, argv);
     if (!strcmp(argv[1], "run") || !strcmp(argv[1], "install") || !strcmp(argv[1], "add") ||
         !strcmp(argv[1], "remove") || !strcmp(argv[1], "init")) return sxn_package_command(argc, argv);
     bool memory_report = false, leak_check = false, compile_cache = false;
+    int idle_gc = 1;
+    size_t idle_gc_floor = 0; /* 0 keeps sxn_configure_idle_gc's own default */
     int file_index = 1;
     while (file_index < argc && (!strcmp(argv[file_index], "--memory-report") ||
                                  !strcmp(argv[file_index], "--leak-check") ||
+                                 !strcmp(argv[file_index], "--no-idle-gc") ||
+                                 !strncmp(argv[file_index], "--idle-gc-floor=", 16) ||
                                  !strcmp(argv[file_index], "--compile-cache"))) {
         if (!strcmp(argv[file_index], "--memory-report")) memory_report = true;
         else if (!strcmp(argv[file_index], "--leak-check")) leak_check = true;
+        else if (!strcmp(argv[file_index], "--no-idle-gc")) idle_gc = 0;
+        else if (!strncmp(argv[file_index], "--idle-gc-floor=", 16)) {
+            char *end = NULL;
+            long long mb = strtoll(argv[file_index] + 16, &end, 10);
+            if (!end || *end || mb < 0) {
+                fprintf(stderr, "sxn: --idle-gc-floor expects a size in MB\n");
+                return 2;
+            }
+            idle_gc_floor = (size_t)mb * 1024u * 1024u;
+        }
         else compile_cache = true;
         ++file_index;
     }
     if (file_index >= argc) { usage(); return 2; }
+    sxn_configure_idle_gc(idle_gc, idle_gc_floor);
     /* An argument that names a real file is a file to run, whatever it is
        called. Node and Bun both run `./node_modules/.bin/whatever`, and every
        CLI shipped by an npm package is extensionless, so requiring a known

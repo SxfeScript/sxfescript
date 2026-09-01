@@ -1,5 +1,5 @@
 /* Minimal `node:*` compatibility layer, layered the same way bootstrap.js
-   layers WinterCG globals: pure spec/behavior logic lives here in JS, native
+   layers WinterTC globals: pure spec/behavior logic lives here in JS, native
    primitives (env, cwd, exit, signal watching) are thin C wrappers installed
    by sxn_install_node_compat before this file is evaluated. The four
    `node:*` C modules (see src/node.c) just re-export the globals this file
@@ -11,23 +11,16 @@
   // replacing node_compat.js with native C. Listener storage is still the
   // plain `this._events` object with Node's function-for-one-listener and
   // array-for-many representation; the native side reads and writes it
-  // directly. `once` stays JS: its self-removing wrapper has no natural
-  // native shape (it needs to reference itself to call `self.off(type,
-  // wrapped)`), and it's not a hot path the way emit() is.
+  // directly. `once` went native too (js_ee_once): the self-removing wrapper
+  // does have a native shape after all -- a C function carrying the emitter,
+  // the name and the listener, and one holder object it reads itself back
+  // out of. 0.55 microseconds per once-and-emit became 0.44.
   function EventEmitter() {
     this._events = Object.create(null);
   }
   EventEmitter.prototype.on = __sxnEeOn;
   EventEmitter.prototype.addListener = __sxnEeOn;
-  EventEmitter.prototype.once = function (type, listener) {
-    var self = this;
-    function wrapped() {
-      self.off(type, wrapped);
-      listener.apply(this, arguments);
-    }
-    wrapped._original = listener;
-    return this.on(type, wrapped);
-  };
+  EventEmitter.prototype.once = __sxnEeOnce;
   EventEmitter.prototype.off = __sxnEeOff;
   EventEmitter.prototype.removeListener = __sxnEeOff;
   EventEmitter.prototype.removeAllListeners = __sxnEeRemoveAllListeners;
@@ -76,98 +69,78 @@
   // No `.default` here: Node does not define one, and the ESM default export
   // is set on the module itself rather than as a property of the class.
   EventEmitter.captureRejectionSymbol = Symbol.for("nodejs.rejection");
-  EventEmitter.defaultMaxListeners = 10;
+  // A listener count crossing this limit is Node's standard signal that
+  // handlers are being added and never removed, which is how a long-running
+  // server grows one closure at a time. The count check lives with the rest
+  // of the native listener code (sxn_ee_check_max_listeners in src/node.c),
+  // so the default lives there too and this is the accessor over it --
+  // `require('events').defaultMaxListeners = 20` still reads and writes the
+  // value the check actually uses. 0 or less means unlimited, as in Node.
+  Object.defineProperty(EventEmitter, "defaultMaxListeners", {
+    get: () => __sxnEeDefaultMax(),
+    set: (n) => { __sxnEeDefaultMax(n); },
+    enumerable: true, configurable: true,
+  });
+  // Per-emitter override. Without these the warning would be unsuppressable,
+  // which is worse than not warning: a program that legitimately wants 50
+  // listeners could do nothing about the noise.
+  EventEmitter.prototype.setMaxListeners = function (n) {
+    this._maxListeners = n;
+    return this;
+  };
+  EventEmitter.prototype.getMaxListeners = function () {
+    return typeof this._maxListeners === "number"
+      ? this._maxListeners
+      : EventEmitter.defaultMaxListeners;
+  };
   globalThis.__sxnEventEmitter = EventEmitter;
   delete globalThis.__sxnEeOn;
+  delete globalThis.__sxnEeOnce;
   delete globalThis.__sxnEeOff;
   delete globalThis.__sxnEeEmit;
   delete globalThis.__sxnEeListenerCount;
   delete globalThis.__sxnEeListeners;
   delete globalThis.__sxnEeRemoveAllListeners;
+  // __sxnEeDefaultMax stays on the global: the accessor above closes over it.
 
   // ---------------- buffer: Buffer ----------------
   // Only called for non-utf-8 encodings -- Buffer.from's string branch
   // handles utf-8 itself via a native primitive that skips the extra
   // allocation this returns-a-bare-Uint8Array shape would otherwise cost.
-  // `encoding` arrives already-lowercased from that call site.
-  // Node decodes as much as it can and stops, where the standard
-  // Uint8Array.fromHex throws. Take the strict, native path first and fall
-  // back only when it refuses, so valid input keeps its speed.
-  function hexBytesLenient(str) {
-    var out = new Uint8Array(str.length >> 1), n = 0;
-    for (var i = 0; i + 1 < str.length; i += 2) {
-      var hi = hexDigit(str.charCodeAt(i) & 0xff), lo = hexDigit(str.charCodeAt(i + 1) & 0xff);
-      if (hi < 0 || lo < 0) break;
-      out[n++] = (hi << 4) | lo;
-    }
-    return out.subarray(0, n);
-  }
-  function hexDigit(c) {
-    if (c >= 48 && c <= 57) return c - 48;
-    if (c >= 97 && c <= 102) return c - 87;
-    if (c >= 65 && c <= 70) return c - 55;
-    return -1;
-  }
-
-  // Node's base64 reader takes either alphabet, skips anything that is not a
-  // base64 character, and does not require padding.
-  var B64 = (function () {
-    var t = new Int8Array(128).fill(-1);
-    var a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    for (var i = 0; i < a.length; i++) t[a.charCodeAt(i)] = i;
-    t[43] = 62; t[47] = 63;   // + /
-    t[45] = 62; t[95] = 63;   // - _  (base64url)
-    return t;
-  })();
-  function base64BytesLenient(str) {
-    var out = new Uint8Array((str.length * 3) >> 2), n = 0, acc = 0, bits = 0;
-    for (var i = 0; i < str.length; i++) {
-      // Node reads the string one byte at a time, so a code unit above 0xff is
-      // truncated rather than skipped -- which is why an emoji ends a base64
-      // string: the high half of its surrogate pair masks down to '='.
-      var c = str.charCodeAt(i) & 0xff;
-      if (c === 61) break;                        // '=' ends the data
-      var v = c < 128 ? B64[c] : -1;
-      if (v < 0) continue;
-      acc = (acc << 6) | v; bits += 6;
-      if (bits >= 8) { bits -= 8; out[n++] = (acc >> bits) & 0xff; }
-    }
-    return out.subarray(0, n);
-  }
-
-  function utf16leBytes(str) {
-    var out = new Uint8Array(str.length * 2);
-    for (var i = 0; i < str.length; i++) {
-      var c = str.charCodeAt(i);
-      out[i * 2] = c & 0xff;
-      out[i * 2 + 1] = c >> 8;
-    }
-    return out;
-  }
-  function utf16leString(bytes) {
-    var out = "";
-    for (var i = 0; i + 1 < bytes.length; i += 2)
-      out += String.fromCharCode(bytes[i] | (bytes[i + 1] << 8));
-    return out;
-  }
+  // `encoding` arrives already-lowercased from that call site. The lenient
+  // hex and base64 readers Node's leniency needs are native (js_hex_bytes
+  // and js_base64_bytes), including the case where a string holds code
+  // units above 0xff and Node's byte-at-a-time reading of it shows.
+  var utf16leBytes = __sxnUtf16leBytes;
+  // Native (js_buffer_decode_units in src/node.c): latin1, Node's 7-bit
+  // "ascii" and utf16le are all a widening of bytes into code units, which
+  // was a String.fromCharCode per byte here.
+  var utf16leString = __sxnUtf16leString;
 
   function bufferBytesFromString(str, encoding) {
+    // The native readers are lenient the way Node is -- hex stops at the
+    // first pair that is not hex, base64 skips anything outside the alphabet
+    // -- so ordinary payloads, including base64 with the newlines PEM and
+    // MIME put in it, never touch the JavaScript loops. They hand back null
+    // for a string with anything non-ASCII in it, where Node's reading of
+    // UTF-16 code units is visible, and the loops below take that.
     if (encoding === "hex") {
-      try { return Uint8Array.fromHex(str); } catch { return hexBytesLenient(str); }
+      // Strict first, because it reads the string's own bytes with no copy
+      // at all; the native lenient reader takes over when the input has
+      // something in it that the strict one refuses.
+      try { return Uint8Array.fromHex(str); } catch { /* fall through */ }
+      return __sxnHexBytes(str);
     }
     if (encoding === "base64" || encoding === "base64url") {
       try {
         return encoding === "base64" ? Uint8Array.fromBase64(str)
                                      : Uint8Array.fromBase64(str, { alphabet: "base64url" });
-      } catch { return base64BytesLenient(str); }
+      } catch { /* fall through */ }
+      return __sxnBase64Bytes(str);
     }
     if (encoding === "ucs2" || encoding === "ucs-2" ||
         encoding === "utf16le" || encoding === "utf-16le") return utf16leBytes(str);
-    if (encoding === "latin1" || encoding === "binary" || encoding === "ascii") {
-      var bytes = new Uint8Array(str.length);
-      for (var i = 0; i < str.length; i++) bytes[i] = str.charCodeAt(i) & 0xff;
-      return bytes;
-    }
+    if (encoding === "latin1" || encoding === "binary" || encoding === "ascii") return __sxnLatin1Bytes(str);
     throw new TypeError("Unknown encoding: " + encoding);
   }
 
@@ -189,17 +162,9 @@
       if (encoding === "base64url") return this.toBase64({ alphabet: "base64url", omitPadding: true }); // Node emits base64url unpadded
       if (encoding === "ucs2" || encoding === "ucs-2" ||
           encoding === "utf16le" || encoding === "utf-16le") return utf16leString(this);
-      if (encoding === "latin1" || encoding === "binary") {
-        var out = "";
-        for (var i = 0; i < this.length; i++) out += String.fromCharCode(this[i]);
-        return out;
-      }
-      if (encoding === "ascii") {
-        // Node's "ascii" is 7-bit: the high bit is stripped, unlike latin1.
-        var a = "";
-        for (var j = 0; j < this.length; j++) a += String.fromCharCode(this[j] & 0x7f);
-        return a;
-      }
+      if (encoding === "latin1" || encoding === "binary") return __sxnLatin1String(this);
+      // Node's "ascii" is 7-bit: the high bit is stripped, unlike latin1.
+      if (encoding === "ascii") return __sxnAsciiString(this);
       throw new TypeError("Unknown encoding: " + encoding);
     }
     // Node's Buffer#slice (and #subarray) are zero-copy views over the same
@@ -238,9 +203,16 @@
         if (enc === "utf-8" || enc === "utf8") return new Buffer(__sxnUtf8EncodeArrayBuffer(data));
         return Object.setPrototypeOf(bufferBytesFromString(data, enc), Buffer.prototype);
       }
-      if (data instanceof ArrayBuffer) return new Buffer(data); // zero-copy view over the whole buffer
-      if (ArrayBuffer.isView(data)) return new Buffer(data.buffer, data.byteOffset, data.byteLength); // zero-copy view
-      if (Array.isArray(data) || (data && typeof data.length === "number")) return new Buffer(data); // copies, matching Node
+      if (data instanceof ArrayBuffer) return new Buffer(data); // a view, which is what Node gives for an ArrayBuffer
+      // Native (js_buffer_from_bytes in src/node.c): copying a view went
+      // through the Uint8Array subclass constructor, 0.285us against
+      // 0.210us for the copy made in C. Node copies here, and code relies
+      // on it -- writing to the copy must not reach the original.
+      if (ArrayBuffer.isView(data)) return __sxnBufferFromBytes(data);
+      // An array stays with the constructor: reading its elements one at a
+      // time from C measured 1.185us against the engine's own 0.375us for
+      // the same array, which it fills without leaving the interpreter.
+      if (Array.isArray(data) || (data && typeof data.length === "number")) return new Buffer(data);
       throw new TypeError("Buffer.from: unsupported argument");
     }
     // Node serializes a Buffer as { type: "Buffer", data: [...] }, and code
@@ -250,161 +222,33 @@
     // Node orders by unsigned byte value, then by length, and equals is just
     // compare === 0. Anything holding bytes is accepted, as Node does.
     compare(other) {
-      var n = Math.min(this.length, other.length);
-      for (var i = 0; i < n; i++) {
-        if (this[i] !== other[i]) return this[i] < other[i] ? -1 : 1;
-      }
-      return this.length === other.length ? 0 : (this.length < other.length ? -1 : 1);
+      // Native (sxn_bytes_compare in src/network.c): memcmp, then length.
+      return __sxnBytesCompare(this, other instanceof Uint8Array ? other : Buffer.from(other));
     }
     equals(other) { return this.length === other.length && this.compare(other) === 0; }
 
+    // Native (js_concat_bytes in src/node.c): one memcpy per part rather
+    // than a length loop, a subarray per part and a set() per part.
     static concat(list, totalLength) {
-      if (totalLength === undefined) {
-        totalLength = 0;
-        for (var i = 0; i < list.length; i++) totalLength += list[i].length;
-      }
-      var out = new Buffer(totalLength);
-      var offset = 0;
-      for (var j = 0; j < list.length && offset < totalLength; j++) {
-        var chunk = list[j].subarray(0, Math.min(list[j].length, totalLength - offset));
-        out.set(chunk, offset);
-        offset += chunk.length;
-      }
-      return out;
+      return Object.setPrototypeOf(__sxnConcatBytes(list, totalLength), Buffer.prototype);
     }
   }
+  // The numeric accessors -- readUInt32BE, writeFloatLE and the rest -- and
+  // copy, all native (js_buffer_read/js_buffer_write_num/js_buffer_copy in
+  // src/node.c). They are pure byte-to-number work, they are what binary
+  // protocol code spends its time in, and none of them existed here before.
+  Object.assign(Buffer.prototype, __sxnBufferAccessors);
+  delete globalThis.__sxnBufferAccessors;
+
+  Buffer.compare = (a, b) => __sxnBytesCompare(a, b);
+  Buffer.isEncoding = (enc) =>
+    ["utf8", "utf-8", "hex", "base64", "base64url", "latin1", "binary", "ascii", "ucs2", "ucs-2", "utf16le", "utf-16le"]
+      .includes(String(enc).toLowerCase());
+  Buffer.poolSize = 8192;
+
   globalThis.Buffer = Buffer;
 
   // ---------------- path: posix / win32 ----------------
-  // Reduces a split path into a normalized segment list: drops "." and
-  // empty segments, resolves ".." against the previous real segment, and
-  // (for relative paths) keeps a leading run of ".." since there's no root
-  // to clamp against.
-  function reduceSegments(parts, isAbsolutePath) {
-    var out = [];
-    for (var i = 0; i < parts.length; i++) {
-      var seg = parts[i];
-      if (seg === "" || seg === ".") continue;
-      if (seg === "..") {
-        if (out.length && out[out.length - 1] !== "..") out.pop();
-        else if (!isAbsolutePath) out.push("..");
-      } else {
-        out.push(seg);
-      }
-    }
-    return out;
-  }
-
-  function makePathImpl(sep, delimiter, splitRe, isAbsoluteFn, formatRoot) {
-    function normalize(p) {
-      p = String(p);
-      if (p === "") return ".";
-      var isAbs = isAbsoluteFn(p);
-      var root = formatRoot(p, isAbs);
-      var rest = p.slice(root.rootLength);
-      var trailingSep = rest.length > 0 && splitRe.test(rest.charAt(rest.length - 1));
-      var segments = reduceSegments(rest.split(splitRe), isAbs);
-      var out = root.prefix + segments.join(sep);
-      if (out === "") out = ".";
-      if (trailingSep && segments.length && out.charAt(out.length - 1) !== sep) out += sep;
-      return out;
-    }
-
-    function join() {
-      var parts = [];
-      for (var i = 0; i < arguments.length; i++) {
-        var a = arguments[i];
-        if (a === undefined || a === null) continue;
-        if (typeof a !== "string") throw new TypeError("path segments must be strings");
-        if (a.length) parts.push(a);
-      }
-      if (!parts.length) return ".";
-      return normalize(parts.join(sep));
-    }
-
-    function resolve() {
-      var resolved = "";
-      var resolvedAbsolute = false;
-      for (var i = arguments.length - 1; i >= -1 && !resolvedAbsolute; i--) {
-        var seg = i >= 0 ? arguments[i] : __sxnCwd();
-        if (!seg) continue;
-        resolved = seg + sep + resolved;
-        resolvedAbsolute = isAbsoluteFn(seg);
-      }
-      var out = normalize(resolved);
-      if (!resolvedAbsolute) out = normalize(__sxnCwd() + sep + resolved);
-      // strip a normalize()-added trailing separator, resolve() never keeps one
-      var root = formatRoot(out, true);
-      if (out.length > root.rootLength && splitRe.test(out.charAt(out.length - 1))) out = out.slice(0, -1);
-      return out;
-    }
-
-    function dirname(p) {
-      p = String(p);
-      var isAbs = isAbsoluteFn(p);
-      var root = formatRoot(p, isAbs);
-      var rest = p.slice(root.rootLength);
-      var end = -1, matchedSep = true;
-      for (var i = rest.length - 1; i >= 0; i--) {
-        if (splitRe.test(rest.charAt(i))) {
-          if (!matchedSep) { end = i; break; }
-        } else matchedSep = false;
-      }
-      if (end === -1) return root.rootLength ? (root.prefix || root.rootPath) : ".";
-      return root.prefix + rest.slice(0, end);
-    }
-
-    function basename(p, suffix) {
-      p = String(p);
-      var root = formatRoot(p, isAbsoluteFn(p));
-      var rest = p.slice(root.rootLength).replace(new RegExp("[" + (sep === "\\" ? "\\\\/" : "/") + "]+$"), "");
-      var idx = -1;
-      for (var i = rest.length - 1; i >= 0; i--) { if (splitRe.test(rest.charAt(i))) { idx = i; break; } }
-      var base = idx === -1 ? rest : rest.slice(idx + 1);
-      if (suffix && base.length > suffix.length && base.slice(-suffix.length) === suffix) {
-        base = base.slice(0, -suffix.length);
-      }
-      return base;
-    }
-
-    function extname(p) {
-      var base = basename(p);
-      var dot = base.lastIndexOf(".");
-      if (dot <= 0) return ""; // no dot, or a leading dot (e.g. ".gitignore")
-      return base.slice(dot);
-    }
-
-    function relative(from, to) {
-      from = resolve(from);
-      to = resolve(to);
-      if (from === to) return "";
-      var fromParts = from.split(sep).filter(Boolean);
-      var toParts = to.split(sep).filter(Boolean);
-      var common = 0;
-      while (common < fromParts.length && common < toParts.length &&
-             (sep === "\\" ? fromParts[common].toLowerCase() === toParts[common].toLowerCase() : fromParts[common] === toParts[common])) {
-        common++;
-      }
-      var ups = fromParts.length - common;
-      var out = [];
-      for (var i = 0; i < ups; i++) out.push("..");
-      return out.concat(toParts.slice(common)).join(sep);
-    }
-
-    return {
-      sep: sep,
-      delimiter: delimiter,
-      isAbsolute: function (p) { return isAbsoluteFn(String(p)); },
-      normalize: normalize,
-      join: join,
-      resolve: resolve,
-      dirname: dirname,
-      basename: basename,
-      extname: extname,
-      relative: relative,
-    };
-  }
-
   // Native (see js_path_posix_* in src/node.c, registered as globals above)
   // -- phase 4 of replacing node_compat.js with native C. Same
   // reduceSegments/makePathImpl algorithm, ported to walk C strings
@@ -423,27 +267,21 @@
     relative: __sxnPosixRelative,
   };
 
-  var WIN32_SPLIT_RE = /[\\/]/;
-  function win32Root(p) {
-    // UNC: \\server\share\...
-    var unc = /^[\\/]{2}[^\\/]+[\\/]+[^\\/]+/.exec(p);
-    if (unc) return { rootLength: unc[0].length, prefix: unc[0].replace(/[\\/]+$/, "\\") + "\\", rootPath: unc[0] };
-    // Drive-qualified: C:\... or C:...
-    var drive = /^[a-zA-Z]:[\\/]?/.exec(p);
-    if (drive) {
-      var withSep = /[\\/]$/.test(drive[0]);
-      return { rootLength: drive[0].length, prefix: drive[0].slice(0, 2) + (withSep ? "\\" : ""), rootPath: drive[0].slice(0, 2) + "\\" };
-    }
-    if (WIN32_SPLIT_RE.test(p.charAt(0))) return { rootLength: 1, prefix: "\\", rootPath: "\\" };
-    return { rootLength: 0, prefix: "", rootPath: "" };
-  }
-  function win32IsAbsolute(p) {
-    if (/^[\\/]{2}/.test(p)) return true; // UNC: \\server\share
-    if (/^[a-zA-Z]:[\\/]/.test(p)) return true; // drive-qualified: C:\...
-    if (/^[\\/]/.test(p)) return true; // drive-relative: \foo
-    return false;
-  }
-  var win32 = makePathImpl("\\", ";", WIN32_SPLIT_RE, win32IsAbsolute, win32Root);
+  // Native too (js_path_win_* in src/node.c). This was the last of path
+  // still written in JavaScript, and the last place here that walked a
+  // string with a regexp.
+  var win32 = {
+    sep: "\\",
+    delimiter: ";",
+    isAbsolute: __sxnWinIsAbsolute,
+    normalize: __sxnWinNormalize,
+    join: __sxnWinJoin,
+    resolve: __sxnWinResolve,
+    dirname: __sxnWinDirname,
+    basename: __sxnWinBasename,
+    extname: __sxnWinExtname,
+    relative: __sxnWinRelative,
+  };
 
   var path = __sxnIsWindows ? win32 : posix;
   path.posix = posix;
@@ -457,6 +295,14 @@
   delete globalThis.__sxnPosixBasename;
   delete globalThis.__sxnPosixExtname;
   delete globalThis.__sxnPosixRelative;
+  delete globalThis.__sxnWinJoin;
+  delete globalThis.__sxnWinResolve;
+  delete globalThis.__sxnWinNormalize;
+  delete globalThis.__sxnWinIsAbsolute;
+  delete globalThis.__sxnWinDirname;
+  delete globalThis.__sxnWinBasename;
+  delete globalThis.__sxnWinExtname;
+  delete globalThis.__sxnWinRelative;
 
   // ---------------- process ----------------
   function Process() {
@@ -508,7 +354,9 @@
   // doubling it.
   const stripNL = (s) => (s.endsWith("\n") ? s.slice(0, -1) : s);
   process.stdout = makeStdio(1, (t) => { if (t) console.log(stripNL(t)); });
-  process.stderr = makeStdio(2, (t) => { if (t) console.error(stripNL(t)); });
+  // Straight to fd 2 -- console.error is itself built on __sxnWriteStderr, so
+  // routing through it would be a cycle.
+  process.stderr = makeStdio(2, (t) => { if (t) __sxnWriteStderr(t); });
   process.stdin = { fd: 0, isTTY: false, readable: false,
                     on() { return this; }, once() { return this; }, off() { return this; },
                     resume() { return this; }, pause() { return this; },
@@ -527,20 +375,32 @@
   // resolve back to this executable, so there is nothing to pass but the
   // module object it should fill in.
   if (typeof __sxnDlopen === "function") process.dlopen = __sxnDlopen;
-  process.emitWarning = function (w) { console.error("Warning: " + (w && w.message ? w.message : w)); };
+  // Node prints "<Name>: <message>" and callers lean on the name to tell
+  // warnings apart -- MaxListenersExceededWarning is the one this runtime
+  // raises itself, from sxn_ee_check_max_listeners.
+  process.emitWarning = function (w) {
+    const message = w && w.message ? w.message : String(w);
+    const name = w && w.name && w.name !== "Error" ? w.name + ": " : "";
+    console.error("Warning: " + name + message);
+  };
   process.uptime = function () { return performance.now() / 1000; };
-  process.pid = 0;
-  process.cwd = function () { return __sxnCwd(); };
+  // The real one: a program that runs several copies of itself -- which is
+  // how this runtime uses more than one core -- has nothing else to tell them
+  // apart by in a log.
+  process.pid = typeof __sxnPid === "number" ? __sxnPid : 0;
+  process.cwd = __sxnCwd;
+  // Node has chdir, and this runtime now needs one anyway: it is what tells
+  // the cached cwd it is stale.
+  process.chdir = __sxnChdir;
   process.exit = function (code) { __sxnExit(code === undefined ? 0 : code); };
   // A genuine job-queue microtask (queueMicrotask is itself a thin JS_EnqueueJob
   // wrapper built into quickjs.c), not a timer -- so nextTick callbacks always
   // run before any subsequently-scheduled timer/I-O callback, matching Node's
   // "runs before the event loop continues" contract for the cases this runtime
   // supports.
-  process.nextTick = function (fn) {
-    var args = Array.prototype.slice.call(arguments, 1);
-    queueMicrotask(function () { fn.apply(undefined, args); });
-  };
+  // Native (js_next_tick in src/node.c): this copied `arguments` into an
+  // array and built a closure over it for every tick.
+  process.nextTick = __sxnNextTick;
 
   // process.on('SIGINT'/'SIGTERM', ...) only arms the native libuv signal
   // watcher (see __sxnWatchSignal in src/node.c) the first time a listener
@@ -573,6 +433,22 @@
   function wantsText(encoding) {
     return typeof encoding === "string" || (encoding && typeof encoding.encoding === "string");
   }
+  // A file's size, kind and times. The numbers come from libuv; the methods
+  // and the Date fields are the shape Node hands back.
+  var S_IFMT = 0o170000, S_IFREG = 0o100000, S_IFDIR = 0o040000, S_IFLNK = 0o120000;
+  var S_IFCHR = 0o020000, S_IFBLK = 0o060000, S_IFIFO = 0o010000, S_IFSOCK = 0o140000;
+  // Native: __sxnStat fills the object itself, on this prototype, rather
+  // than handing back a plain one whose every field was then copied across
+  // by a for-in loop here.
+  function Stats() {}
+  Stats.prototype.isFile = function () { return (this.mode & S_IFMT) === S_IFREG; };
+  Stats.prototype.isDirectory = function () { return (this.mode & S_IFMT) === S_IFDIR; };
+  Stats.prototype.isSymbolicLink = function () { return (this.mode & S_IFMT) === S_IFLNK; };
+  Stats.prototype.isCharacterDevice = function () { return (this.mode & S_IFMT) === S_IFCHR; };
+  Stats.prototype.isBlockDevice = function () { return (this.mode & S_IFMT) === S_IFBLK; };
+  Stats.prototype.isFIFO = function () { return (this.mode & S_IFMT) === S_IFIFO; };
+  Stats.prototype.isSocket = function () { return (this.mode & S_IFMT) === S_IFSOCK; };
+
   var fs = {
     readFileSync: function (path, encoding) {
       var bytes = __sxnReadFileSync(path);
@@ -581,18 +457,56 @@
     },
     writeFileSync: globalThis.__sxnWriteFileSync,
     existsSync: globalThis.__sxnExistsSync,
+    statSync: function (path) { return __sxnStat(path, true, Stats.prototype); },
+    lstatSync: function (path) { return __sxnStat(path, false, Stats.prototype); },
+    Stats: Stats,
+    // The whole file, handed to a Readable in one chunk. Enough for serving
+    // a file, which is what this exists for; it is not a window onto a file
+    // too large to hold.
+    createReadStream: function (path, options) {
+      var stream = new Readable();
+      queueMicrotask(function () {
+        try {
+          var bytes = __sxnReadFileSync(path);
+          var start = (options && options.start) || 0;
+          var end = options && options.end !== undefined ? options.end + 1 : bytes.byteLength;
+          var slice = bytes.subarray(start, end);
+          var encoding = options && (typeof options === "string" ? options : options.encoding);
+          stream.push(encoding ? new TextDecoder().decode(slice)
+                               : Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength));
+          stream.push(null);
+        } catch (e) {
+          stream.emit("error", e);
+        }
+      });
+      return stream;
+    },
   };
+  // The flag numbers come from this platform's headers (js_fs_constants in
+  // src/network.c), which is the only way to get O_CREAT right everywhere.
+  fs.constants = __sxnFsConstants();
   globalThis.__sxnFs = fs;
   delete globalThis.__sxnWriteFileSync;
   delete globalThis.__sxnExistsSync;
 
   var fsPromises = {
+    // The same native read the synchronous side uses. This went through
+    // Sxn.file().text(), which decodes the file as UTF-8 and then had to
+    // encode it back to bytes -- so any byte that is not valid UTF-8 came
+    // back as the replacement character, and a binary file was corrupted.
     readFile: function (path, encoding) {
-      return Sxn.file(path).text().then(function (text) {
-        return wantsText(encoding) ? text : Buffer.from(new TextEncoder().encode(text).buffer);
-      });
+      try { return Promise.resolve(fs.readFileSync(path, encoding)); }
+      catch (e) { return Promise.reject(e); }
     },
     writeFile: __sxnWriteFileAsync,
+    stat: function (path) {
+      try { return Promise.resolve(__sxnStat(path, true, Stats.prototype)); }
+      catch (e) { return Promise.reject(e); }
+    },
+    lstat: function (path) {
+      try { return Promise.resolve(__sxnStat(path, false, Stats.prototype)); }
+      catch (e) { return Promise.reject(e); }
+    },
   };
   globalThis.__sxnFsPromises = fsPromises;
 
@@ -613,6 +527,7 @@
     EE.call(this);
     options = options || {};
     this._buf = [];
+    this._bufAt = 0;      // read cursor: shift() on a long queue copies it
     this._flowing = false;
     this._ended = false;
     this._endEmitted = false;
@@ -645,29 +560,41 @@
     this._buf.push(chunk);
     if (this._flowing) drainReadable(this);
     else this.emit("readable");
-    return this._buf.length < 16;      // a coarse high-water mark
+    return this._buf.length - this._bufAt < 16;      // a coarse high-water mark
   };
+  // Chunks leave through a cursor rather than shift(), which copies the
+  // whole queue down by one every time and made draining a long one cost
+  // its own length squared.
+  function takeChunk(r) {
+    const chunk = r._buf[r._bufAt];
+    r._buf[r._bufAt++] = undefined;
+    if (r._bufAt === r._buf.length) { r._buf.length = 0; r._bufAt = 0; }
+    return chunk;
+  }
+  function bufferedCount(r) { return r._buf.length - r._bufAt; }
   function drainReadable(r) {
-    while (r._flowing && r._buf.length > 0) r.emit("data", r._buf.shift());
+    while (r._flowing && bufferedCount(r) > 0) r.emit("data", takeChunk(r));
     maybeEndReadable(r);
     if (r._flowing && !r._ended) r._read();
   }
   function maybeEndReadable(r) {
-    if (r._ended && r._buf.length === 0 && !r._endEmitted) {
+    if (r._ended && bufferedCount(r) === 0 && !r._endEmitted) {
       r._endEmitted = true;
       r.readable = false;
       queueMicrotask(() => { r.emit("end"); r.emit("close"); });
     }
   }
   Readable.prototype.read = function () {
-    if (this._buf.length === 0) { this._read(); }
-    if (this._buf.length === 0) { maybeEndReadable(this); return null; }
+    if (bufferedCount(this) === 0) { this._read(); }
+    if (bufferedCount(this) === 0) { maybeEndReadable(this); return null; }
     let c;
-    if (this._readableObjectMode || this._encoding || this._buf.length === 1) {
-      c = this._buf.shift();
+    if (this._readableObjectMode || this._encoding || bufferedCount(this) === 1) {
+      c = takeChunk(this);
     } else {
       // Node hands back everything buffered as one Buffer.
-      c = Buffer.concat(this._buf.splice(0));
+      c = Buffer.concat(this._buf.splice(this._bufAt));
+      this._buf.length = 0;
+      this._bufAt = 0;
     }
     maybeEndReadable(this);
     return c;
@@ -686,19 +613,10 @@
     queueMicrotask(() => { if (err) this.emit("error", err); this.emit("close"); });
     return this;
   };
-  Readable.prototype.pipe = function (dest, options) {
-    const onData = (chunk) => { if (dest.write(chunk) === false) this.pause(); };
-    const onDrain = () => this.resume();
-    const onEnd = () => { if (!options || options.end !== false) dest.end(); };
-    const onError = (e) => dest.emit("error", e);
-    this.on("data", onData);
-    dest.on("drain", onDrain);
-    this.on("end", onEnd);
-    this.on("error", onError);
-    (this._pipes || (this._pipes = [])).push({ dest, onData, onDrain, onEnd, onError });
-    this.resume();
-    return dest;
-  };
+  // Native (js_stream_pipe in src/node.c): four closures per pipe, one per
+  // event, became four C functions sharing the source and the destination.
+  // The record kept for unpipe has the same shape it always had.
+  Readable.prototype.pipe = __sxnPipe;
   // Node's readable.unpipe([dest]). finalhandler calls it before draining a
   // request it is about to answer, so it has to exist even on a stream that
   // was never piped anywhere.
@@ -729,7 +647,7 @@
     const self = this;
     return {
       next() {
-        if (self._buf.length > 0) return Promise.resolve({ value: self._buf.shift(), done: false });
+        if (bufferedCount(self) > 0) return Promise.resolve({ value: takeChunk(self), done: false });
         if (self._ended) return Promise.resolve({ value: undefined, done: true });
         return new Promise((resolve, reject) => {
           const onData = (c) => { cleanup(); resolve({ value: c, done: false }); };
@@ -821,14 +739,11 @@
       if (cb) cb(e);
       return false;
     }
-    let sync = true, backpressure = false;
-    this._write(chunk, enc || "utf8", (err) => {
-      if (err) { this.emit("error", err); if (cb) cb(err); return; }
-      if (cb) cb(null);
-      if (backpressure) queueMicrotask(() => this.emit("drain"));
-    });
-    sync = false; void sync;
-    return !backpressure;
+    // Native (sxn_write_done in src/node.c): the callback _write is handed
+    // was a JavaScript closure per chunk. An error still reaches the
+    // stream's 'error' listeners whether or not a callback was passed.
+    this._write(chunk, enc || "utf8", __sxnWriteCallback(this, cb));
+    return true;
   };
   Writable.prototype.cork = function () { this._corked++; };
   Writable.prototype.uncork = function () { if (this._corked) this._corked--; };
@@ -980,44 +895,37 @@
     Readable.call(this, {});
     this.method = raw.method || "GET";
     this.url = raw.url || "/";
-    this.headers = {};
-    for (const k of Object.keys(raw.headers || {}))
-      this.headers[k.toLowerCase()] = raw.headers[k];
+    // Native (js_http_headers in src/node.c): lowercase every name and
+    // flatten into rawHeaders in one pass, once per request.
+    const named = __sxnHttpHeaders(raw.headers);
+    this.headers = named.headers;
     this.httpVersion = "1.1";
-    this.rawHeaders = [];
-    for (const k of Object.keys(this.headers)) this.rawHeaders.push(k, this.headers[k]);
+    this.rawHeaders = named.rawHeaders;
     // on-finished reads socket.readable and `complete` to decide whether a
     // request is spent; body-parser skips parsing when it says yes, so both
     // have to describe a request whose body has not been read yet. The socket
     // is a real emitter because on-finished subscribes to its 'error' and
     // 'close', and a plain object had no on() for it to call.
-    this.socket = Object.assign(new EE(), {
-      remoteAddress: "127.0.0.1", remotePort: 0, localAddress: "127.0.0.1",
-      encrypted: false, readable: true, writable: true, destroyed: false,
-      setTimeout() { return this; }, setNoDelay() { return this; },
-      setKeepAlive() { return this; },
-      destroy() { this.destroyed = true; this.readable = this.writable = false;
-                  this.emit("close"); return this; },
-      end() { return this.destroy(); },
-    });
+    // Native (js_http_socket in src/node.c): the shape is the same every
+    // request, so the prototype is built once rather than eleven properties
+    // being copied onto a fresh emitter each time.
+    this.socket = __sxnHttpSocket();
     this.connection = this.socket;
     this.complete = false;
-    this.once("end", () => { this.complete = true; });
+    // Native, and shared: this was an arrow function per request.
+    this.once("end", __sxnHttpComplete);
     // The body is already off the wire, but it must not be pushed before the
     // consumer attaches: body-parser adds its 'data' listener after the
     // handler returns, and an eagerly-ended stream would hand it nothing.
     // Pushing from _read defers until something actually reads.
-    let sent = false;
-    const body = raw.body;
-    this._read = () => {
-      if (sent) return;
-      sent = true;
-      if (body !== undefined && body !== null && body !== "") this.push(body);
-      this.push(null);
-    };
+    this._rawBody = raw.body;
+    this._bodySent = false;
   }
   IncomingMessage.prototype = Object.create(Readable.prototype);
   IncomingMessage.prototype.constructor = IncomingMessage;
+  // Native (js_http_read_body in src/node.c), and on the prototype rather
+  // than a closure built per request.
+  IncomingMessage.prototype._read = __sxnHttpReadBody;
 
   function ServerResponse(settle) {
     Writable.call(this, {});
@@ -1031,17 +939,14 @@
   }
   ServerResponse.prototype = Object.create(Writable.prototype);
   ServerResponse.prototype.constructor = ServerResponse;
-  ServerResponse.prototype.setHeader = function (name, value) {
-    this._headers[String(name).toLowerCase()] = value;
-    return this;
-  };
-  ServerResponse.prototype.getHeader = function (name) { return this._headers[String(name).toLowerCase()]; };
-  ServerResponse.prototype.getHeaders = function () { return Object.assign({}, this._headers); };
-  ServerResponse.prototype.getHeaderNames = function () { return Object.keys(this._headers); };
-  ServerResponse.prototype.hasHeader = function (name) {
-    return Object.prototype.hasOwnProperty.call(this._headers, String(name).toLowerCase());
-  };
-  ServerResponse.prototype.removeHeader = function (name) { delete this._headers[String(name).toLowerCase()]; };
+  // Native (js_header_op in src/node.c): each of these lowercases the name
+  // first, which is a scan over a short string rather than a builtin call.
+  ServerResponse.prototype.setHeader = __sxnSetHeader;
+  ServerResponse.prototype.getHeader = __sxnGetHeader;
+  ServerResponse.prototype.getHeaders = __sxnGetHeaders;
+  ServerResponse.prototype.getHeaderNames = __sxnGetHeaderNames;
+  ServerResponse.prototype.hasHeader = __sxnHasHeader;
+  ServerResponse.prototype.removeHeader = __sxnRemoveHeader;
   ServerResponse.prototype.writeHead = function (status, reasonOrHeaders, maybeHeaders) {
     this.statusCode = status;
     let headers = maybeHeaders;
@@ -1065,19 +970,20 @@
     if (chunk !== undefined && chunk !== null) this._chunks.push(chunk);
     this.finished = true;
     this.headersSent = true;
-    // Concatenate once: text chunks join, binary chunks merge into one array.
-    let body;
-    const anyBinary = this._chunks.some((c) => c instanceof Uint8Array || c instanceof ArrayBuffer);
-    if (anyBinary) {
-      const parts = this._chunks.map((c) =>
+    // Concatenate once. Native (js_join_chunks in src/node.c) answers the
+    // cases every real response is -- nothing written, one string, all bytes
+    // -- and hands back undefined for a mix, where joining strings is the
+    // engine's own job.
+    let body = __sxnJoinChunks(this._chunks);
+    if (body === undefined) {
+      const anyBinary = this._chunks.some((c) => c instanceof Uint8Array || c instanceof ArrayBuffer);
+      if (!anyBinary) body = this._chunks.map((c) => String(c)).join("");
+      else {
+      body = __sxnConcatBytes(this._chunks.map((c) =>
         c instanceof Uint8Array ? c
         : c instanceof ArrayBuffer ? new Uint8Array(c)
-        : new TextEncoder().encode(String(c)));
-      let total = 0; for (const p of parts) total += p.length;
-      body = new Uint8Array(total);
-      let at = 0; for (const p of parts) { body.set(p, at); at += p.length; }
-    } else {
-      body = this._chunks.map((c) => String(c)).join("");
+        : new TextEncoder().encode(String(c))));
+      }
     }
     this._settle({ statusCode: this.statusCode, headers: this._headers, body });
     if (cb) queueMicrotask(cb);
@@ -1173,45 +1079,13 @@
   // Address validation is what frameworks import this for -- Express uses
   // net.isIP when parsing X-Forwarded-For. Real sockets are not implemented,
   // and say so rather than pretending to connect.
-  function isIPv4(s) {
-    if (typeof s !== "string") return false;
-    const parts = s.split(".");
-    if (parts.length !== 4) return false;
-    return parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255 &&
-                              (p === "0" || p[0] !== "0"));
-  }
-  function isIPv6(s) {
-    if (typeof s !== "string" || s.indexOf(":") < 0) return false;
-    // A zone index (fe80::1%eth0) names an interface, not part of the
-    // address; Node accepts it and so does this.
-    const pct = s.indexOf("%");
-    if (pct >= 0) s = s.slice(0, pct);
-    // At most one "::", and every group is 1-4 hex digits. A trailing IPv4
-    // form is allowed, as in ::ffff:127.0.0.1.
-    const dbl = s.split("::");
-    if (dbl.length > 2) return false;
-    let tail = s;
-    let v4extra = 0;
-    const lastColon = s.lastIndexOf(":");
-    const maybeV4 = s.slice(lastColon + 1);
-    if (maybeV4.indexOf(".") >= 0) {
-      if (!isIPv4(maybeV4)) return false;
-      tail = s.slice(0, lastColon);
-      v4extra = 2;                       // an embedded IPv4 fills two groups
-    }
-    const groups = tail.split(":").filter((g, i, a) => !(g === "" && i > 0 && i < a.length - 1) || true);
-    let count = 0;
-    for (const g of tail.split(":")) {
-      if (g === "") continue;
-      if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return false;
-      count++;
-    }
-    void groups;
-    const total = count + v4extra;
-    return dbl.length === 2 ? total <= 8 : total === 8;
-  }
+  // Native (js_net_is_ip in src/node.c): the system's own address parser,
+  // rather than two regexps and a split per call.
+  const isIPv4 = (s) => __sxnIsIP(s) === 4;
+  const isIPv6 = (s) => __sxnIsIP(s) === 6;
+
   const net = {
-    isIP: (s) => (isIPv4(s) ? 4 : isIPv6(s) ? 6 : 0),
+    isIP: __sxnIsIP,
     isIPv4, isIPv6,
     Socket: function Socket() { throw new Error("net.Socket is not implemented"); },
     Server: function Server() { throw new Error("net.Server is not implemented; use node:http"); },
@@ -1226,36 +1100,29 @@
   // and a constant-time compare. Digests come from the same OpenSSL binding
   // WebCrypto uses; HMAC is the standard construction over it, which needs no
   // second binding and is exactly what the RFC specifies.
-  const HASH_BLOCK = { md5: 64, sha1: 64, sha224: 64, sha256: 64, sha384: 128, sha512: 128 };
   const cryptoToBytes = (d, enc) => {
     if (typeof d === "string") {
-      if (enc === "hex") {
-        const out = new Uint8Array(d.length >> 1);
-        for (let i = 0; i < out.length; i++) out[i] = parseInt(d.substr(i * 2, 2), 16);
-        return out;
-      }
-      if (enc === "base64") return Uint8Array.from(atob(d), (c) => c.charCodeAt(0));
+      // Buffer's readers are the native ones; this used to parse hex a byte
+      // at a time with parseInt and read base64 through atob.
+      if (enc && enc !== "utf8" && enc !== "utf-8") return bufferBytesFromString(d, enc);
       return new TextEncoder().encode(d);
     }
     if (d instanceof ArrayBuffer) return new Uint8Array(d);
     if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
     throw new TypeError("expected a string, Buffer or TypedArray");
   };
+  // Uint8Array's own toHex/toBase64 are native; building the hex by hand cost
+  // a string per byte, an array and a join -- which was most of the time a
+  // digest took once the digest itself was C.
   const encodeDigest = (bytes, encoding) => {
     if (!encoding || encoding === "buffer")
       return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    if (encoding === "hex")
-      return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-    if (encoding === "base64")
-      return btoa(String.fromCharCode(...bytes));
+    if (encoding === "hex") return bytes.toHex();
+    if (encoding === "base64") return bytes.toBase64();
+    if (encoding === "base64url") return bytes.toBase64({ alphabet: "base64url", omitPadding: true });
     throw new TypeError("unsupported digest encoding: " + encoding);
   };
-  const concatBytes = (parts) => {
-    let total = 0; for (const p of parts) total += p.length;
-    const out = new Uint8Array(total);
-    let at = 0; for (const p of parts) { out.set(p, at); at += p.length; }
-    return out;
-  };
+  const concatBytes = __sxnConcatBytes;
 
   function Hash(algorithm) {
     this._algo = String(algorithm).toLowerCase();
@@ -1266,7 +1133,8 @@
     return this;
   };
   Hash.prototype.digest = function (encoding) {
-    return encodeDigest(__sxnDigest(this._algo, concatBytes(this._parts)), encoding);
+    const data = this._parts.length === 1 ? this._parts[0] : concatBytes(this._parts);
+    return encodeDigest(__sxnDigest(this._algo, data), encoding);
   };
   Hash.prototype.copy = function () {
     const h = new Hash(this._algo);
@@ -1274,26 +1142,21 @@
     return h;
   };
 
+  // Native (sxn_hmac in src/network.c): OpenSSL's own HMAC, rather than two
+  // padded key buffers and three digest calls built here.
   function Hmac(algorithm, key) {
-    const algo = String(algorithm).toLowerCase();
-    const block = HASH_BLOCK[algo.replace(/-/g, "")] || 64;
-    let k = cryptoToBytes(key);
-    if (k.length > block) k = __sxnDigest(algo, k);
-    const padded = new Uint8Array(block);
-    padded.set(k);
-    const ipad = new Uint8Array(block), opad = new Uint8Array(block);
-    for (let i = 0; i < block; i++) { ipad[i] = padded[i] ^ 0x36; opad[i] = padded[i] ^ 0x5c; }
-    this._algo = algo;
-    this._opad = opad;
-    this._parts = [ipad];
+    this._algo = String(algorithm).toLowerCase();
+    this._key = cryptoToBytes(key);
+    this._parts = [];
   }
   Hmac.prototype.update = function (data, enc) {
     this._parts.push(cryptoToBytes(data, enc));
     return this;
   };
   Hmac.prototype.digest = function (encoding) {
-    const inner = __sxnDigest(this._algo, concatBytes(this._parts));
-    return encodeDigest(__sxnDigest(this._algo, concatBytes([this._opad, inner])), encoding);
+    // One update is the usual case, and then there is nothing to join.
+    const data = this._parts.length === 1 ? this._parts[0] : concatBytes(this._parts);
+    return encodeDigest(__sxnHmac(this._algo, this._key, data), encoding);
   };
 
   const nodeCrypto = {
@@ -1315,13 +1178,9 @@
       return min + (v % range);
     },
     // Compares in time independent of where the first difference is.
-    timingSafeEqual(a, b) {
-      const x = cryptoToBytes(a), y = cryptoToBytes(b);
-      if (x.length !== y.length) throw new RangeError("input length mismatch");
-      let diff = 0;
-      for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
-      return diff === 0;
-    },
+    // Native: a comparison that takes the same time either way is not
+    // something a JavaScript loop can promise.
+    timingSafeEqual: (a, b) => __sxnTimingSafeEqual(cryptoToBytes(a), cryptoToBytes(b)),
     getHashes: () => ["md5", "sha1", "sha224", "sha256", "sha384", "sha512"],
     constants: {},
     webcrypto: globalThis.crypto,
@@ -1402,10 +1261,7 @@
         transform(chunk, enc, cb) { parts.push(toBytes(chunk)); cb(); },
         flush(cb) {
           try {
-            let total = 0; for (const p of parts) total += p.length;
-            const joined = new Uint8Array(total);
-            let at = 0; for (const p of parts) { joined.set(p, at); at += p.length; }
-            cb(null, syncFn(joined, options));
+            cb(null, syncFn(__sxnConcatBytes(parts), options));
           } catch (e) { cb(e); }
         },
       }));
@@ -1437,15 +1293,24 @@
   // across a chunk boundary -- which is the entire reason it exists.
   function StringDecoder(encoding) {
     this.encoding = (encoding || "utf8").toLowerCase();
-    this._dec = new TextDecoder(this.encoding === "utf8" ? "utf-8" : this.encoding);
+    this._tail = null;
+    // utf-8 is native (js_decode_chunk in src/node.c); the other encodings
+    // keep the TextDecoder, which is where they came from.
+    this._dec = (this.encoding === "utf8" || this.encoding === "utf-8")
+      ? null : new TextDecoder(this.encoding);
   }
   StringDecoder.prototype.write = function (buf) {
     if (typeof buf === "string") return buf;
-    return this._dec.decode(buf, { stream: true });
+    if (this._dec) return this._dec.decode(buf, { stream: true });
+    return __sxnDecodeChunk(this, buf);
   };
   StringDecoder.prototype.end = function (buf) {
     let out = buf ? this.write(buf) : "";
-    out += this._dec.decode();
+    if (this._dec) return out + this._dec.decode();
+    // Anything still held back was never going to complete. It is the start
+    // of one character, however many bytes of it arrived, so Node emits one
+    // replacement character for it.
+    if (this._tail) { out += "\ufffd"; this._tail = null; }
     return out;
   };
   globalThis.__sxnStringDecoder = { StringDecoder };
@@ -1496,151 +1361,50 @@
   const moduleModule = Object.assign(Module, {
     Module,
     createRequire: (from) => __sxnMakeRequire(String(from)),
-    builtinModules: ["assert","buffer","events","fs","http","os","path","process",
-                     "querystring","stream","string_decoder","timers","tty","url","util"],
-    isBuiltin: (n) => moduleModule.builtinModules.includes(String(n).replace(/^node:/, "")),
+    // Native, and read off the table require() itself uses (js_builtin_names
+    // in src/node.c): the list here used to be written by hand and had fallen
+    // short of several modules that do resolve.
+    builtinModules: __sxnBuiltinNames(),
+    isBuiltin: __sxnIsBuiltin,
   });
   globalThis.__sxnModule = moduleModule;
 
   // CommonJS reaches the builtins through require(), which is synchronous, so
-  // it cannot go through import(). Every builtin is already a plain object on
-  // a global; this maps a specifier to it, with or without the node: prefix.
-  globalThis.__sxnBuiltinRequire = function (specifier) {
-    const name = String(specifier).replace(/^node:/, "");
-    const table = {
-      buffer: { Buffer, default: Buffer },
-      events: globalThis.__sxnEventEmitter,
-      path: globalThis.__sxnPath,
-      process: globalThis.process,
-      fs: globalThis.__sxnFs,
-      "fs/promises": globalThis.__sxnFsPromises,
-      util: globalThis.__sxnUtil,
-      os: globalThis.__sxnOs,
-      url: globalThis.__sxnUrl,
-      querystring: globalThis.__sxnQuerystring,
-      assert: globalThis.__sxnAssert,
-      "assert/strict": globalThis.__sxnAssert,
-      stream: globalThis.__sxnStream,
-      "stream/promises": globalThis.__sxnStream && globalThis.__sxnStream.promises,
-      http: globalThis.__sxnHttp,
-      tty: globalThis.__sxnTty,
-      string_decoder: globalThis.__sxnStringDecoder,
-      timers: globalThis.__sxnTimers,
-      "timers/promises": globalThis.__sxnTimers && globalThis.__sxnTimers.promises,
-      perf_hooks: globalThis.__sxnPerfHooks,
-      module: globalThis.__sxnModule,
-      zlib: globalThis.__sxnZlib,
-      crypto: globalThis.__sxnCrypto,
-      net: globalThis.__sxnNet,
-    };
-    const m = table[name];
-    if (m === undefined) {
-      const e = new Error("Cannot find module '" + specifier + "'");
-      e.code = "MODULE_NOT_FOUND";
-      throw e;
-    }
-    // events exports the constructor itself, and Node lets you reach the
-    // named helpers off it either way.
-    return m;
-  };
-  globalThis.__sxnIsBuiltin = function (specifier) {
-    try { globalThis.__sxnBuiltinRequire(specifier); return true; } catch { return false; }
-  };
+  // it cannot go through import(). The mapping from specifier to builtin is
+  // native (sxn_builtin_lookup in src/node.c), where the table is static
+  // rather than an object rebuilt on every require() call.
 
   // ---------------- node:util ----------------
   // The parts packages actually import: promisify, callbackify, inherits,
   // format, deprecate, and the types guards. inspect is a readable
   // approximation, not Node's exact formatter.
-  function inspect(v, opts, depth) {
-    opts = opts || {};
-    const max = opts.depth === undefined ? 2 : opts.depth;
-    const seen = opts._seen || new Set();
-    depth = depth || 0;
-    const t = typeof v;
-    if (v === null) return "null";
-    if (t === "string") return depth === 0 && !opts.quoteStrings ? v : JSON.stringify(v);
-    if (t === "number" || t === "boolean" || t === "undefined") return String(v);
-    if (t === "bigint") return String(v) + "n";
-    if (t === "symbol") return v.toString();
-    if (t === "function") return "[Function: " + (v.name || "anonymous") + "]";
-    if (v instanceof Error) return v.stack || (v.name + ": " + v.message);
-    if (v instanceof Date) return v.toISOString();
-    if (v instanceof RegExp) return String(v);
-    if (seen.has(v)) return "[Circular *1]";
-    if (depth > max) return Array.isArray(v) ? "[Array]" : "[Object]";
-    seen.add(v);
-    const sub = Object.assign({}, opts, { _seen: seen, quoteStrings: true });
-    let out;
-    if (Array.isArray(v)) {
-      out = "[ " + v.map((e) => inspect(e, sub, depth + 1)).join(", ") + " ]";
-      if (v.length === 0) out = "[]";
-    } else if (v instanceof Map) {
-      out = "Map(" + v.size + ") {" + (v.size ? " " + [...v].map(([k, val]) =>
-        inspect(k, sub, depth + 1) + " => " + inspect(val, sub, depth + 1)).join(", ") + " " : "") + "}";
-    } else if (v instanceof Set) {
-      out = "Set(" + v.size + ") {" + (v.size ? " " + [...v].map((e) =>
-        inspect(e, sub, depth + 1)).join(", ") + " " : "") + "}";
-    } else if (ArrayBuffer.isView(v)) {
-      out = v.constructor.name + "(" + v.length + ") [ " + Array.from(v).join(", ") + " ]";
-    } else {
-      const keys = Object.keys(v);
-      out = keys.length === 0 ? "{}" : "{ " + keys.map((k) =>
-        (/^[A-Za-z_$][\w$]*$/.test(k) ? k : JSON.stringify(k)) + ": " +
-        inspect(v[k], sub, depth + 1)).join(", ") + " }";
-    }
-    seen.delete(v);
-    return out;
-  }
+  // Native (js_inspect in src/node.c). This was a recursive walk that built
+  // an options object per level, a mapped array per container and a joined
+  // string per level; the C one walks into a single buffer. It also answers
+  // "Invalid Date" where this used to throw out of toISOString.
+  const inspect = __sxnInspect;
 
-  function format(...args) {
-    if (typeof args[0] !== "string") return args.map((a) => inspect(a)).join(" ");
-    // With nothing to substitute, Node returns the string untouched -- even
-    // "%%" stays as written.
-    if (args.length === 1) return args[0];
-    let i = 1;
-    let out = args[0].replace(/%[sdifjoOc%]/g, (m) => {
-      if (m === "%%") return "%";
-      if (i >= args.length) return m;
-      const a = args[i++];
-      switch (m) {
-        case "%s": return typeof a === "string" ? a : inspect(a);
-        case "%d": case "%f": return typeof a === "bigint" ? a + "n" : Number(a).toString();
-        case "%i": return typeof a === "bigint" ? a + "n" : parseInt(a, 10).toString();
-        case "%j": try { return JSON.stringify(a); } catch { return "[Circular]"; }
-        case "%o": case "%O": return inspect(a, { depth: 4 });
-        case "%c": return "";
-        default: return m;
-      }
-    });
-    for (; i < args.length; i++) out += " " + (typeof args[i] === "string" ? args[i] : inspect(args[i]));
-    return out;
-  }
+  // Native (js_util_format in src/node.c): the scan and the substitution are
+  // string work. Only the cases that need inspect -- %s of something that is
+  // not a string, and %o/%O -- come back into JavaScript, which is why
+  // inspect is handed over as the first argument.
+  const format = (...args) => __sxnFormat(inspect, ...args);
 
   const util = {
     inspect,
     format,
     // Node keeps the custom-inspect symbol here.
-    promisify(fn) {
-      if (typeof fn !== "function") throw new TypeError("promisify expects a function");
-      const wrapped = function (...args) {
-        return new Promise((resolve, reject) => {
-          fn.call(this, ...args, (err, ...values) =>
-            err ? reject(err) : resolve(values.length > 1 ? values : values[0]));
-        });
-      };
-      Object.defineProperty(wrapped, "name", { value: fn.name, configurable: true });
-      return wrapped;
-    },
-    callbackify(fn) {
-      return function (...args) {
-        const cb = args.pop();
-        Promise.resolve(fn.apply(this, args)).then((v) => cb(null, v), (e) => cb(e || new Error("rejected")));
-      };
-    },
-    inherits(ctor, superCtor) {
-      Object.defineProperty(ctor, "super_", { value: superCtor, writable: true, configurable: true });
-      Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
-    },
+    // Native (js_promisify in src/node.c): this spread the arguments, built
+    // a Promise with an executor closure and a callback closure inside it,
+    // per call. It also resolved with an array when a callback reported
+    // more than one value; Node keeps the first and drops the rest.
+    promisify: __sxnPromisify,
+    // Native (js_callbackify in src/node.c): this built two closures per
+    // call for the two halves of the promise, 1.32 microseconds to 0.84.
+    callbackify: __sxnCallbackify,
+    // Native (js_inherits in src/node.c): two property operations, 0.250
+    // microseconds to 0.060.
+    inherits: __sxnInherits,
     deprecate(fn, msg) {
       let warned = false;
       return function (...args) {
@@ -1668,38 +1432,8 @@
   globalThis.__sxnUtil = util;
 
   // Structural equality, shared by util.isDeepStrictEqual and node:assert.
-  function deepEqual(a, b, strict) {
-    if (strict ? Object.is(a, b) : a == b) return true;
-    if (a === null || b === null || typeof a !== "object" || typeof b !== "object") {
-      return strict ? Object.is(a, b) : a == b;
-    }
-    if (Object.getPrototypeOf(a) !== Object.getPrototypeOf(b)) return false;
-    if (a instanceof Date) return a.getTime() === b.getTime();
-    if (a instanceof RegExp) return String(a) === String(b);
-    if (Array.isArray(a) !== Array.isArray(b)) return false;
-    if (ArrayBuffer.isView(a)) {
-      if (a.length !== b.length) return false;
-      for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-      return true;
-    }
-    if (a instanceof Map) {
-      if (a.size !== b.size) return false;
-      for (const [k, v] of a) { if (!b.has(k) || !deepEqual(v, b.get(k), strict)) return false; }
-      return true;
-    }
-    if (a instanceof Set) {
-      if (a.size !== b.size) return false;
-      for (const v of a) if (!b.has(v)) return false;
-      return true;
-    }
-    const ka = Object.keys(a), kb = Object.keys(b);
-    if (ka.length !== kb.length) return false;
-    for (const k of ka) {
-      if (!Object.prototype.hasOwnProperty.call(b, k)) return false;
-      if (!deepEqual(a[k], b[k], strict)) return false;
-    }
-    return true;
-  }
+  // Native (sxn_deep_equal in src/node.c).
+  const deepEqual = (a, b, strict) => strict ? __sxnDeepEqual(a, b) : __sxnLooseDeepEqual(a, b);
 
   // ---------------- node:assert ----------------
   function AssertionError(opts) {
@@ -1733,69 +1467,817 @@
   globalThis.__sxnAssert = assert;
 
   // ---------------- node:os ----------------
+  // Answered by libuv. These used to be guesses -- "localhost" for the
+  // hostname, 0 for the memory sizes, an empty list of CPUs -- which is worse
+  // than not answering at all, because nothing can tell a stub from the
+  // truth.
+  const uname = () => __sxnOsUname();
   const os = {
     EOL: "\n",
     platform: () => process.platform,
     arch: () => process.arch,
-    type: () => (process.platform === "darwin" ? "Darwin" : process.platform === "win32" ? "Windows_NT" : "Linux"),
-    release: () => "",
-    hostname: () => "localhost",
-    tmpdir: () => (process.env && (process.env.TMPDIR || process.env.TMP)) || "/tmp",
-    homedir: () => (process.env && process.env.HOME) || "/",
+    type: () => uname().sysname || (process.platform === "darwin" ? "Darwin" : process.platform === "win32" ? "Windows_NT" : "Linux"),
+    release: () => uname().release || "",
+    version: () => uname().version || "",
+    machine: () => uname().machine || process.arch,
+    hostname: () => __sxnOsHostname(),
+    tmpdir: () => __sxnOsTmpdir(),
+    homedir: () => __sxnOsHomedir(),
     endianness: () => "LE",
-    cpus: () => [],
-    totalmem: () => 0,
-    freemem: () => 0,
-    uptime: () => Math.floor(performance.now() / 1000),
+    cpus: () => __sxnOsCpus(),
+    availableParallelism: () => __sxnOsNumbers().parallelism,
+    networkInterfaces: () => __sxnOsInterfaces(),
+    totalmem: () => __sxnOsNumbers().totalmem,
+    freemem: () => __sxnOsNumbers().freemem,
+    loadavg: () => __sxnOsNumbers().loadavg,
+    uptime: () => Math.floor(__sxnOsNumbers().uptime),
+    userInfo: () => ({
+      username: (process.env && (process.env.USER || process.env.USERNAME)) || "",
+      homedir: __sxnOsHomedir(),
+      shell: (process.env && process.env.SHELL) || null,
+      uid: -1,
+      gid: -1,
+    }),
     devNull: "/dev/null",
+    constants: { signals: {}, errno: {}, priority: {} },
   };
   globalThis.__sxnOs = os;
 
   // ---------------- node:querystring ----------------
+  // Native (js_qs_* in src/node.c): pure string work with no state, which
+  // went through split(), a regexp for "+" and decodeURIComponent per part.
   const querystring = {
-    parse(str, sep, eq) {
-      const out = Object.create(null);
-      if (typeof str !== "string" || str.length === 0) return out;
-      for (const part of str.split(sep || "&")) {
-        if (!part) continue;
-        const i = part.indexOf(eq || "=");
-        const k = decodeURIComponent((i < 0 ? part : part.slice(0, i)).replace(/\+/g, " "));
-        const v = i < 0 ? "" : decodeURIComponent(part.slice(i + 1).replace(/\+/g, " "));
-        if (k in out) { if (Array.isArray(out[k])) out[k].push(v); else out[k] = [out[k], v]; }
-        else out[k] = v;
-      }
-      return out;
-    },
-    stringify(obj, sep, eq) {
-      if (!obj || typeof obj !== "object") return "";
-      const parts = [];
-      for (const k of Object.keys(obj)) {
-        const v = obj[k];
-        const ek = encodeURIComponent(k);
-        if (Array.isArray(v)) for (const one of v) parts.push(ek + (eq || "=") + encodeURIComponent(one));
-        else parts.push(ek + (eq || "=") + encodeURIComponent(v === undefined || v === null ? "" : v));
-      }
-      return parts.join(sep || "&");
-    },
-    escape: encodeURIComponent,
-    unescape: decodeURIComponent,
+    parse: __sxnQsParse,
+    stringify: __sxnQsStringify,
+    escape: __sxnQsEscape,
+    unescape: __sxnQsUnescape,
+    decode: __sxnQsParse,
+    encode: __sxnQsStringify,
   };
   globalThis.__sxnQuerystring = querystring;
+  delete globalThis.__sxnQsParse;
+  delete globalThis.__sxnQsStringify;
+  delete globalThis.__sxnQsEscape;
+  delete globalThis.__sxnQsUnescape;
 
   // ---------------- node:url ----------------
   const url = {
     URL: globalThis.URL,
     URLSearchParams: globalThis.URLSearchParams,
-    fileURLToPath(u) {
-      const s = typeof u === "string" ? u : String(u);
-      if (!s.startsWith("file://")) throw new TypeError("must be a file: URL");
-      return decodeURIComponent(s.slice(7).replace(/^localhost/, "")) || "/";
-    },
-    pathToFileURL(p) {
-      return new URL("file://" + encodeURI(String(p)).replace(/[?#]/g, encodeURIComponent));
-    },
+    // Native (js_file_url_to_path in src/node.c): a scheme check, a host
+    // check and a percent-decode, none of which needs a regexp.
+    fileURLToPath: (u) => __sxnFileUrlToPath(typeof u === "string" ? u : String(u)),
+    // The text is built native (js_path_to_file_url); the URL object it is
+    // handed to is the engine's own.
+    pathToFileURL: (p) => new URL(__sxnPathToFileUrl(String(p))),
     format: (u) => String(u),
     parse: (s) => { try { return new URL(s); } catch { return null; } },
   };
   globalThis.__sxnUrl = url;
+  // ---------------- the builtins past the first twenty ----------------
+  // These are built on first use rather than at startup. Every program pays
+  // for what is above this line; almost none of them require node:dgram, and
+  // constructing all of this eagerly cost about 4% of a cold start.
+  const laterBuiltins = () => {
+    // ---------------- node:child_process ----------------
+    // One native primitive (js_spawn_sync in src/network.c) runs a child to
+    // completion on a loop of its own. The synchronous calls are that call; the
+    // asynchronous ones are that call plus the events Node emits afterwards, so
+    // a child does not overlap with the rest of the program the way it does in
+    // Node. Anything that streams a long-running child's output as it arrives
+    // will see it all at once, at the end.
+    function spawnArgs(command, args, options) {
+      if (!Array.isArray(args)) { options = args; args = []; }
+      return [args || [], options || {}];
+    }
+    function shellRun(command, options) {
+      const shell = (options && typeof options.shell === "string" && options.shell) ||
+        (process.platform === "win32" ? "cmd.exe" : "/bin/sh");
+      const flag = process.platform === "win32" ? "/d/s/c" : "-c";
+      return __sxnSpawnSync(shell, [flag, command], options || {});
+    }
+    function decodeOut(raw, options) {
+      const encoding = options && options.encoding;
+      if (encoding === "buffer" || encoding === null) return Buffer.from(raw);
+      return new TextDecoder().decode(raw);
+    }
+    function spawnError(result, command) {
+      const e = new Error("spawnSync " + command + " " + (result.errno || "failed"));
+      e.code = result.errno || "UNKNOWN";
+      e.syscall = "spawnSync " + command;
+      e.path = command;
+      return e;
+    }
+    function spawnSync(command, args, options) {
+      const [list, opts] = spawnArgs(command, args, options);
+      const raw = opts.shell ? shellRun([command].concat(list).join(" "), opts)
+                             : __sxnSpawnSync(command, list, opts);
+      const out = {
+        pid: raw.pid || 0,
+        status: raw.status === undefined ? null : raw.status,
+        signal: raw.signal === undefined ? null : raw.signal,
+        stdout: decodeOut(raw.stdout, opts),
+        stderr: decodeOut(raw.stderr, opts),
+        error: raw.error ? spawnError(raw, command) : undefined,
+      };
+      out.output = [null, out.stdout, out.stderr];
+      return out;
+    }
+    function checkedSync(result, command) {
+      if (result.error) throw result.error;
+      if (result.status !== 0) {
+        const e = new Error("Command failed: " + command + "\n" +
+                            (typeof result.stderr === "string" ? result.stderr : ""));
+        e.status = result.status;
+        e.signal = result.signal;
+        e.stdout = result.stdout;
+        e.stderr = result.stderr;
+        throw e;
+      }
+      return result.stdout;
+    }
+    // The asynchronous forms: run the child, then deliver its output and its
+    // exit through the same events Node uses, one tick later.
+    function ChildProcess(result) {
+      EE.call(this);
+      this.pid = result.pid || 0;
+      this.exitCode = result.status === undefined ? null : result.status;
+      this.signalCode = result.signal || null;
+      this.killed = false;
+      this.stdin = new Writable({ write(c, e, cb) { cb(); } });
+      this.stdout = new Readable({ read() {} });
+      this.stderr = new Readable({ read() {} });
+    }
+    inheritEE(ChildProcess);
+    ChildProcess.prototype.kill = function () { this.killed = true; return false; };
+    ChildProcess.prototype.unref = function () { return this; };
+    ChildProcess.prototype.ref = function () { return this; };
+    function deliver(child, raw, opts, cb) {
+      process.nextTick(() => {
+        if (raw.error) {
+          child.emit("error", spawnError(raw, "child"));
+          if (cb) cb(spawnError(raw, "child"), decodeOut(raw.stdout, opts), decodeOut(raw.stderr, opts));
+          return;
+        }
+        if (raw.stdout.length) child.stdout.push(Buffer.from(raw.stdout));
+        if (raw.stderr.length) child.stderr.push(Buffer.from(raw.stderr));
+        child.stdout.push(null);
+        child.stderr.push(null);
+        if (cb) {
+          const stdout = decodeOut(raw.stdout, opts), stderr = decodeOut(raw.stderr, opts);
+          let e = null;
+          if (raw.status !== 0) {
+            e = new Error("Command failed");
+            e.code = raw.status;
+          }
+          cb(e, stdout, stderr);
+        }
+        child.emit("exit", raw.status === undefined ? null : raw.status, raw.signal || null);
+        child.emit("close", raw.status === undefined ? null : raw.status, raw.signal || null);
+      });
+      return child;
+    }
+    const childProcess = {
+      spawnSync,
+      execFileSync(file, args, options) {
+        const [list, opts] = spawnArgs(file, args, options);
+        return checkedSync(spawnSync(file, list, opts), file);
+      },
+      execSync(command, options) {
+        const opts = options || {};
+        const raw = shellRun(command, opts);
+        return checkedSync({
+          error: raw.error ? spawnError(raw, command) : undefined,
+          status: raw.status, signal: raw.signal,
+          stdout: decodeOut(raw.stdout, opts), stderr: decodeOut(raw.stderr, opts),
+        }, command);
+      },
+      spawn(command, args, options) {
+        const [list, opts] = spawnArgs(command, args, options);
+        const raw = opts.shell ? shellRun([command].concat(list).join(" "), opts)
+                               : __sxnSpawnSync(command, list, opts);
+        return deliver(new ChildProcess(raw), raw, opts, null);
+      },
+      exec(command, options, cb) {
+        if (typeof options === "function") { cb = options; options = {}; }
+        const opts = options || {};
+        const raw = shellRun(command, opts);
+        return deliver(new ChildProcess(raw), raw, opts, cb);
+      },
+      execFile(file, args, options, cb) {
+        if (typeof args === "function") { cb = args; args = []; options = {}; }
+        else if (typeof options === "function") { cb = options; options = {}; }
+        const opts = options || {};
+        const raw = __sxnSpawnSync(file, args || [], opts);
+        return deliver(new ChildProcess(raw), raw, opts, cb);
+      },
+      fork() { throw new Error("child_process.fork is not supported: a child would need its own runtime"); },
+      ChildProcess,
+    };
+    globalThis.__sxnChildProcess = childProcess;
+
+    // ---------------- node:dns ----------------
+    // uv_getaddrinfo, resolved on this thread (js_dns_lookup in src/network.c).
+    // The callback forms hand the answer back on a later tick, so they compose
+    // like Node's, but the resolution itself blocks. There is no resolver
+    // beyond the system one: the record types libuv cannot answer throw.
+    function dnsLookup(hostname, options, cb) {
+      if (typeof options === "function") { cb = options; options = {}; }
+      const opts = typeof options === "number" ? { family: options } : (options || {});
+      let list, error = null;
+      try { list = __sxnDnsLookup(hostname, opts.family || 0); }
+      catch (e) { error = e; list = []; }
+      process.nextTick(() => {
+        if (error) return cb(error);
+        if (!list.length) {
+          const e = new Error("getaddrinfo ENOTFOUND " + hostname);
+          e.code = "ENOTFOUND";
+          return cb(e);
+        }
+        if (opts.all) return cb(null, list);
+        cb(null, list[0].address, list[0].family);
+      });
+    }
+    function dnsResolve(family) {
+      return function (hostname, cb) {
+        dnsLookup(hostname, { family, all: true }, (e, list) =>
+          e ? cb(e) : cb(null, list.map((a) => a.address)));
+      };
+    }
+    function noResolver(kind) {
+      return function (hostname, cb) {
+        const e = new Error("dns.resolve" + kind + " is not supported: there is no resolver beyond the system one");
+        e.code = "ENOTIMP";
+        if (cb) return process.nextTick(() => cb(e));
+        throw e;
+      };
+    }
+    const dns = {
+      lookup: dnsLookup,
+      resolve4: dnsResolve(4),
+      resolve6: dnsResolve(6),
+      resolve(hostname, type, cb) {
+        if (typeof type === "function") { cb = type; type = "A"; }
+        if (type === "A") return dns.resolve4(hostname, cb);
+        if (type === "AAAA") return dns.resolve6(hostname, cb);
+        return noResolver(type)(hostname, cb);
+      },
+      resolveMx: noResolver("Mx"), resolveTxt: noResolver("Txt"),
+      resolveSrv: noResolver("Srv"), resolveNs: noResolver("Ns"),
+      resolveCname: noResolver("Cname"), reverse: noResolver("Ptr"),
+      getServers: () => [],
+      setServers() { throw new Error("dns.setServers is not supported: resolution goes through the system resolver"); },
+      ADDRCONFIG: 1024, V4MAPPED: 8, ALL: 16,
+    };
+    const promisify1 = (fn) => (...a) => new Promise((res, rej) =>
+      fn(...a, (e, v) => e ? rej(e) : res(v)));
+    dns.promises = {
+      lookup: (hostname, options) => new Promise((res, rej) =>
+        dnsLookup(hostname, options || {}, (e, address, family) =>
+          e ? rej(e) : res(typeof address === "string" ? { address, family } : address))),
+      resolve4: promisify1(dns.resolve4),
+      resolve6: promisify1(dns.resolve6),
+      resolve: promisify1(dns.resolve),
+      getServers: dns.getServers,
+    };
+    dns.Resolver = function Resolver() { return Object.assign(Object.create(null), dns); };
+    globalThis.__sxnDns = dns;
+    globalThis.__sxnDnsPromises = dns.promises;
+
+    // ---------------- node:https ----------------
+    // The same client node:http uses: the request goes out through the same
+    // native fetch, which speaks TLS. Only the default protocol differs.
+    // There is no https server, because Sxn.serve does not terminate TLS.
+    const https = {
+      request(options, cb) {
+        const opts = typeof options === "string" ? { url: options } : Object.assign({}, options);
+        if (!opts.url && !opts.protocol) opts.protocol = "https:";
+        return http.request(opts, cb);
+      },
+      get(options, cb) { const r = https.request(options, cb); r.end(); return r; },
+      Agent: function Agent(options) { this.options = options || {}; },
+      globalAgent: null,
+      createServer() { throw new Error("https.createServer is not supported: this runtime does not terminate TLS"); },
+      Server: function Server() { throw new Error("https.Server is not supported: this runtime does not terminate TLS"); },
+    };
+    https.globalAgent = new https.Agent({});
+    globalThis.__sxnHttps = https;
+
+    // ---------------- node:tls / node:http2 ----------------
+    // Named so that a `require` resolves and a feature check can fail cleanly,
+    // rather than dying on a missing module. TLS is only available as a client,
+    // through fetch and node:https; there is no socket to hand back.
+    const tls = {
+      connect() { throw new Error("tls.connect is not supported: use fetch or node:https"); },
+      createServer() { throw new Error("tls.createServer is not supported: this runtime does not terminate TLS"); },
+      TLSSocket: function TLSSocket() { throw new Error("tls.TLSSocket is not supported"); },
+      Server: function Server() { throw new Error("tls.Server is not supported"); },
+      createSecureContext: (options) => Object.assign({}, options),
+      rootCertificates: [],
+      DEFAULT_MIN_VERSION: "TLSv1.2",
+      DEFAULT_MAX_VERSION: "TLSv1.3",
+    };
+    globalThis.__sxnTls = tls;
+
+    const http2 = {
+      constants: {
+        HTTP2_HEADER_METHOD: ":method", HTTP2_HEADER_PATH: ":path",
+        HTTP2_HEADER_STATUS: ":status", HTTP2_HEADER_AUTHORITY: ":authority",
+        HTTP2_HEADER_SCHEME: ":scheme", HTTP2_HEADER_CONTENT_TYPE: "content-type",
+      },
+      connect() { throw new Error("http2.connect is not supported: the client speaks HTTP/1.1"); },
+      createServer() { throw new Error("http2.createServer is not supported: the server speaks HTTP/1.1"); },
+      createSecureServer() { throw new Error("http2.createSecureServer is not supported: the server speaks HTTP/1.1"); },
+      getDefaultSettings: () => ({}),
+    };
+    globalThis.__sxnHttp2 = http2;
+
+    // ---------------- node:stream/web ----------------
+    // The Web Streams already in the global scope, under the names Node also
+    // publishes them under. Nothing is reimplemented here.
+    globalThis.__sxnStreamWeb = {
+      ReadableStream: globalThis.ReadableStream,
+      ReadableStreamDefaultReader: globalThis.ReadableStreamDefaultReader,
+      ReadableStreamBYOBReader: globalThis.ReadableStreamBYOBReader,
+      ReadableStreamDefaultController: globalThis.ReadableStreamDefaultController,
+      ReadableByteStreamController: globalThis.ReadableByteStreamController,
+      ReadableStreamBYOBRequest: globalThis.ReadableStreamBYOBRequest,
+      WritableStream: globalThis.WritableStream,
+      WritableStreamDefaultWriter: globalThis.WritableStreamDefaultWriter,
+      WritableStreamDefaultController: globalThis.WritableStreamDefaultController,
+      TransformStream: globalThis.TransformStream,
+      TransformStreamDefaultController: globalThis.TransformStreamDefaultController,
+      ByteLengthQueuingStrategy: globalThis.ByteLengthQueuingStrategy,
+      CountQueuingStrategy: globalThis.CountQueuingStrategy,
+      TextEncoderStream: globalThis.TextEncoderStream,
+      TextDecoderStream: globalThis.TextDecoderStream,
+      CompressionStream: globalThis.CompressionStream,
+      DecompressionStream: globalThis.DecompressionStream,
+    };
+
+    // ---------------- node:vm ----------------
+    // The engine has one realm, so a "new context" is a function whose
+    // parameters are the sandbox's keys: the code sees those names, and writes
+    // to them come back out. It is not an isolated global.
+    const vm = {
+      runInThisContext(code, options) {
+        return (0, eval)(String(code));
+      },
+      runInNewContext(code, sandbox, options) {
+        const box = sandbox || {};
+        const keys = Object.keys(box);
+        const fn = new Function(...keys, '"use strict"; return (' + "function(){" + String(code) + "}" + ")()");
+        return fn(...keys.map((k) => box[k]));
+      },
+      runInContext(code, contextifiedObject, options) {
+        return vm.runInNewContext(code, contextifiedObject, options);
+      },
+      createContext: (sandbox) => sandbox || {},
+      isContext: (o) => typeof o === "object" && o !== null,
+      compileFunction(code, params, options) {
+        return new Function(...(params || []), String(code));
+      },
+      Script: function Script(code) {
+        this.code = String(code);
+        this.runInThisContext = () => vm.runInThisContext(this.code);
+        this.runInNewContext = (sandbox) => vm.runInNewContext(this.code, sandbox);
+        this.runInContext = (sandbox) => vm.runInNewContext(this.code, sandbox);
+      },
+    };
+    globalThis.__sxnVm = vm;
+
+    // ---------------- node:v8 ----------------
+    // The numbers come from the engine's own allocator, not V8's, and the names
+    // are Node's. serialize/deserialize are JSON, which covers the plain data
+    // packages put through them and rejects what it cannot carry.
+    const v8 = {
+      getHeapStatistics() {
+        const m = Sxn.memoryUsage();
+        return {
+          total_heap_size: m.mallocSize, used_heap_size: m.memoryUsed,
+          heap_size_limit: m.mallocSize, total_available_size: 0,
+          total_heap_size_executable: 0, total_physical_size: m.mallocSize,
+          malloced_memory: m.mallocSize, peak_malloced_memory: m.mallocSize,
+          does_zap_garbage: 0, number_of_native_contexts: 1, number_of_detached_contexts: 0,
+        };
+      },
+      getHeapSpaceStatistics: () => [],
+      setFlagsFromString() {},
+      serialize(value) { return Buffer.from(JSON.stringify(value), "utf8"); },
+      deserialize(buf) { return JSON.parse(Buffer.from(buf).toString("utf8")); },
+      cachedDataVersionTag: () => 0,
+    };
+    globalThis.__sxnV8 = v8;
+
+    // ---------------- node:worker_threads / node:cluster ----------------
+    // One JS thread, one process. Both modules answer the questions a library
+    // asks before it decides whether it is the main one -- which is most of
+    // what they are used for -- and throw where a second thread is required.
+    const workerThreads = {
+      isMainThread: true,
+      threadId: 0,
+      parentPort: null,
+      workerData: null,
+      resourceLimits: {},
+      SHARE_ENV: Symbol("nodejs.worker_threads.SHARE_ENV"),
+      Worker: function Worker() { throw new Error("worker_threads.Worker is not supported: this runtime has one JS thread"); },
+      MessageChannel: globalThis.MessageChannel,
+      MessagePort: globalThis.MessagePort,
+      BroadcastChannel: function BroadcastChannel() { throw new Error("BroadcastChannel is not supported: this runtime has one JS thread"); },
+      markAsUntransferable() {},
+      moveMessagePortToContext() { throw new Error("moveMessagePortToContext is not supported"); },
+      receiveMessageOnPort: () => undefined,
+      setEnvironmentData() {},
+      getEnvironmentData: () => undefined,
+    };
+    globalThis.__sxnWorkerThreads = workerThreads;
+
+    function Cluster() { EE.call(this); }
+    inheritEE(Cluster);
+    const cluster = new Cluster();
+    cluster.isPrimary = true;
+    cluster.isMaster = true;
+    cluster.isWorker = false;
+    cluster.worker = null;
+    cluster.workers = {};
+    cluster.settings = {};
+    cluster.schedulingPolicy = 2;
+    cluster.setupPrimary = function () {};
+    cluster.setupMaster = function () {};
+    cluster.fork = function () { throw new Error("cluster.fork is not supported: this runtime does not fork"); };
+    cluster.disconnect = function (cb) { if (cb) process.nextTick(cb); };
+    globalThis.__sxnCluster = cluster;
+
+    // ---------------- node:readline ----------------
+    // Lines out of any readable stream, and the promise form of question().
+    // Terminal editing -- history, completion, cursor keys -- is not here:
+    // stdin arrives as plain bytes.
+    function Interface(options) {
+      EE.call(this);
+      const opts = options || {};
+      this.input = opts.input || process.stdin;
+      this.output = opts.output || process.stdout;
+      this.terminal = false;
+      this.closed = false;
+      this._pending = [];
+      this._rest = "";
+      const self = this;
+      if (this.input && typeof this.input.on === "function") {
+        this.input.on("data", (chunk) => self._feed(String(chunk)));
+        this.input.on("end", () => self._end());
+        if (typeof this.input.resume === "function") this.input.resume();
+      }
+    }
+    inheritEE(Interface);
+    Interface.prototype._feed = function (text) {
+      const parts = (this._rest + text).split("\n");
+      this._rest = parts.pop();
+      for (const line of parts) {
+        const clean = line.endsWith("\r") ? line.slice(0, -1) : line;
+        const waiter = this._pending.shift();
+        if (waiter) waiter(clean);
+        else this.emit("line", clean);
+      }
+    };
+    Interface.prototype._end = function () {
+      if (this._rest) { this._feed("\n"); }
+      this.close();
+    };
+    Interface.prototype.question = function (query, cb) {
+      if (this.output && typeof this.output.write === "function") this.output.write(query);
+      this._pending.push(cb);
+    };
+    Interface.prototype.prompt = function () {};
+    Interface.prototype.write = function (text) {
+      if (this.output && typeof this.output.write === "function") this.output.write(text);
+    };
+    Interface.prototype.setPrompt = function () {};
+    Interface.prototype.pause = function () { return this; };
+    Interface.prototype.resume = function () { return this; };
+    Interface.prototype.close = function () {
+      if (this.closed) return;
+      this.closed = true;
+      this.emit("close");
+    };
+    Interface.prototype[Symbol.asyncIterator] = function () {
+      const lines = [];
+      let waiting = null, done = false;
+      this.on("line", (l) => { if (waiting) { const w = waiting; waiting = null; w({ value: l, done: false }); } else lines.push(l); });
+      this.on("close", () => { done = true; if (waiting) { const w = waiting; waiting = null; w({ value: undefined, done: true }); } });
+      return {
+        next() {
+          if (lines.length) return Promise.resolve({ value: lines.shift(), done: false });
+          if (done) return Promise.resolve({ value: undefined, done: true });
+          return new Promise((res) => { waiting = res; });
+        },
+        [Symbol.asyncIterator]() { return this; },
+      };
+    };
+    const readline = {
+      Interface,
+      createInterface: (options, output) =>
+        new Interface(options && options.read !== undefined ? { input: options, output } : options),
+      clearLine: () => true, clearScreenDown: () => true,
+      cursorTo: () => true, moveCursor: () => true,
+      emitKeypressEvents() {},
+      promises: null,
+    };
+    readline.promises = {
+      Interface,
+      createInterface(options, output) {
+        const rl = readline.createInterface(options, output);
+        const ask = rl.question.bind(rl);
+        rl.question = (query) => new Promise((res) => ask(query, res));
+        return rl;
+      },
+    };
+    globalThis.__sxnReadline = readline;
+    globalThis.__sxnReadlinePromises = readline.promises;
+
+    // ---------------- node:async_hooks ----------------
+    // AsyncLocalStorage is real and is the reason this module is here: a store
+    // entered for a synchronous run, and kept across an await by binding it to
+    // the promise chain the callback returns. The hook API around it reports
+    // one execution context, because that is what a single loop with no async
+    // tracking can honestly say.
+    function AsyncLocalStorage() { this._store = undefined; this._entered = false; }
+    AsyncLocalStorage.prototype.run = function (store, callback, ...args) {
+      const previous = this._store, wasIn = this._entered;
+      this._store = store;
+      this._entered = true;
+      let async = false;
+      const restore = () => { this._store = previous; this._entered = wasIn; };
+      try {
+        const out = callback(...args);
+        // A callback that returns a promise keeps the store until the promise
+        // settles. Anything else that runs while it is awaiting sees the store
+        // too, which is where this parts company with Node: there is no async
+        // context tracking underneath, only the promise chain handed back.
+        if (out && typeof out.then === "function") {
+          async = true;
+          return out.then((v) => { restore(); return v; }, (e) => { restore(); throw e; });
+        }
+        return out;
+      } finally {
+        if (!async) restore();
+      }
+    };
+    AsyncLocalStorage.prototype.exit = function (callback, ...args) {
+      return this.run(undefined, callback, ...args);
+    };
+    AsyncLocalStorage.prototype.getStore = function () { return this._entered ? this._store : undefined; };
+    AsyncLocalStorage.prototype.enterWith = function (store) { this._store = store; this._entered = true; };
+    AsyncLocalStorage.prototype.disable = function () { this._store = undefined; this._entered = false; };
+    function AsyncResource(type) { this.type = type; }
+    AsyncResource.prototype.runInAsyncScope = function (fn, thisArg, ...args) { return fn.apply(thisArg, args); };
+    AsyncResource.prototype.emitDestroy = function () { return this; };
+    AsyncResource.prototype.asyncId = function () { return 1; };
+    AsyncResource.prototype.triggerAsyncId = function () { return 0; };
+    AsyncResource.bind = (fn) => fn;
+    const asyncHooks = {
+      AsyncLocalStorage, AsyncResource,
+      executionAsyncId: () => 1,
+      triggerAsyncId: () => 0,
+      executionAsyncResource: () => ({}),
+      createHook: () => ({ enable() { return this; }, disable() { return this; } }),
+    };
+    globalThis.__sxnAsyncHooks = asyncHooks;
+
+    // ---------------- node:inspector ----------------
+    // There is no debug protocol behind this. It exists so that a library can
+    // ask whether a session is open and get "no" instead of a crash.
+    const inspector = {
+      url: () => undefined,
+      open() { throw new Error("inspector.open is not supported: this runtime has no debug protocol"); },
+      close() {},
+      waitForDebugger() { throw new Error("inspector.waitForDebugger is not supported"); },
+      console: globalThis.console,
+      Session: function Session() { throw new Error("inspector.Session is not supported: this runtime has no debug protocol"); },
+    };
+    inspector.promises = { Session: inspector.Session };
+    globalThis.__sxnInspector = inspector;
+
+    // ---------------- node:dgram ----------------
+    // A real UDP socket (uv_udp_t, in src/network.c) with the EventEmitter
+    // shape Node gives it. Multicast is not wired up.
+    function Socket(options) {
+      EE.call(this);
+      this.type = (options && (options.type || options)) === "udp6" ? "udp6" : "udp4";
+      this._port = 0;
+      this._handle = __sxnUdpOpen(this.type === "udp6", (bytes, address, port) => {
+        this.emit("message", Buffer.from(bytes), { address, port, family: this.type === "udp6" ? "IPv6" : "IPv4", size: bytes.length });
+      });
+    }
+    inheritEE(Socket);
+    Socket.prototype.bind = function (port, address, cb) {
+      if (typeof port === "object" && port !== null) { address = port.address; port = port.port; }
+      if (typeof address === "function") { cb = address; address = undefined; }
+      this._port = __sxnUdpBind(this._handle, Number(port) || 0, address);
+      if (cb) this.once("listening", cb);
+      process.nextTick(() => this.emit("listening"));
+      return this;
+    };
+    Socket.prototype.send = function (data, port, address, cb) {
+      if (typeof address === "function") { cb = address; address = undefined; }
+      const bytes = typeof data === "string" ? Buffer.from(data, "utf8")
+        : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+        : new Uint8Array(data);
+      let error = null, sent = 0;
+      try { sent = __sxnUdpSend(this._handle, bytes, Number(port) || 0, address); }
+      catch (e) { error = e; }
+      if (cb) process.nextTick(() => cb(error, sent));
+      else if (error) process.nextTick(() => this.emit("error", error));
+      return this;
+    };
+    Socket.prototype.address = function () {
+      return { address: this.type === "udp6" ? "::" : "0.0.0.0", port: this._port, family: this.type === "udp6" ? "IPv6" : "IPv4" };
+    };
+    Socket.prototype.close = function (cb) {
+      __sxnUdpClose(this._handle);
+      if (cb) this.once("close", cb);
+      process.nextTick(() => this.emit("close"));
+      return this;
+    };
+    Socket.prototype.ref = function () { return this; };
+    Socket.prototype.unref = function () { return this; };
+    Socket.prototype.setBroadcast = function () { return this; };
+    const dgram = {
+      Socket,
+      createSocket(options, listener) {
+        const s = new Socket(options);
+        if (typeof options === "object" && options && typeof listener !== "function") listener = options.listener;
+        if (typeof listener === "function") s.on("message", listener);
+        return s;
+      },
+    };
+    globalThis.__sxnDgram = dgram;
+
+    // ---------------- node:console / node:constants ----------------
+    // Both are the older shape of things that live elsewhere now: the global
+    // console, and the constants that hang off fs, os and crypto.
+    globalThis.__sxnConsole = Object.assign(Object.create(null), globalThis.console, {
+      Console: function Console() { return globalThis.console; },
+    });
+    globalThis.__sxnConstants = Object.assign({}, fs.constants, os.constants, {
+      SIGINT: 2, SIGTERM: 15, SIGKILL: 9,
+    });
+
+    // ---------------- node:punycode ----------------
+    // The algorithm from RFC 3492, which is small enough to be worth having
+    // rather than a stub: `url` used to need it and some packages still do.
+    const punyBase = 36, punyTMin = 1, punyTMax = 26, punySkew = 38,
+          punyDamp = 700, punyInitialBias = 72, punyInitialN = 128;
+    function punyAdapt(delta, numPoints, firstTime) {
+      delta = firstTime ? Math.floor(delta / punyDamp) : delta >> 1;
+      delta += Math.floor(delta / numPoints);
+      let k = 0;
+      while (delta > ((punyBase - punyTMin) * punyTMax) >> 1) {
+        delta = Math.floor(delta / (punyBase - punyTMin));
+        k += punyBase;
+      }
+      return k + Math.floor(((punyBase - punyTMin + 1) * delta) / (delta + punySkew));
+    }
+    function punyDecode(input) {
+      const output = [];
+      const basic = input.lastIndexOf("-");
+      let n = punyInitialN, bias = punyInitialBias, i = 0;
+      for (let j = 0; j < (basic < 0 ? 0 : basic); j++) output.push(input.charCodeAt(j));
+      for (let index = basic < 0 ? 0 : basic + 1; index < input.length;) {
+        const oldi = i;
+        for (let w = 1, k = punyBase;; k += punyBase) {
+          const code = input.charCodeAt(index++);
+          const digit = code - 48 < 10 ? code - 22 : code - 65 < 26 ? code - 65 : code - 97 < 26 ? code - 97 : punyBase;
+          if (digit >= punyBase) throw new RangeError("Invalid input");
+          i += digit * w;
+          const t = k <= bias ? punyTMin : k >= bias + punyTMax ? punyTMax : k - bias;
+          if (digit < t) break;
+          w *= punyBase - t;
+        }
+        bias = punyAdapt(i - oldi, output.length + 1, oldi === 0);
+        n += Math.floor(i / (output.length + 1));
+        i %= output.length + 1;
+        output.splice(i++, 0, n);
+      }
+      return String.fromCodePoint(...output);
+    }
+    function punyEncode(input) {
+      const points = Array.from(input).map((c) => c.codePointAt(0));
+      const basic = points.filter((c) => c < 128);
+      const output = basic.map((c) => String.fromCharCode(c));
+      let handled = basic.length;
+      if (handled) output.push("-");
+      let n = punyInitialN, delta = 0, bias = punyInitialBias;
+      while (handled < points.length) {
+        let m = Infinity;
+        for (const c of points) if (c >= n && c < m) m = c;
+        delta += (m - n) * (handled + 1);
+        n = m;
+        for (const c of points) {
+          if (c < n) delta++;
+          else if (c === n) {
+            let q = delta;
+            for (let k = punyBase;; k += punyBase) {
+              const t = k <= bias ? punyTMin : k >= bias + punyTMax ? punyTMax : k - bias;
+              if (q < t) break;
+              output.push(String.fromCharCode(punyDigit(t + ((q - t) % (punyBase - t)))));
+              q = Math.floor((q - t) / (punyBase - t));
+            }
+            output.push(String.fromCharCode(punyDigit(q)));
+            bias = punyAdapt(delta, handled + 1, handled === basic.length);
+            delta = 0;
+            handled++;
+          }
+        }
+        delta++;
+        n++;
+      }
+      return output.join("");
+    }
+    const punyDigit = (d) => d + 22 + (d < 26 ? 75 : 0);
+    const mapDomain = (text, fn) => text.split(".").map(fn).join(".");
+    const punycode = {
+      encode: punyEncode,
+      decode: punyDecode,
+      toASCII: (text) => mapDomain(text, (part) =>
+        /[^\x00-\x7F]/.test(part) ? "xn--" + punyEncode(part) : part),
+      toUnicode: (text) => mapDomain(text, (part) =>
+        part.startsWith("xn--") ? punyDecode(part.slice(4)) : part),
+      ucs2: {
+        decode: (text) => Array.from(text).map((c) => c.codePointAt(0)),
+        encode: (points) => String.fromCodePoint(...points),
+      },
+      version: "2.3.1",
+    };
+    globalThis.__sxnPunycode = punycode;
+
+    // ---------------- node:diagnostics_channel ----------------
+    // Named channels with subscribers, which is all of it that does not depend
+    // on async context tracking.
+    const channels = new Map();
+    function Channel(name) { this.name = name; this._subscribers = []; }
+    Object.defineProperty(Channel.prototype, "hasSubscribers", {
+      get() { return this._subscribers.length > 0; },
+    });
+    Channel.prototype.publish = function (message) {
+      for (const fn of this._subscribers.slice()) {
+        try { fn(message, this.name); } catch { /* a subscriber must not break the publisher */ }
+      }
+    };
+    Channel.prototype.subscribe = function (fn) { this._subscribers.push(fn); };
+    Channel.prototype.unsubscribe = function (fn) {
+      const i = this._subscribers.indexOf(fn);
+      if (i < 0) return false;
+      this._subscribers.splice(i, 1);
+      return true;
+    };
+    Channel.prototype.bindStore = function () {};
+    Channel.prototype.runStores = function (message, fn, thisArg, ...args) {
+      this.publish(message);
+      return fn.apply(thisArg, args);
+    };
+    function channelFor(name) {
+      let c = channels.get(name);
+      if (!c) { c = new Channel(name); channels.set(name, c); }
+      return c;
+    }
+    const diagnosticsChannel = {
+      Channel,
+      channel: channelFor,
+      hasSubscribers: (name) => channels.has(name) && channels.get(name).hasSubscribers,
+      subscribe: (name, fn) => channelFor(name).subscribe(fn),
+      unsubscribe: (name, fn) => channelFor(name).unsubscribe(fn),
+      tracingChannel(name) {
+        return {
+          start: channelFor(name + ":start"), end: channelFor(name + ":end"),
+          asyncStart: channelFor(name + ":asyncStart"), asyncEnd: channelFor(name + ":asyncEnd"),
+          error: channelFor(name + ":error"),
+          traceSync(fn, context, thisArg, ...args) { return fn.apply(thisArg, args); },
+          tracePromise(fn, context, thisArg, ...args) { return fn.apply(thisArg, args); },
+          traceCallback(fn, position, context, thisArg, ...args) { return fn.apply(thisArg, args); },
+        };
+      },
+    };
+    globalThis.__sxnDiagnosticsChannel = diagnosticsChannel;
+  };
+  // The names above, each a getter that builds the whole group once and then
+  // gets out of the way -- the group is one closure, so splitting it further
+  // would buy nothing.
+  let builtLater = false;
+  for (const name of ["__sxnChildProcess", "__sxnDns", "__sxnDnsPromises", "__sxnHttps", "__sxnTls", "__sxnHttp2", "__sxnStreamWeb", "__sxnVm", "__sxnV8", "__sxnWorkerThreads", "__sxnCluster", "__sxnReadline", "__sxnReadlinePromises", "__sxnAsyncHooks", "__sxnInspector", "__sxnDgram", "__sxnConsole", "__sxnConstants", "__sxnPunycode", "__sxnDiagnosticsChannel"]) {
+    Object.defineProperty(globalThis, name, {
+      configurable: true,
+      get() {
+        if (!builtLater) {
+          builtLater = true;
+          for (const other of ["__sxnChildProcess", "__sxnDns", "__sxnDnsPromises", "__sxnHttps", "__sxnTls", "__sxnHttp2", "__sxnStreamWeb", "__sxnVm", "__sxnV8", "__sxnWorkerThreads", "__sxnCluster", "__sxnReadline", "__sxnReadlinePromises", "__sxnAsyncHooks", "__sxnInspector", "__sxnDgram", "__sxnConsole", "__sxnConstants", "__sxnPunycode", "__sxnDiagnosticsChannel"]) delete globalThis[other];
+          laterBuiltins();
+        }
+        return globalThis[name];
+      },
+      set(value) {
+        Object.defineProperty(globalThis, name, { value, writable: true, configurable: true });
+      },
+    });
+  }
+
 })();

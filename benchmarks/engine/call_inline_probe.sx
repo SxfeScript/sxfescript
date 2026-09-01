@@ -1,0 +1,52 @@
+// What the typed-call inliner is worth, and against what ceiling.
+//
+// A call to a function with a fully declared scalar signature is spliced into
+// its caller by sx_inline_typed_calls (quickjs.c). "hand-inlined" is the same
+// arithmetic written out by hand and is therefore the exact upper bound; the
+// untyped row is the same program with the annotations removed, which never
+// qualifies and so measures the call this pass removes.
+//
+// Report is per loop iteration, minimum of 9 runs. Subtract the empty loop to
+// read the cost of the work itself.
+//
+//   sxn benchmarks/engine/call_inline_probe.sx
+
+const N = 5000000;
+
+function bench(name: string, fn): void {
+  let best = Infinity;
+  for (let r = 0; r < 9; r++) {
+    const t = performance.now();
+    fn();
+    const d = performance.now() - t;
+    if (d < best) best = d;
+  }
+  console.log(name.padEnd(24), (best * 1e6 / N).toFixed(2), "ns/op");
+}
+
+function emptyLoop(): number { let s = 0; for (let i = 0; i < N; i++) ; return s; }
+
+function typedCall(): number {
+  function add2(a: i32, b: i32): i32 { return a + b; }
+  let s = 0;
+  for (let i = 0; i < N; i++) s = add2(i, 1);
+  return s;
+}
+
+function untypedCall(): number {
+  function add2(a, b) { return a + b; }
+  let s = 0;
+  for (let i = 0; i < N; i++) s = add2(i, 1);
+  return s;
+}
+
+function handInlined(): number {
+  let s = 0;
+  for (let i = 0; i < N; i++) s = i + 1;
+  return s;
+}
+
+bench("empty loop", emptyLoop);
+bench("untyped call", untypedCall);
+bench("typed call", typedCall);
+bench("hand-inlined", handInlined);

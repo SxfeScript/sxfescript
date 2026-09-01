@@ -1,0 +1,197 @@
+// A call to a small function with a fully declared scalar signature is
+// spliced into its caller (see sx_inline_typed_calls in quickjs.c). These
+// checks assert the splice changes nothing observable except the missing
+// frame: the same values, the same exceptions, the same behaviour when the
+// binding is reassigned, captured, or used as a value.
+
+let failures = 0;
+function check(name: string, actual, expected): void {
+  if (!Object.is(actual, expected)) {
+    console.log("FAIL", name, "expected", expected, "got", actual);
+    failures += 1;
+  }
+}
+
+// --- the shapes that are meant to inline ---------------------------------
+function arith(): void {
+  function add(a: i32, b: i32): i32 { return a + b; }
+  function sub(a: f64, b: f64): f64 { return a - b; }
+  function mul(a: f64, b: f64): f64 { return a * b; }
+  function less(a: i32, b: i32): bool { return a < b; }
+  function negate(a: f64): f64 { return -a; }
+  function scale(a: f64): f64 { return a * 2; }
+
+  check("add", add(2, 3), 5);
+  check("sub", sub(2.5, 1.25), 1.25);
+  check("mul", mul(3, 4), 12);
+  check("less true", less(1, 2), true);
+  check("less false", less(2, 1), false);
+  check("negate", negate(5), -5);
+  check("negate zero keeps sign", negate(0), -0);
+  check("scale", scale(21), 42);
+
+  // Called in a loop, which is where the frame cost was measured.
+  let total = 0;
+  for (let i = 0; i < 5; i++) total = add(total, i);
+  check("add in a loop", total, 10);
+}
+arith();
+
+// --- values must still flow through unchanged ----------------------------
+function coercion(): void {
+  function add(a: i32, b: i32): i32 { return a + b; }
+  // The declared types are not enforced at runtime, so the spliced `add`
+  // must behave exactly as the call did on values that are not integers.
+  check("string concat", add("a", "b"), "ab");
+  check("undefined is NaN", add(undefined, 1), NaN);
+  check("object valueOf runs", add({ valueOf() { return 7; } }, 1), 8);
+  check("overflow promotes", add(2147483647, 1), 2147483648);
+}
+coercion();
+
+// --- exceptions ----------------------------------------------------------
+function throwing(): void {
+  function add(a: i32, b: i32): i32 { return a + b; }
+  let threw = "";
+  try { add(Symbol("s"), 1); } catch (e) { threw = e.constructor.name; }
+  check("symbol still throws TypeError", threw, "TypeError");
+}
+throwing();
+
+// --- a reassigned binding must not be spliced ----------------------------
+function reassigned(): number {
+  function pick(a: i32, b: i32): i32 { return a + b; }
+  let r = pick(1, 2);
+  pick = function (a: i32, b: i32): i32 { return a * b; };
+  return r + pick(3, 4);
+}
+check("reassigned callee", reassigned(), 15);
+
+// --- a captured binding must not be spliced ------------------------------
+function captured(): number {
+  function pick(a: i32, b: i32): i32 { return a + b; }
+  const swap = () => { pick = (a: i32, b: i32): i32 => a * b; };
+  const before = pick(2, 3);
+  swap();
+  return before + pick(2, 3);
+}
+check("captured callee", captured(), 11);
+
+// --- the function is still an ordinary value -----------------------------
+function stillAValue(): void {
+  function add(a: i32, b: i32): i32 { return a + b; }
+  check("direct call", add(1, 1), 2);
+  check("reduce", [1, 2, 3, 4].reduce(add, 0), 10);
+  check("apply", add.apply(null, [3, 4]), 7);
+  check("length", add.length, 2);
+  check("name", add.name, "add");
+}
+stillAValue();
+
+// --- shapes that must be left alone --------------------------------------
+function notInlined(): void {
+  function untyped(a, b) { return a + b; }
+  function stringy(a: string, b: string): string { return a + b; }
+  function withLocal(a: i32, b: i32): i32 { let t = a + b; return t; }
+  function twoUses(a: i32): i32 { return a * a; }
+  function branching(a: i32, b: i32): i32 { return a > b ? a : b; }
+  function calling(a: i32): f64 { return Math.abs(a); }
+
+  check("untyped", untyped(1, 2), 3);
+  check("string", stringy("a", "b"), "ab");
+  check("has a local", withLocal(1, 2), 3);
+  check("uses an arg twice", twoUses(6), 36);
+  check("branches", branching(3, 9), 9);
+  check("calls out", calling(-4), 4);
+
+  // Wrong arity on both sides of the declared signature.
+  function add(a: i32, b: i32): i32 { return a + b; }
+  check("too few args", add(1), NaN);
+  check("too many args", add(1, 2, 3), 3);
+}
+notInlined();
+
+// --- argument evaluation order and side effects --------------------------
+function order(): void {
+  function add(a: i32, b: i32): i32 { return a + b; }
+  const seen = [];
+  const t = (n: i32): i32 => { seen.push(n); return n; };
+  check("side-effecting args", add(t(1), t(2)), 3);
+  check("evaluated left to right", seen.join(","), "1,2");
+}
+order();
+
+// --- recursion still terminates ------------------------------------------
+function recursion(): void {
+  function fact(n: i32): i32 { return n < 2 ? 1 : n * fact(n - 1); }
+  check("recursive", fact(5), 120);
+}
+recursion();
+
+// --- differential: inlined vs the identical untyped function -------------
+// Each pair is the same body, once with a declared scalar signature (which
+// inlines) and once without (which does not). The calls have to be written
+// out rather than driven from a table: reaching a function through `apply`,
+// or through an arrow that closes over it, is exactly what stops the splice,
+// so a table-driven version would compare two un-inlined functions and prove
+// nothing. Over a value table chosen to hit the awkward paths -- the i32
+// boundaries, -0, NaN, the infinities, strings, objects, arrays, null and
+// undefined -- the two must agree on every result and on every exception.
+function differential(): void {
+  function t_add(x: f64, y: f64): f64 { return x + y; }
+  function u_add(x, y) { return x + y; }
+  function t_div(x: f64, y: f64): f64 { return x / y; }
+  function u_div(x, y) { return x / y; }
+  function t_shl(x: f64, y: f64): f64 { return x << y; }
+  function u_shl(x, y) { return x << y; }
+  function t_shr(x: f64, y: f64): f64 { return x >>> y; }
+  function u_shr(x, y) { return x >>> y; }
+  function t_lt(x: f64, y: f64): f64 { return x < y; }
+  function u_lt(x, y) { return x < y; }
+  function t_looseEq(x: f64, y: f64): f64 { return x == y; }
+  function u_looseEq(x, y) { return x == y; }
+
+  const values = [0, -0, 1, -1, 2147483647, -2147483648, 0.5, 1e21, NaN,
+                  Infinity, -Infinity, "7", "", true, false, null, undefined,
+                  {}, [], [3]];
+  let compared = 0;
+  function compare(name: string, l: string, r: string, a, b): void {
+    compared += 1;
+    if (l !== r) {
+      console.log("FAIL differential", name, String(a), String(b), l, "vs", r);
+      failures += 1;
+    }
+  }
+
+  for (const a of values) {
+    for (const b of values) {
+      let l = "", r = "";
+      try { l = "v:" + String(t_add(a, b)); } catch (e) { l = "e:" + e.constructor.name; }
+      try { r = "v:" + String(u_add(a, b)); } catch (e) { r = "e:" + e.constructor.name; }
+      compare("add", l, r, a, b);
+      try { l = "v:" + String(t_div(a, b)); } catch (e) { l = "e:" + e.constructor.name; }
+      try { r = "v:" + String(u_div(a, b)); } catch (e) { r = "e:" + e.constructor.name; }
+      compare("div", l, r, a, b);
+      try { l = "v:" + String(t_shl(a, b)); } catch (e) { l = "e:" + e.constructor.name; }
+      try { r = "v:" + String(u_shl(a, b)); } catch (e) { r = "e:" + e.constructor.name; }
+      compare("shl", l, r, a, b);
+      try { l = "v:" + String(t_shr(a, b)); } catch (e) { l = "e:" + e.constructor.name; }
+      try { r = "v:" + String(u_shr(a, b)); } catch (e) { r = "e:" + e.constructor.name; }
+      compare("shr", l, r, a, b);
+      try { l = "v:" + String(t_lt(a, b)); } catch (e) { l = "e:" + e.constructor.name; }
+      try { r = "v:" + String(u_lt(a, b)); } catch (e) { r = "e:" + e.constructor.name; }
+      compare("lt", l, r, a, b);
+      try { l = "v:" + String(t_looseEq(a, b)); } catch (e) { l = "e:" + e.constructor.name; }
+      try { r = "v:" + String(u_looseEq(a, b)); } catch (e) { r = "e:" + e.constructor.name; }
+      compare("looseEq", l, r, a, b);
+    }
+  }
+  if (compared !== values.length * values.length * 6) {
+    console.log("FAIL differential ran", compared, "cases");
+    failures += 1;
+  }
+}
+differential();
+
+if (failures !== 0) throw new Error(failures + " typed-inline checks failed");
+console.log("typed inline: all checks passed");

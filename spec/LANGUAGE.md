@@ -19,6 +19,14 @@ Safe object shapes reject property addition/deletion and incompatible writes.
 The compatibility transformer erases this qualifier; the native parser is
 responsible for attaching its runtime descriptor.
 
+The declared type is what `safe` specializes on, so it is part of the
+contract rather than documentation. `safe ... : i32` wraps at the 32-bit
+boundary, which is the defined semantics for that type and not JavaScript's;
+every other annotation, and an un-annotated `safe`, keeps exact JavaScript
+arithmetic where 2^31-1 + 1 promotes to a double. A declared signature is
+also what makes a call eligible to be inlined into its caller, so annotating
+a small function changes what it costs.
+
 Primitive FFI declarations use an explicit unsafe boundary:
 
 ```sx
@@ -48,6 +56,17 @@ document has not written down.
 - Passing, assigning, returning, or capturing an affine value by value moves it.
 - A borrow cannot be returned, stored in a longer-lived value, or captured.
 - `unsafe` permits typed JS/native interop but never disables runtime alias locks.
+
+Of those, the exclusive-borrow rule is the one enforced today: `&mut x` where
+`x` is a binding the parser can resolve and that was not declared `let mut` is
+a compile error, `SX2003`. It rules only on a bare identifier it can resolve in
+the current function's lexical scope chain or its top-level lexicals; a
+parameter, a captured outer binding, or a name it cannot resolve is left alone
+rather than guessed at. The rest of this section is parsed and waiting on the
+control-flow ownership pass; `spec/IMPLEMENTATION.md` is the record of which is
+which. Note also that `&mut` is still erased at runtime, so it aliases through
+JavaScript object identity: it mutates a struct in place, and cannot write back
+to a caller's number.
 
 `i32`, `f32`, `f64`, `bool`, and ordinary JavaScript values are copyable.
 Primitive-only interfaces define affine fixed-layout structs. A literal becomes

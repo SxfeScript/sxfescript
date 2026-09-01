@@ -200,7 +200,7 @@ static no_inline limb_t mp_div1norm(limb_t *tabr, const limb_t *taba, limb_t n,
 static __maybe_unused void mpb_dump(const char *str, const mpb_t *a)
 {
     int i;
-    
+
     printf("%s= 0x", str);
     for(i = a->len - 1; i >= 0; i--) {
         printf("%08x", a->tab[i]);
@@ -299,7 +299,7 @@ enum {
 static int mpb_get_bit(const mpb_t *r, int k)
 {
     int l;
-    
+
     l = (unsigned)k / LIMB_BITS;
     k = k & (LIMB_BITS - 1);
     if (l >= r->len)
@@ -511,7 +511,7 @@ static void build_mul_log2_radix_table(void)
 static void mul_log2_radix_test(void)
 {
     int radix, i, ref, r;
-    
+
     for(radix = 2; radix <= 36; radix++) {
         for(i = -2048; i <= 2047; i++) {
             ref = (int)floor((double)i / log2(radix));
@@ -590,7 +590,7 @@ size_t u32toa(char *buf, uint32_t n)
 {
     char buf1[10], *q;
     size_t len;
-    
+
     q = buf1 + sizeof(buf1);
     do {
         *--q = n % 10 + '0';
@@ -753,7 +753,7 @@ static const int16_t min_exponent[JS_RADIX_MAX - 1] = {
 void build_tables(void)
 {
     int r, j, radix, n, col, i;
-    
+
     /* radix_base_table */
     for(radix = 2; radix <= 36; radix++) {
         r = 1;
@@ -1103,6 +1103,316 @@ static void dtoa_free(void *ptr)
 }
 #endif
 
+/*
+ * Grisu3 fast path for the overwhelmingly common Number::toString case.
+ *
+ * This is deliberately kept as a leaf which only returns a decimal mantissa
+ * and exponent.  js_dtoa's existing output code still decides between fixed
+ * and exponential notation, and the exact bignum implementation below remains
+ * the fallback for every other radix/format and whenever the fast path cannot
+ * prove its candidate.  The algorithm is from Florian Loitsch, "Printing
+ * Floating-Point Numbers Quickly and Accurately with Integers" (PLDI 2010).
+ */
+typedef struct {
+    uint64_t f;
+    int e;
+} DtoaDiyFp;
+
+static DtoaDiyFp dtoa_diy_mul(DtoaDiyFp a, DtoaDiyFp b)
+{
+#if defined(__SIZEOF_INT128__)
+    __extension__ typedef unsigned __int128 dtoa_uint128_t;
+    dtoa_uint128_t p = (dtoa_uint128_t)a.f * b.f;
+    uint64_t high = p >> 64;
+    DtoaDiyFp r;
+
+    if ((uint64_t)p & (UINT64_C(1) << 63))
+        high++;
+    r.f = high;
+    r.e = a.e + b.e + 64;
+    return r;
+#else
+    uint64_t a_hi = a.f >> 32, a_lo = (uint32_t)a.f;
+    uint64_t b_hi = b.f >> 32, b_lo = (uint32_t)b.f;
+    uint64_t ac = a_hi * b_hi;
+    uint64_t bc = a_lo * b_hi;
+    uint64_t ad = a_hi * b_lo;
+    uint64_t bd = a_lo * b_lo;
+    uint64_t t = (bd >> 32) + (uint32_t)ad + (uint32_t)bc;
+    DtoaDiyFp r;
+
+    /* Round the discarded low half, exactly as a 128-bit multiply would. */
+    t += (uint64_t)1 << 31;
+    r.f = ac + (ad >> 32) + (bc >> 32) + (t >> 32);
+    r.e = a.e + b.e + 64;
+    return r;
+#endif
+}
+
+static DtoaDiyFp dtoa_diy_normalize(DtoaDiyFp v)
+{
+    int n = clz64(v.f);
+    v.f <<= n;
+    v.e -= n;
+    return v;
+}
+
+/* 10^-348, 10^-340, ... 10^340, rounded to a 64-bit significand. */
+static const DtoaDiyFp dtoa_cached_powers[] = {
+    { UINT64_C(0xfa8fd5a0081c0288), -1220 },
+    { UINT64_C(0xbaaee17fa23ebf76), -1193 },
+    { UINT64_C(0x8b16fb203055ac76), -1166 },
+    { UINT64_C(0xcf42894a5dce35ea), -1140 },
+    { UINT64_C(0x9a6bb0aa55653b2d), -1113 },
+    { UINT64_C(0xe61acf033d1a45df), -1087 },
+    { UINT64_C(0xab70fe17c79ac6ca), -1060 },
+    { UINT64_C(0xff77b1fcbebcdc4f), -1034 },
+    { UINT64_C(0xbe5691ef416bd60c), -1007 },
+    { UINT64_C(0x8dd01fad907ffc3c), -980 },
+    { UINT64_C(0xd3515c2831559a83), -954 },
+    { UINT64_C(0x9d71ac8fada6c9b5), -927 },
+    { UINT64_C(0xea9c227723ee8bcb), -901 },
+    { UINT64_C(0xaecc49914078536d), -874 },
+    { UINT64_C(0x823c12795db6ce57), -847 },
+    { UINT64_C(0xc21094364dfb5637), -821 },
+    { UINT64_C(0x9096ea6f3848984f), -794 },
+    { UINT64_C(0xd77485cb25823ac7), -768 },
+    { UINT64_C(0xa086cfcd97bf97f4), -741 },
+    { UINT64_C(0xef340a98172aace5), -715 },
+    { UINT64_C(0xb23867fb2a35b28e), -688 },
+    { UINT64_C(0x84c8d4dfd2c63f3b), -661 },
+    { UINT64_C(0xc5dd44271ad3cdba), -635 },
+    { UINT64_C(0x936b9fcebb25c996), -608 },
+    { UINT64_C(0xdbac6c247d62a584), -582 },
+    { UINT64_C(0xa3ab66580d5fdaf6), -555 },
+    { UINT64_C(0xf3e2f893dec3f126), -529 },
+    { UINT64_C(0xb5b5ada8aaff80b8), -502 },
+    { UINT64_C(0x87625f056c7c4a8b), -475 },
+    { UINT64_C(0xc9bcff6034c13053), -449 },
+    { UINT64_C(0x964e858c91ba2655), -422 },
+    { UINT64_C(0xdff9772470297ebd), -396 },
+    { UINT64_C(0xa6dfbd9fb8e5b88f), -369 },
+    { UINT64_C(0xf8a95fcf88747d94), -343 },
+    { UINT64_C(0xb94470938fa89bcf), -316 },
+    { UINT64_C(0x8a08f0f8bf0f156b), -289 },
+    { UINT64_C(0xcdb02555653131b6), -263 },
+    { UINT64_C(0x993fe2c6d07b7fac), -236 },
+    { UINT64_C(0xe45c10c42a2b3b06), -210 },
+    { UINT64_C(0xaa242499697392d3), -183 },
+    { UINT64_C(0xfd87b5f28300ca0e), -157 },
+    { UINT64_C(0xbce5086492111aeb), -130 },
+    { UINT64_C(0x8cbccc096f5088cc), -103 },
+    { UINT64_C(0xd1b71758e219652c), -77 },
+    { UINT64_C(0x9c40000000000000), -50 },
+    { UINT64_C(0xe8d4a51000000000), -24 },
+    { UINT64_C(0xad78ebc5ac620000), 3 },
+    { UINT64_C(0x813f3978f8940984), 30 },
+    { UINT64_C(0xc097ce7bc90715b3), 56 },
+    { UINT64_C(0x8f7e32ce7bea5c70), 83 },
+    { UINT64_C(0xd5d238a4abe98068), 109 },
+    { UINT64_C(0x9f4f2726179a2245), 136 },
+    { UINT64_C(0xed63a231d4c4fb27), 162 },
+    { UINT64_C(0xb0de65388cc8ada8), 189 },
+    { UINT64_C(0x83c7088e1aab65db), 216 },
+    { UINT64_C(0xc45d1df942711d9a), 242 },
+    { UINT64_C(0x924d692ca61be758), 269 },
+    { UINT64_C(0xda01ee641a708dea), 295 },
+    { UINT64_C(0xa26da3999aef774a), 322 },
+    { UINT64_C(0xf209787bb47d6b85), 348 },
+    { UINT64_C(0xb454e4a179dd1877), 375 },
+    { UINT64_C(0x865b86925b9bc5c2), 402 },
+    { UINT64_C(0xc83553c5c8965d3d), 428 },
+    { UINT64_C(0x952ab45cfa97a0b3), 455 },
+    { UINT64_C(0xde469fbd99a05fe3), 481 },
+    { UINT64_C(0xa59bc234db398c25), 508 },
+    { UINT64_C(0xf6c69a72a3989f5c), 534 },
+    { UINT64_C(0xb7dcbf5354e9bece), 561 },
+    { UINT64_C(0x88fcf317f22241e2), 588 },
+    { UINT64_C(0xcc20ce9bd35c78a5), 614 },
+    { UINT64_C(0x98165af37b2153df), 641 },
+    { UINT64_C(0xe2a0b5dc971f303a), 667 },
+    { UINT64_C(0xa8d9d1535ce3b396), 694 },
+    { UINT64_C(0xfb9b7cd9a4a7443c), 720 },
+    { UINT64_C(0xbb764c4ca7a44410), 747 },
+    { UINT64_C(0x8bab8eefb6409c1a), 774 },
+    { UINT64_C(0xd01fef10a657842c), 800 },
+    { UINT64_C(0x9b10a4e5e9913129), 827 },
+    { UINT64_C(0xe7109bfba19c0c9d), 853 },
+    { UINT64_C(0xac2820d9623bf429), 880 },
+    { UINT64_C(0x80444b5e7aa7cf85), 907 },
+    { UINT64_C(0xbf21e44003acdd2d), 933 },
+    { UINT64_C(0x8e679c2f5e44ff8f), 960 },
+    { UINT64_C(0xd433179d9c8cb841), 986 },
+    { UINT64_C(0x9e19db92b4e31ba9), 1013 },
+    { UINT64_C(0xeb96bf6ebadf77d9), 1039 },
+    { UINT64_C(0xaf87023b9bf0ee6b), 1066 },
+};
+
+static DtoaDiyFp dtoa_cached_power(int e, int *dec_exp)
+{
+    size_t i;
+
+    /* Select the first power which puts the scaled upper boundary in
+       [-60, -32].  Integer selection avoids host floating-point variation. */
+    for (i = 0; i < countof(dtoa_cached_powers); i++) {
+        if (e + dtoa_cached_powers[i].e + 64 >= -60) {
+            *dec_exp = 348 - (int)i * 8;
+            return dtoa_cached_powers[i];
+        }
+    }
+    abort(); /* Binary64's exponent range always selects an entry. */
+}
+
+static int dtoa_decimal_digits32(uint32_t n)
+{
+    if (n < 10) return 1;
+    if (n < 100) return 2;
+    if (n < 1000) return 3;
+    if (n < 10000) return 4;
+    if (n < 100000) return 5;
+    if (n < 1000000) return 6;
+    if (n < 10000000) return 7;
+    if (n < 100000000) return 8;
+    return 9;
+}
+
+static bool dtoa_grisu_round(char *digits, int len,
+                             uint64_t upper_distance,
+                             uint64_t unsafe_interval, uint64_t rest,
+                             uint64_t ten_kappa, uint64_t unit)
+{
+    uint64_t small_distance = upper_distance - unit;
+    uint64_t big_distance = upper_distance + unit;
+
+    while (rest < small_distance &&
+           unsafe_interval - rest >= ten_kappa &&
+           (rest + ten_kappa < small_distance ||
+            small_distance - rest >= rest + ten_kappa - small_distance)) {
+        digits[len - 1]--;
+        rest += ten_kappa;
+    }
+    /* If two digits are still plausible, the bignum fallback must decide. */
+    if (rest < big_distance && unsafe_interval - rest >= ten_kappa &&
+        (rest + ten_kappa < big_distance ||
+         big_distance - rest > rest + ten_kappa - big_distance))
+        return false;
+    return 2 * unit <= rest && rest <= unsafe_interval - 4 * unit;
+}
+
+static bool dtoa_grisu_digits(DtoaDiyFp w, DtoaDiyFp lower,
+                              DtoaDiyFp upper, char *digits,
+                              int *plen, int *pdec_exp)
+{
+    static const uint64_t pow10[] = {
+        UINT64_C(1), UINT64_C(10), UINT64_C(100), UINT64_C(1000),
+        UINT64_C(10000), UINT64_C(100000), UINT64_C(1000000),
+        UINT64_C(10000000), UINT64_C(100000000), UINT64_C(1000000000),
+        UINT64_C(10000000000), UINT64_C(100000000000),
+        UINT64_C(1000000000000), UINT64_C(10000000000000),
+        UINT64_C(100000000000000), UINT64_C(1000000000000000),
+        UINT64_C(10000000000000000), UINT64_C(100000000000000000),
+        UINT64_C(1000000000000000000), UINT64_C(10000000000000000000)
+    };
+    uint64_t unit = 1;
+    uint64_t one, upper_distance, unsafe_interval, p2;
+    uint32_t p1;
+    int kappa;
+    int len = 0;
+
+    /* Cached-power multiplication is rounded by at most one unit.  Widen the
+       interval by that error; round-weed accepts only unambiguous results. */
+    lower.f -= unit;
+    upper.f += unit;
+    one = (uint64_t)1 << -upper.e;
+    upper_distance = upper.f - w.f;
+    unsafe_interval = upper.f - lower.f;
+    p1 = upper.f >> -upper.e;
+    p2 = upper.f & (one - 1);
+    kappa = dtoa_decimal_digits32(p1);
+
+    while (kappa > 0) {
+        uint32_t divisor = (uint32_t)pow10[kappa - 1];
+        uint32_t digit = p1 / divisor;
+        uint64_t rest;
+        p1 %= divisor;
+        if (digit || len)
+            digits[len++] = '0' + digit;
+        kappa--;
+        rest = ((uint64_t)p1 << -upper.e) + p2;
+        if (rest < unsafe_interval) {
+            *pdec_exp += kappa;
+            *plen = len;
+            return dtoa_grisu_round(digits, len, upper_distance,
+                                    unsafe_interval, rest,
+                                    pow10[kappa] << -upper.e, unit);
+        }
+    }
+    for (;;) {
+        uint32_t digit;
+        p2 *= 10;
+        unit *= 10;
+        unsafe_interval *= 10;
+        digit = p2 >> -upper.e;
+        if (digit || len)
+            digits[len++] = '0' + digit;
+        p2 &= one - 1;
+        kappa--;
+        if (p2 < unsafe_interval) {
+            *pdec_exp += kappa;
+            *plen = len;
+            return dtoa_grisu_round(digits, len, upper_distance * unit,
+                                    unsafe_interval, p2, one, unit);
+        }
+    }
+}
+
+static bool dtoa_grisu3(uint64_t bits, uint64_t *pmant, int *pdigits,
+                        int *pdec_exp)
+{
+    uint64_t frac = bits & (UINT64_C(1) << 52) - 1;
+    int biased_e = (bits >> 52) & 0x7ff;
+    DtoaDiyFp v, lower, upper, c, w, lower_scaled, upper_scaled;
+    char digits[18];
+    uint64_t mant = 0;
+    int len, i;
+
+    if (biased_e == 0) {
+        v.f = frac;
+        v.e = -1074;
+    } else {
+        v.f = frac | (UINT64_C(1) << 52);
+        v.e = biased_e - 1075;
+    }
+
+    upper.f = (v.f << 1) + 1;
+    upper.e = v.e - 1;
+    upper = dtoa_diy_normalize(upper);
+    if (v.f == (UINT64_C(1) << 52)) {
+        lower.f = (v.f << 2) - 1;
+        lower.e = v.e - 2;
+    } else {
+        lower.f = (v.f << 1) - 1;
+        lower.e = v.e - 1;
+    }
+    lower.f <<= lower.e - upper.e;
+    lower.e = upper.e;
+
+    c = dtoa_cached_power(upper.e, pdec_exp);
+    w = dtoa_diy_mul(dtoa_diy_normalize(v), c);
+    lower_scaled = dtoa_diy_mul(lower, c);
+    upper_scaled = dtoa_diy_mul(upper, c);
+    if (!dtoa_grisu_digits(w, lower_scaled, upper_scaled,
+                           digits, &len, pdec_exp))
+        return false;
+    if (len <= 0 || len > 17)
+        return false;
+    for (i = 0; i < len; i++)
+        mant = mant * 10 + digits[i] - '0';
+    *pmant = mant;
+    *pdigits = len;
+    return true;
+}
+
 /* return the length */
 int js_dtoa(char *buf, double d, int radix, int n_digits, int flags,
             JSDTOATempMem *tmp_mem)
@@ -1175,11 +1485,23 @@ int js_dtoa(char *buf, double d, int radix, int n_digits, int flags,
         goto done;
     }
 #endif
-    
+
+    /* Local deviation from upstream QuickJS: avoid the exact shortest-digit
+       search for ordinary decimal String(number)/JSON number formatting. */
+    if (radix == 10 && fmt == JS_DTOA_FORMAT_FREE &&
+        (flags & JS_DTOA_EXP_MASK) == JS_DTOA_EXP_AUTO) {
+        int dec_exp;
+        if (dtoa_grisu3(a & ~(UINT64_C(1) << 63), &m, &P, &dec_exp)) {
+            E = P + dec_exp;
+            mpb_set_u64(tmp1, m);
+            goto output;
+        }
+    }
+
     /* this choice of E implies F=round(x*B^(P-E) is such as: 
        B^(P-1) <= F < 2.B^P. */
     E = 1 + mul_log2_radix(e - 1, radix);
-    
+
     if (fmt == JS_DTOA_FORMAT_FREE) {
         int P_max, E0, e1, E_found, P_found;
         uint64_t m1, mant_found, mant, mant_max1;
@@ -1380,7 +1702,7 @@ double js_atod(const char *str, const char **pnext, int radix, int flags,
     } else {
         p_start = p;
     }
-    
+
     if (p[0] == '0') {
         if ((p[1] == 'x' || p[1] == 'X') &&
             (radix == 0 || radix == 16)) {
@@ -1456,7 +1778,7 @@ double js_atod(const char *str, const char **pnext, int radix, int flags,
         p++;
         pos++;
     }
-    
+
     sig_pos = pos;
     for(;;) {
         limb_t c;
@@ -1502,13 +1824,13 @@ double js_atod(const char *str, const char **pnext, int radix, int flags,
             dot_pos = pos;
         expn_offset = sig_pos + digit_count - dot_pos;
     }
-    
+
     /* Use the extra digits for rounding if the base is a power of
        two. Otherwise they are just truncated. */
     if (radix_bits != 0 && extra_digits != 0) {
         tmp0->tab[0] |= 1;
     }
-    
+
     /* parse the exponent, if any */
     expn = 0;
     expn_overflow = false;

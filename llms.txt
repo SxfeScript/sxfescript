@@ -1,0 +1,5 @@
+# SxfeScript / SXN
+
+The current release is 0.0.2. See `llm.txt` for the verified six-platform
+binary matrix, build provenance, and test status. The source documentation is
+in `README.md`, `docs/`, and `spec/`.

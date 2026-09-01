@@ -1,0 +1,34 @@
+sha1 "k" "message" 2d795a5f313a0bb4e42011cbd2063b8a2610df75
+sha1 "" "empty key" 60e4e201d6e1b6348ba256f68186bddb58f3a938
+sha1 "aaaaaaaaaaaa" "long key" ed7c878aaf3d3afa40b8736ebb83f94360d1b120
+sha1 "k" "" 3a84a218ee6665209bb70e84525dd837645a1965
+sha256 "k" "message" 9831a5afefa770d5fe6c985f6c343796ca3d27651d69e24864f1f9948debfacf
+sha256 "" "empty key" bf6e6a0f34cd9fdf69c67b8c62969c87cd4f783d4665217df03f062dc4a0406e
+sha256 "aaaaaaaaaaaa" "long key" f7b340fe6c42e1512d7a40dff53513cf693899fe598a9e248b27412b10f8c245
+sha256 "k" "" 8bb990c40a7d61cb97597a942125025be50ac8beb74436e3735b98893a7f6620
+sha512 "k" "message" 64906709a2715107346e6c90d94d00e77d240f50adffb0d08cb204f010a80211af7947ccfd3ed9df99310e464cc6201a8fc03e0f00ecd761e4e9f82ae6fcd13d
+sha512 "" "empty key" a2216fd9ef34dc16c8e559c675f255889c380e3f8c7d19c6836ec6ed3bb7eff126d2cc221cb38ea33883cdf9c365d8248049dfe67e6781aed6ef2f48856cf2e5
+sha512 "aaaaaaaaaaaa" "long key" 129faf68e2a065737a2052d8654e55f199f7e306205ebb7e9236b9532f8efdbfdb40304bb9a4c26ad4afefa9e15efe2bd17de54b310e3ac586710f4caa6db861
+sha512 "k" "" 893ccbf5d0b335fcda6f625e4a59055a364d75a9251589428750782c116830a1af455efe1094c1901d0e8fd5beb6df64c6d5fe1c6f09be6ef47fb3987260cdd8
+md5 "k" "message" 830e89d40ff8cacbb791807541e5b78e
+md5 "" "empty key" 4ba1126c25c31c3c5c431c2c68784b6b
+md5 "aaaaaaaaaaaa" "long key" 80e6d83819da34d75e633702a805c094
+md5 "k" "" cd32bedd46aa63cffa3023f050fc78e3
+streamed NC5RnOCtbAOja5jus/HRMNtIE7nfTRFg7aSI1xLceO4=
+equal true
+differ false
+mismatch -> RangeError
+hash hex "deadbeef" 5f78c33274e43fa9de5659265c1d917e25c03722dcb0b8d27db8d5feaa813953
+hmac hex "deadbeef" vnR0a3D0RWFcGEI8e8BOnmC59Zx/no4aDlvGyHVrpys=
+hash hex "DEADBEEF" 5f78c33274e43fa9de5659265c1d917e25c03722dcb0b8d27db8d5feaa813953
+hmac hex "DEADBEEF" vnR0a3D0RWFcGEI8e8BOnmC59Zx/no4aDlvGyHVrpys=
+hash base64 "QUJD" b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78
+hmac base64 "QUJD" R2EoX7/mTM/FUNUp5uqdKly4ge7dOi57M7ji6ypTwbI=
+hash base64url "QUJD" b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78
+hmac base64url "QUJD" R2EoX7/mTM/FUNUp5uqdKly4ge7dOi57M7ji6ypTwbI=
+hash latin1 "ÿþ" b3d510ef04275ca8e698e5b3cbb0ece3949ef9252f0cdc839e9ee347409a2209
+hmac latin1 "ÿþ" SR8auta1W/HKyIqhNX4m9h49m89Do9vWO3yTIhdbcDk=
+hash utf8 "abc" ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+hmac utf8 "abc" nBluMtwBdfhvSxy4konWYZ3mvuaZ5MN45oMJ7Zehpqs=
+hash  "abc" ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+hmac  "abc" nBluMtwBdfhvSxy4konWYZ3mvuaZ5MN45oMJ7Zehpqs=
