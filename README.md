@@ -175,7 +175,7 @@ working laptop under load, and the Linux box is slower per core but idle.
 Read each machine's table against itself, never across the two. The Linux
 Node is four major versions behind, and `performance.now` costs far more per
 call on that kernel, which is why its pause totals read in seconds for all
-three runtimes. Same tree, same tests, same 66 fixtures passing on both.
+three runtimes. Same tree, same tests, same 95 fixtures passing on both.
 
 How each row is measured: throughput rows are the harness's own 1,000-run
 medians. The two startup rows are 20 interleaved launches per runtime, quoted

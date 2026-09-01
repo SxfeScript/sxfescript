@@ -527,9 +527,12 @@ static void sxn_report_uncaught(JSContext *ctx) {
 
 /* Both halves of the rejection tracker are handed to JavaScript, which keeps
    the list and decides when a rejection has gone unhandled for good. */
+extern int sxn_rejections_pending;   /* src/network.c, read by its loop */
+
 static void sxn_rejection_tracker(JSContext *ctx, JSValueConst promise,
                                   JSValueConst reason, bool is_handled, void *opaque) {
     (void)opaque;
+    if (!is_handled) sxn_rejections_pending = 1;
     JSValue global = JS_GetGlobalObject(ctx);
     JSValue fn = JS_GetPropertyStr(ctx, global,
                                    is_handled ? "__sxnRejectionHandled" : "__sxnRejectionRaised");

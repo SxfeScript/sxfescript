@@ -2554,6 +2554,22 @@ static void sxn_spawn_exit(uv_process_t *proc, int64_t status, int signal) {
     uv_close((uv_handle_t *)proc, NULL);
 }
 
+/* A loop that is closed while a handle is still registered leaves libuv's
+   own child-process bookkeeping behind it, and the next uv_spawn walks into
+   what is left: on Linux that is a segfault, not a leak. So everything still
+   open is closed, the loop is run until those closes complete, and only then
+   is it closed. */
+static void sxn_spawn_close_walk(uv_handle_t *handle, void *arg) {
+    (void)arg;
+    if (!uv_is_closing(handle)) uv_close(handle, NULL);
+}
+
+static void sxn_spawn_teardown(uv_loop_t *loop) {
+    uv_walk(loop, sxn_spawn_close_walk, NULL);
+    while (uv_run(loop, UV_RUN_DEFAULT) != 0) { }
+    uv_loop_close(loop);
+}
+
 static void sxn_spawn_written(uv_write_t *req, int status) {
     (void)status;
     uv_close((uv_handle_t *)req->handle, NULL);
@@ -2657,8 +2673,7 @@ static JSValue js_spawn_sync(JSContext *ctx, JSValueConst this_val, int argc, JS
         uv_close((uv_handle_t *)&in_pipe, NULL);
         uv_close((uv_handle_t *)&out_pipe, NULL);
         uv_close((uv_handle_t *)&err_pipe, NULL);
-        uv_run(&loop, UV_RUN_DEFAULT);
-        uv_loop_close(&loop);
+        sxn_spawn_teardown(&loop);
         JS_SetPropertyStr(ctx, result, "error", JS_NewString(ctx, uv_strerror(rc)));
         JS_SetPropertyStr(ctx, result, "errno", JS_NewString(ctx, uv_err_name(rc)));
         JS_SetPropertyStr(ctx, result, "status", JS_NULL);
@@ -2668,17 +2683,15 @@ static JSValue js_spawn_sync(JSContext *ctx, JSValueConst this_val, int argc, JS
         if (input) {
             uv_write_t *req = calloc(1, sizeof(*req));
             uv_buf_t buf = uv_buf_init((char *)input, (unsigned int)input_len);
-            if (uv_write(req, (uv_stream_t *)&in_pipe, &buf, 1, sxn_spawn_written) != 0) {
+            if (!req || uv_write(req, (uv_stream_t *)&in_pipe, &buf, 1, sxn_spawn_written) != 0) {
                 free(req);
                 uv_close((uv_handle_t *)&in_pipe, NULL);
-            } else {
-                uv_run(&loop, UV_RUN_DEFAULT);
             }
         } else {
             uv_close((uv_handle_t *)&in_pipe, NULL);
         }
         uv_run(&loop, UV_RUN_DEFAULT);
-        uv_loop_close(&loop);
+        sxn_spawn_teardown(&loop);
         JS_SetPropertyStr(ctx, result, "pid", JS_NewInt32(ctx, proc.pid));
         JS_SetPropertyStr(ctx, result, "status",
                           exit_state.signal ? JS_NULL : JS_NewInt64(ctx, exit_state.status));
@@ -3047,8 +3060,16 @@ JSValue sxn_await_with_loop(JSContext *ctx, JSValue obj) {
     }
 }
 
+/* Set by the rejection tracker in src/main.c when a promise is rejected with
+   nothing watching it. The loop below runs on every batch of I/O, so it asks
+   this variable rather than the global object: with no rejection in flight
+   the whole report costs one comparison. */
+int sxn_rejections_pending = 0;
+
 /* Calls the JavaScript half of the rejection report, if it is installed. */
 static void sxn_flush_rejections(JSContext *ctx) {
+    if (!sxn_rejections_pending) return;
+    sxn_rejections_pending = 0;
     JSValue global = JS_GetGlobalObject(ctx);
     JSValue fn = JS_GetPropertyStr(ctx, global, "__sxnFlushRejections");
     if (JS_IsFunction(ctx, fn)) {
