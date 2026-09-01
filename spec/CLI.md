@@ -11,7 +11,10 @@
 - `sxn add [--dev] package[@range]` adds and installs a dependency.
 - `sxn remove package` removes a dependency.
 - `sxn init` creates a minimal package.
-- `sxn lsp --stdio` runs the language server transport.
+- `sxn lsp --stdio` runs the language server transport. It answers
+  `textDocument/semanticTokens/full` with the ownership keywords -- `safe`
+  where it qualifies a declaration, `mut`, `unsafe`, `extern`, and the `&`
+  of a `&mut` borrow -- and null to every other request.
 
 Extensionless resolution order (an import or require with no extension, or a
 bare directory) is `.sx`, `.mjs`, `.js`, `.cjs`, `.json`, `.node`, `.ts`, then

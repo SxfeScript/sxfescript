@@ -94,10 +94,11 @@ green Release run until it aborted the first Debug one.
 
 The repository contains a working QuickJS-backed CLI, an in-memory `.sx`
 frontend, fixed-layout arena primitives, package workflow commands, an LSP
-transport, VS Code language packaging, specifications, and tests. The native
-opcode lowering, full control-flow ownership pass, native npm registry backend,
-and semantic LSP features are tracked in `spec/IMPLEMENTATION.md` and are not
-yet represented as complete production implementations.
+transport that answers semantic-token requests, VS Code language packaging,
+specifications, and tests. The native opcode lowering, full control-flow
+ownership pass, native npm registry backend, and the remaining semantic LSP
+features are tracked in `spec/IMPLEMENTATION.md` and are not yet represented as
+complete production implementations.
 
 ## What the runtime does
 

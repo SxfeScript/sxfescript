@@ -4,10 +4,12 @@
   "scopeName": "source.sxfe",
   "patterns": [
     { "include": "#comments" },
-    { "name": "keyword.control.sxfe", "match": "\\b(unsafe|if|else|for|while|return|throw|try|catch|finally|await|async)\\b" },
+    { "comment": "`safe` belongs in this list by every appearance, and is deliberately left out of it. It is a keyword only where it qualifies a let or const declaration and an ordinary name everywhere else, which no regex here can tell apart. The server in src/lsp.c decides it with the compiler's own rule and sends back a semantic token, which the editor draws over this grammar.",
+      "name": "keyword.control.sxfe", "match": "\\b(unsafe|extern|if|else|for|while|return|throw|try|catch|finally|await|async)\\b" },
     { "name": "storage.modifier.sxfe", "match": "\\b(let\\s+mut|let|const|interface|type|mut)\\b" },
     { "name": "storage.type.sxfe", "match": "\\b(i32|f32|f64|bool|void)\\b" },
-    { "name": "keyword.operator.borrow.sxfe", "match": "&(mut\\b)?" },
+    { "comment": "The sigil only. `mut` after it is the same keyword it is after `let`, and is scoped as one by the rule above.",
+      "name": "keyword.operator.borrow.sxfe", "match": "&" },
     { "name": "string.quoted.double.sxfe", "begin": "\"", "end": "\"", "patterns": [{ "match": "\\\\.", "name": "constant.character.escape.sxfe" }] },
     { "name": "string.quoted.single.sxfe", "begin": "'", "end": "'", "patterns": [{ "match": "\\\\.", "name": "constant.character.escape.sxfe" }] },
     { "name": "constant.numeric.sxfe", "match": "\\b(?:0x[0-9a-fA-F]+|\\d+(?:\\.\\d+)?)\\b" }

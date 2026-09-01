@@ -15,7 +15,13 @@
 - Module-loader hook that transforms imported `.sx` modules in memory.
 - Package command surface with safe argument validation, disabled lifecycle
   scripts, and a bootstrap npm-compatible backend.
-- LSP JSON-RPC transport and VS Code language registration.
+- LSP JSON-RPC transport, VS Code language registration, and semantic
+  tokens for the ownership keywords. The tokens exist because `safe` is a
+  keyword only where it qualifies a `let` or `const`, which a TextMate
+  grammar cannot decide; the server applies the frontend's own rule and the
+  editor draws the answer over the grammar. `mut`, `unsafe`, `extern`, and
+  the `&` of a `&mut` borrow are sent with it so the whole vocabulary is
+  colored by one decision rather than two.
 - Contextual `safe let`/`safe const` compatibility parsing and CLI
   `--memory-report`/`--leak-check` diagnostics using QuickJS accounting.
 - `Sxn.ffi` is implemented on libffi and `dlopen`: scalars, pointers and
@@ -358,7 +364,9 @@ Architectural work with no shortcut, still outstanding:
   revocable interop proxies, and typed native registration to QuickJS.
 - Replace the npm bootstrap delegation with the pinned native registry,
   integrity, extraction, resolver, lockfile, and trusted-hook implementation.
-- Implement semantic LSP requests and parser-conformance sharing.
+- Implement the remaining semantic LSP requests -- hover, definition,
+  references, rename, formatting, completion, and document symbols all
+  answer null today -- and parser-conformance sharing.
 - The complete platform CI matrix.
 
 What used to be listed here and now isn't: libuv-backed Node-compatible

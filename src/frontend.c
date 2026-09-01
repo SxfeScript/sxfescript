@@ -26,14 +26,6 @@ static int append(Buffer *buffer, const char *data, size_t length) {
     return 0;
 }
 
-static bool ident_start(char c) { return isalpha((unsigned char)c) || c == '_' || c == '$'; }
-static bool ident_char(char c) { return isalnum((unsigned char)c) || c == '_' || c == '$'; }
-static bool word_at(const char *s, size_t n, size_t i, const char *word) {
-    size_t w = strlen(word);
-    return i + w <= n && !memcmp(s + i, word, w) &&
-           (i == 0 || !ident_char(s[i - 1])) && (i + w == n || !ident_char(s[i + w]));
-}
-
 static void location(const char *source, size_t offset, size_t *line, size_t *column) {
     *line = 1; *column = 1;
     for (size_t i = 0; i < offset; ++i) {
@@ -57,27 +49,6 @@ static int diagnostic(SxfeCompileResult *out, const char *source, SxfeDiagnostic
     return 0;
 }
 
-static size_t skip_string(const char *source, size_t length, size_t i) {
-    char quote = source[i++];
-    while (i < length) {
-        if (source[i] == '\\') { i += i + 1 < length ? 2 : 1; continue; }
-        if (source[i++] == quote) break;
-    }
-    return i;
-}
-
-static size_t skip_comment(const char *source, size_t length, size_t i) {
-    if (i + 1 >= length || source[i] != '/') return i;
-    if (source[i + 1] == '/') {
-        i += 2; while (i < length && source[i] != '\n') ++i; return i;
-    }
-    if (source[i + 1] == '*') {
-        i += 2; while (i + 1 < length && !(source[i] == '*' && source[i + 1] == '/')) ++i;
-        return i + (i + 1 < length ? 2 : 0);
-    }
-    return i;
-}
-
 /* SX deliberately accepts only erasable TypeScript. Constructs that require emit are rejected. */
 static void validate_unsupported(const char *source, size_t length, SxfeCompileResult *out) {
     const char *words[] = { "enum", "namespace", "decorator", "abstract" };
@@ -85,11 +56,11 @@ static void validate_unsupported(const char *source, size_t length, SxfeCompileR
     /* Skip string/comment bodies so an occurrence of these words inside them
        (e.g. a "// TODO: support enum" comment) doesn't misfire. */
     for (size_t i = 0; i < length; ) {
-        if (source[i] == '\'' || source[i] == '"' || source[i] == '`') { i = skip_string(source, length, i); continue; }
-        size_t comment = skip_comment(source, length, i);
+        if (source[i] == '\'' || source[i] == '"' || source[i] == '`') { i = sxfe_skip_string(source, length, i); continue; }
+        size_t comment = sxfe_skip_comment(source, length, i);
         if (comment != i) { i = comment; continue; }
         for (size_t w = 0; w < sizeof(words) / sizeof(words[0]); ++w) {
-            if (!reported[w] && word_at(source, length, i, words[w])) {
+            if (!reported[w] && sxfe_word_at(source, length, i, words[w])) {
                 char message[160];
                 snprintf(message, sizeof(message), "'%s' requires TypeScript code generation and is not supported in .sx", words[w]);
                 diagnostic(out, source, SX1001_UNSUPPORTED_SYNTAX, i, message);
@@ -104,8 +75,8 @@ static size_t skip_declaration(const char *source, size_t length, size_t i) {
     int braces = 0;
     bool saw_brace = false;
     while (i < length) {
-        if (source[i] == '\'' || source[i] == '"' || source[i] == '`') { i = skip_string(source, length, i); continue; }
-        size_t comment = skip_comment(source, length, i);
+        if (source[i] == '\'' || source[i] == '"' || source[i] == '`') { i = sxfe_skip_string(source, length, i); continue; }
+        size_t comment = sxfe_skip_comment(source, length, i);
         if (comment != i) { i = comment; continue; }
         if (source[i] == '{') { ++braces; saw_brace = true; }
         else if (source[i] == '}') { if (--braces <= 0 && saw_brace) return i + 1; }
@@ -120,7 +91,7 @@ static bool likely_type_at(const char *source, size_t length, size_t i) {
     if (source[i] == '&') return true;
     if (isupper((unsigned char)source[i])) return true;
     const char *types[] = { "i32", "f32", "f64", "bool", "void", "string", "number", "boolean", "unknown", "any", "never" };
-    for (size_t n = 0; n < sizeof(types) / sizeof(types[0]); ++n) if (word_at(source, length, i, types[n])) return true;
+    for (size_t n = 0; n < sizeof(types) / sizeof(types[0]); ++n) if (sxfe_word_at(source, length, i, types[n])) return true;
     return false;
 }
 
@@ -148,26 +119,26 @@ int sxfe_compile(const char *source, size_t length, SxfeCompileResult *out) {
     bool declaration_context = false;
     for (size_t i = 0; i < length;) {
         if (source[i] == '\'' || source[i] == '"' || source[i] == '`') {
-            size_t end = skip_string(source, length, i);
+            size_t end = sxfe_skip_string(source, length, i);
             if (append(&result, source + i, end - i)) goto oom;
             i = end; continue;
         }
-        size_t comment = skip_comment(source, length, i);
+        size_t comment = sxfe_skip_comment(source, length, i);
         if (comment != i) { if (append(&result, source + i, comment - i)) goto oom; i = comment; continue; }
-        if (word_at(source, length, i, "interface") || word_at(source, length, i, "type")) {
+        if (sxfe_word_at(source, length, i, "interface") || sxfe_word_at(source, length, i, "type")) {
             size_t end = skip_declaration(source, length, i);
             for (size_t p = i; p < end; ++p) if (source[p] == '\n' && append(&result, "\n", 1)) goto oom;
             i = end; continue;
         }
         /* Primitive FFI declarations are lowered to a host call until the
            native SX parser grows first-class FFI bytecodes. */
-        if (word_at(source, length, i, "extern") || word_at(source, length, i, "using")) {
+        if (sxfe_word_at(source, length, i, "extern") || sxfe_word_at(source, length, i, "using")) {
             size_t end = i;
             while (end < length && source[end] != ';') ++end;
             if (end < length) ++end;
-            size_t p = i + (word_at(source, length, i, "extern") ? 6 : 5);
+            size_t p = i + (sxfe_word_at(source, length, i, "extern") ? 6 : 5);
             while (p < end && isspace((unsigned char)source[p])) ++p;
-            size_t ns = p; while (p < end && ident_char(source[p])) ++p;
+            size_t ns = p; while (p < end && sxfe_ident_char(source[p])) ++p;
             size_t name_len = p - ns;
             const char *from = strstr(source + p, "from");
             const char *quote = from ? strchr(from, '"') : NULL;
@@ -203,28 +174,28 @@ int sxfe_compile(const char *source, size_t length, SxfeCompileResult *out) {
         /* `safe` is a contextual declaration qualifier.  It is intentionally
            erased by the compatibility frontend; the native SX parser will
            attach the type contract to the resulting binding. */
-        if (word_at(source, length, i, "safe")) {
+        if (sxfe_word_at(source, length, i, "safe")) {
             size_t j = i + 4;
             while (j < length && isspace((unsigned char)source[j])) ++j;
-            if (word_at(source, length, j, "let") || word_at(source, length, j, "const")) {
+            if (sxfe_word_at(source, length, j, "let") || sxfe_word_at(source, length, j, "const")) {
                 i = j;
                 if (append(&result, "", 0)) goto oom;
                 continue;
             }
-            if (word_at(source, length, j, "var")) {
+            if (sxfe_word_at(source, length, j, "var")) {
                 diagnostic(out, source, SX1002_INVALID_TYPE, i,
                            "safe may qualify only let or const declarations");
             }
         }
-        if (word_at(source, length, i, "let") || word_at(source, length, i, "const") || word_at(source, length, i, "var")) declaration_context = true;
-        if (word_at(source, length, i, "let")) {
+        if (sxfe_word_at(source, length, i, "let") || sxfe_word_at(source, length, i, "const") || sxfe_word_at(source, length, i, "var")) declaration_context = true;
+        if (sxfe_word_at(source, length, i, "let")) {
             if (append(&result, "let", 3)) goto oom; i += 3;
             size_t ws = i; while (i < length && isspace((unsigned char)source[i])) ++i;
-            if (word_at(source, length, i, "mut")) { i += 3; if (append(&result, " ", 1)) goto oom; }
+            if (sxfe_word_at(source, length, i, "mut")) { i += 3; if (append(&result, " ", 1)) goto oom; }
             else if (append(&result, source + ws, i - ws)) goto oom;
             continue;
         }
-        if (word_at(source, length, i, "unsafe")) { i += 6; continue; }
+        if (sxfe_word_at(source, length, i, "unsafe")) { i += 6; continue; }
         if (source[i] == '&') {
             if (i + 1 < length && source[i + 1] == '&') {
                 if (append(&result, "&&", 2)) goto oom;
@@ -232,7 +203,7 @@ int sxfe_compile(const char *source, size_t length, SxfeCompileResult *out) {
                 continue;
             }
             ++i; while (i < length && isspace((unsigned char)source[i])) ++i;
-            if (word_at(source, length, i, "mut")) { i += 3; while (i < length && isspace((unsigned char)source[i])) ++i; }
+            if (sxfe_word_at(source, length, i, "mut")) { i += 3; while (i < length && isspace((unsigned char)source[i])) ++i; }
             continue;
         }
         if (source[i] == '(') { ++paren_depth; if (append(&result, source + i++, 1)) goto oom; continue; }

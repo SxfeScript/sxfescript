@@ -1,0 +1,13 @@
+Content-Length: 75
+
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}Content-Length: 52
+
+{"jsonrpc":"2.0","method":"initialized","params":{}}Content-Length: 219
+
+{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///t.sx","languageId":"sxfe","version":1,"text":"safe let mut a = 0;\nbump(&mut a);\n// mut here is a comment\nconst safe = 1;\n"}}}Content-Length: 117
+
+{"jsonrpc":"2.0","id":2,"method":"textDocument/semanticTokens/full","params":{"textDocument":{"uri":"file:///t.sx"}}}Content-Length: 58
+
+{"jsonrpc":"2.0","id":3,"method":"shutdown","params":null}Content-Length: 33
+
+{"jsonrpc":"2.0","method":"exit"}

@@ -85,24 +85,48 @@ def expand_includes(text):
 
 
 # GitHub has no highlighter for .sx, and an ```sx fence comes back as flat
-# unhighlighted text. TypeScript's covers the language almost exactly -- it is
-# JavaScript plus the same annotation syntax -- so the fence is relabelled on
-# the way in and the three keywords TypeScript does not know are re-tagged as
-# keywords on the way out. The markdown files stay honest and say `sx`.
+# unhighlighted text. Rust's is the closest one it has, and the same one
+# .gitattributes points the file browser at, so the fence is relabelled on the
+# way in and the site matches what a reader sees browsing the repository. The
+# markdown files stay honest and say `sx`.
 SX_FENCE_RE = re.compile(r"^```sx$", re.M)
-SX_KEYWORDS = ("mut", "safe", "unsafe")
+
+# Rust colors `let`, `mut`, `unsafe`, and `extern`, but only where its parser
+# still follows the code; a line of plain JavaScript defeats it and that line's
+# keywords come back as bare text. Promote them on the way out so a keyword
+# looks like one wherever it appears. `safe` Rust has no notion of at all.
+# src/lsp.c makes `safe` a keyword only before `let` or `const`, which is the
+# compiler's rule; drawing the same distinction is not worth it here, where the
+# only code rendered is this repository's own documentation.
+SX_KEYWORDS = ("unsafe", "extern", "safe", "mut")
+SX_WORD_RE = re.compile(r"(?<![\w$])(" + "|".join(SX_KEYWORDS) + r")(?![\w$])")
+SX_BLOCK_RE = re.compile(r'<div class="highlight highlight-source-rust">.*?</div>', re.S)
 
 
 def retag_sx_keywords(body):
-    for word in SX_KEYWORDS:
-        body = body.replace(f'<span class="pl-s1">{word}</span>',
-                            f'<span class="pl-k">{word}</span>')
-    return body
+    """Tag the keywords Rust left bare, in rendered code blocks only. Text
+    inside a span has already been classified -- as a comment or a string, most
+    of the time -- so only text at span depth zero is rewritten, and the word
+    `mut` in a sentence of prose keeps its plain styling."""
+    def block(match):
+        depth, out = 0, []
+        for part in re.split(r"(<[^>]*>)", match.group(0)):
+            if part.startswith("<"):
+                if part.startswith("</span"):
+                    depth -= 1
+                elif part.startswith("<span"):
+                    depth += 1
+            elif depth == 0:
+                part = SX_WORD_RE.sub(r'<span class="pl-k">\1</span>', part)
+            out.append(part)
+        return "".join(out)
+
+    return SX_BLOCK_RE.sub(block, body)
 
 
 def render_markdown(text):
     """GitHub's own renderer, through gh so the call is authenticated."""
-    text = SX_FENCE_RE.sub("```ts", text)
+    text = SX_FENCE_RE.sub("```rust", text)
     try:
         out = subprocess.run(
             ["gh", "api", "-X", "POST", "/markdown", "-f", "mode=markdown", "-f", "text=" + text],

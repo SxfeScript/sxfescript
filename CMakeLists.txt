@@ -167,6 +167,10 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   endif()
   add_test(NAME sxfe-frontend COMMAND sxfe-tests)
   add_test(NAME sxn-help COMMAND sxn --help)
+  add_test(NAME sxn-lsp-semantic-tokens COMMAND ${CMAKE_COMMAND}
+    -DSXN=$<TARGET_FILE:sxn>
+    -DFIXTURE=${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/lsp-semantic-tokens.jsonrpc
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/LspSemanticTokens.cmake)
   add_test(NAME sxn-example COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/examples/velocity.sx)
   # The docs site inlines every one of these programs verbatim, so an example
   # that stops running is a broken code block published to the web. fetch.sx

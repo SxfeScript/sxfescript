@@ -1,15 +1,56 @@
 #ifndef SXFE_H
 #define SXFE_H
 
+#include <ctype.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #define SXFE_VERSION "0.0.1"
+
+/* The lexical rules the frontend (src/frontend.c) and the LSP's semantic
+   highlighter (src/lsp.c) both scan by. They live here rather than in either
+   file because the two must agree: a word the compiler treats as the `mut` or
+   `safe` keyword is exactly the word the editor should color as one, and an
+   occurrence inside a string or a comment is neither. */
+static inline bool sxfe_ident_char(char c) { return isalnum((unsigned char)c) || c == '_' || c == '$'; }
+
+/* True when `word` sits at s[i] as a whole word rather than inside a longer
+   identifier, so "unsafe" does not match a search for "safe". */
+static inline bool sxfe_word_at(const char *s, size_t n, size_t i, const char *word) {
+    size_t w = strlen(word);
+    return i + w <= n && !memcmp(s + i, word, w) &&
+           (i == 0 || !sxfe_ident_char(s[i - 1])) && (i + w == n || !sxfe_ident_char(s[i + w]));
+}
+
+/* Index just past the string literal opening at s[i], which the caller has
+   already checked is a quote. Handles ' " and ` alike, and backslash escapes. */
+static inline size_t sxfe_skip_string(const char *s, size_t n, size_t i) {
+    char quote = s[i++];
+    while (i < n) {
+        if (s[i] == '\\') { i += i + 1 < n ? 2 : 1; continue; }
+        if (s[i++] == quote) break;
+    }
+    return i;
+}
+
+/* Index just past the comment at s[i], or i unchanged when none starts there. */
+static inline size_t sxfe_skip_comment(const char *s, size_t n, size_t i) {
+    if (i + 1 >= n || s[i] != '/') return i;
+    if (s[i + 1] == '/') {
+        i += 2; while (i < n && s[i] != '\n') ++i; return i;
+    }
+    if (s[i + 1] == '*') {
+        i += 2; while (i + 1 < n && !(s[i] == '*' && s[i + 1] == '/')) ++i;
+        return i + (i + 1 < n ? 2 : 0);
+    }
+    return i;
+}
 
 /* Length of the absolute-path root at p: 0 if relative, 1 for POSIX's
    leading '/', or 3 for a Windows drive letter (`C:/` or `C:\`). Used by
