@@ -17,10 +17,13 @@ same surface those runtimes implement.
 
 `sxn file.sx` runs an SxfeScript file — ordinary JavaScript plus explicit
 mutation, affine values, and borrow sigils, parsed natively with no separate
-transform step (`spec/LANGUAGE.md`). `sxn file.ts` strips TypeScript types and
-runs the result, also natively, with no build step. `sxn file.js` / `.mjs` /
-`.cjs` run plain JavaScript. All four import each other freely: a `.sx`
-module can `import` a `.ts` module and vice versa.
+transform step (`spec/LANGUAGE.md`). `sxn file.ts` parses TypeScript types
+natively and runs the result, also with no build step; no code is emitted for
+an annotation, but a declared scalar type is recorded rather than discarded
+and spent on the bytecode that comes out (`spec/LANGUAGE.md`,
+`spec/PERFORMANCE.md`). `sxn file.js` / `.mjs` / `.cjs` run plain JavaScript.
+All four import each other freely: a `.sx` module can `import` a `.ts` module
+and vice versa.
 
 Module-or-script is decided the way Node decides it — see spec/NODE.md — with
 one exception: `.sx` and `.ts` are always modules, because type stripping is

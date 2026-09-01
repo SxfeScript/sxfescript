@@ -1,0 +1,50 @@
+// `safe` now specializes on the type that was declared, not on the `safe`
+// keyword alone. i32 wraps at the boundary by definition; every other
+// annotation, and an un-annotated `safe`, keeps exact JavaScript arithmetic
+// where 2^31-1 + 1 promotes to a double.
+//
+// Both right-hand-side shapes matter: a constant and a local used to compile
+// through different peephole branches and disagreed with each other.
+
+let failures = 0;
+function check(name: string, actual: number, expected: number): void {
+  if (actual !== expected) {
+    console.log("FAIL", name, "expected", expected, "got", actual);
+    failures += 1;
+  }
+}
+
+function i32ConstRhs(): number { safe let mut n: i32 = 2147483647; n += 1; return n; }
+function i32LocalRhs(): number { safe let mut n: i32 = 2147483647; let one = 1; n += one; return n; }
+function f64ConstRhs(): number { safe let mut d: f64 = 2147483647; d += 1; return d; }
+function f64LocalRhs(): number { safe let mut d: f64 = 2147483647; let one = 1; d += one; return d; }
+function bareConstRhs(): number { safe let mut u = 2147483647; u += 1; return u; }
+function bareLocalRhs(): number { safe let mut u = 2147483647; let one = 1; u += one; return u; }
+function plainLet(): number { let x = 2147483647; let one = 1; x += one; return x; }
+
+check("i32 const rhs wraps", i32ConstRhs(), -2147483648);
+check("i32 local rhs wraps", i32LocalRhs(), -2147483648);
+check("f64 const rhs promotes", f64ConstRhs(), 2147483648);
+check("f64 local rhs promotes", f64LocalRhs(), 2147483648);
+check("un-annotated safe promotes", bareConstRhs(), 2147483648);
+check("un-annotated safe promotes", bareLocalRhs(), 2147483648);
+check("plain let promotes", plainLet(), 2147483648);
+
+// The fused counting loop is still reached by a declared i32 accumulator.
+function fused(): number {
+  safe let mut total: i32 = 0;
+  for (let i = 0; i < 1000; i++) total += i;
+  return total;
+}
+check("fused i32 loop", fused(), 499500);
+
+// A declared f64 accumulator must not reach it, and must stay exact.
+function notFused(): number {
+  safe let mut total: f64 = 0;
+  for (let i = 0; i < 3; i++) total += 0.5;
+  return total;
+}
+check("f64 loop stays exact", notFused(), 1.5);
+
+if (failures !== 0) throw new Error(failures + " typed-overflow checks failed");
+console.log("typed overflow: all checks passed");

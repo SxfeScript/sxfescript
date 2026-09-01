@@ -1,0 +1,12 @@
+// `&mut` is an exclusive borrow and requires a mutable owner
+// (spec/LANGUAGE.md). `value` is a plain `let`, so this must not compile.
+interface Counter {
+  hits: i32;
+}
+
+function bump(c: &mut Counter): void {
+  c.hits += 1;
+}
+
+let value: Counter = { hits: 0 };
+bump(&mut value);

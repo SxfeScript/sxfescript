@@ -345,8 +345,8 @@ What's left in the EventEmitter gap is the interpreted-bytecode floor for
 general listener bodies. The benchmark's numeric accumulator takes a native
 fast path and now a fused call site as well, but arbitrary listeners still
 require an interpreter frame. A JIT is the usual way to remove that frame,
-and it's ruled out here; closing the gap some other way is open, and hasn't
-been attempted yet.
+and it's ruled out here; closing the gap some other way is open, and the
+declared-signature inlining below is the first thing that has removed one.
 
 ## Startup
 
@@ -370,3 +370,54 @@ closed by ablation rather than implemented, each with a measured ceiling of
 zero; `spec/IMPLEMENTATION.md` records the method and the numbers. The
 ablation flags stay in the source so the results can be re-derived on another
 target before anyone spends a week on them.
+
+## The declared types buy something, and it is the call frame
+
+Every annotation used to be stripped, so `safe` was the only fact reaching
+codegen and it did not carry which type had been written. Recording the type
+instead let the same specialization be aimed properly, and let a second one
+exist at all. Measured on the Mac, minimum of 9 runs over 5M iterations,
+reported per loop iteration:
+
+| | sxn | Node 25.2 | Bun 1.2.17 |
+|---|---|---|---|
+| empty loop | 4.0 ns | 0.27 | 0.23 |
+| interpreted call, 0 args | 14.4 ns | -- | -- |
+| interpreted call, 2 args | 16.3 ns | 0.37 | 0.22 |
+| field read + write | 11.9 ns | 0.27 | 0.22 |
+| f64 accumulate | 5.9 ns | 0.53 | 0.54 |
+
+Read that the way this document reads every JIT row: Node and Bun delete these
+loops outright, so no interpreter change reaches 0.3 ns. What the table
+locates is where this runtime's own time goes. A call costs about 10.4 ns
+before an argument is passed and 1.7 ns per argument after; a field access is
+2.6 ns; arithmetic is already within 2 ns of the dispatch floor. Typed and
+untyped field access measured 11.76 and 11.67 ns, the same number, which is
+what "the annotations bought nothing" meant concretely.
+
+Hand-inlining a small typed function gave the exact upper bound for removing
+the frame -- 17.1 ns to 5.4 for a two-argument `i32` add -- and unlike the
+ablations below, that bound was not zero. A call whose callee is a local
+written once by an `fclosure`, never captured, with every parameter and the
+return declared scalar, and whose body loads each parameter once in order and
+then runs only operand-free arithmetic, is now spliced into its caller at the
+pass-2 peephole. `benchmarks/engine/call_inline_probe.sx`:
+
+| | ns/op |
+|---|---|
+| empty loop | 4.07 |
+| untyped call | 16.34 |
+| typed call, inlined | 5.31 |
+| hand-inlined ceiling | 5.38 |
+
+16.34 to 5.31 ns, 3.1x, landing on the ceiling. Against Node's 0.37 ns that is
+a 44x gap narrowed to 14x, and it should be quoted that way. It needs no
+opcode, which matters because the opcode space is full -- the template-literal
+`concat` op above took the last slot. Plain JavaScript never qualifies: the
+gate is the declared signature, so a `.js` file is untouched.
+
+Two limits are worth stating rather than discovering. The splice needs the
+body to load every parameter once in declaration order, so anything reusing a
+parameter still pays for its frame. And an inlined callee no longer appears in
+a stack trace if its arithmetic throws, which is the tradeoff every inlining
+compiler makes.

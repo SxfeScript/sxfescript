@@ -186,6 +186,24 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   add_test(NAME sxn-sx-module COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/import-main.sx)
   add_test(NAME sxn-reject-enum COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/reject-enum.sx)
   set_tests_properties(sxn-reject-enum PROPERTIES WILL_FAIL TRUE)
+  # `&mut` requires a mutable owner. The legal direction is covered by
+  # sxn-example (velocity.sx) and sxn-example-hello, both of which borrow a
+  # `let mut`; this is the rejection side.
+  add_test(NAME sxn-reject-mut-borrow COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/reject-mut-borrow.sx)
+  set_tests_properties(sxn-reject-mut-borrow PROPERTIES WILL_FAIL TRUE)
+  # `safe` specializes on the declared type, so i32 wraps and every other
+  # annotation keeps exact JS arithmetic. Both right-hand-side shapes are
+  # covered: a constant and a local compile through different peephole
+  # branches and used to disagree.
+  add_test(NAME sxn-typed-overflow COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/typed_overflow.sx)
+  set_tests_properties(sxn-typed-overflow PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # A call to a small function with a declared scalar signature is spliced
+  # into its caller. This asserts the splice changes nothing observable: same
+  # values, same coercions, same exceptions, and no splice at all when the
+  # binding is reassigned, captured, or the shape does not qualify. Every
+  # expected value here is Node's, checked with the annotations stripped.
+  add_test(NAME sxn-typed-inline COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/typed_inline.sx)
+  set_tests_properties(sxn-typed-inline PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   # Regression coverage: SX's contextual `interface` grammar hook must not
   # leak into ordinary .cjs execution (see update_token_ident in quickjs.c).
   add_test(NAME sxn-interface-ident COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/interface-ident.cjs)
