@@ -14,6 +14,10 @@ const WANT = {
 "once": "1",
 "listener this": "true",
 "remove during emit": "[\"f1\",\"f2\",\"f1\"]",
+"off removes one of two": "2",
+"off removes the second": "1",
+"off keeps the order": "[\"a\",\"c\"]",
+"remove a duplicate during emit": "[\"first\",\"dup\",\"dup\",\"first\",\"dup\"]",
 "throws": "\"RangeError:boom\"",
 "unhandled error": "\"TypeError\"",
 "off/on": "2",
@@ -60,6 +64,21 @@ const p = (n, v) => {
 { const e=new EventEmitter(); const o=[]; const f2=()=>o.push("f2");
   const f1=()=>{o.push("f1"); e.off("x",f2);}; e.on("x",f1); e.on("x",f2);
   e.emit("x"); e.emit("x"); p("remove during emit",o); }
+// off() removes one instance of a listener registered twice, and leaves the
+// order of the rest alone. Outside an emit it closes the list up in place;
+// inside one it has to copy, which these two cases pin.
+{ const e=new EventEmitter(); const f=()=>{};
+  e.on("x",f); e.on("x",f); e.on("x",()=>{}); e.off("x",f);
+  p("off removes one of two", e.listenerCount("x"));
+  e.off("x",f); p("off removes the second", e.listenerCount("x")); }
+{ const e=new EventEmitter(); const o=[];
+  const a=()=>o.push("a"), b=()=>o.push("b"), c=()=>o.push("c");
+  e.on("y",a); e.on("y",b); e.on("y",c); e.off("y",b); e.emit("y");
+  p("off keeps the order", o); }
+{ const e=new EventEmitter(); const o=[]; const dup=()=>o.push("dup");
+  const first=()=>{o.push("first"); e.off("x",dup);};
+  e.on("x",first); e.on("x",dup); e.on("x",dup);
+  e.emit("x"); e.emit("x"); p("remove a duplicate during emit",o); }
 // throwing listener propagates
 { const e=new EventEmitter(); e.on("x",()=>{throw new RangeError("boom");});
   p("throws",(()=>{try{e.emit("x",1);return "no"}catch(err){return err.constructor.name+":"+err.message}})()); }

@@ -401,6 +401,8 @@ static JSValue js_ee_on(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     return JS_DupValue(ctx, this_val);
 }
 
+static int sxn_ee_emit_depth;   /* how many emits are on the stack */
+
 static JSValue js_ee_off(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     sxn_ee_gen++; /* listener set changes: invalidate the emit memo */
     if (argc < 1) return JS_ThrowTypeError(ctx, "expected an event type");
@@ -427,16 +429,60 @@ static JSValue js_ee_off(JSContext *ctx, JSValueConst this_val, int argc, JSValu
         return JS_DupValue(ctx, this_val);
     }
     JSValueConst listener = argc > 1 ? argv[1] : JS_UNDEFINED;
-    JSValue out = JS_NewArray(ctx);
-    uint32_t out_len = 0;
+    /* Node removes the first match only, so the list is scanned until one is
+       found and then closed up in place. This used to build a second array
+       and copy every listener into it, which allocated on every removal and
+       walked the whole list even when the match was the first entry --
+       expensive on an emitter many streams have piped into. */
+    if (sxn_ee_emit_depth > 0) {
+        /* An emit is walking this list: hand it a copy to keep walking. */
+        JSValue kept = JS_NewArray(ctx);
+        uint32_t kept_len = 0;
+        bool dropped = false;
+        for (uint32_t i = 0; i < len; i++) {
+            JSValue l = JS_GetPropertyUint32(ctx, list, i);
+            bool matches = !dropped && JS_IsStrictEqual(ctx, l, listener);
+            if (!matches && !dropped) {
+                JSValue original = JS_GetPropertyStr(ctx, l, "_original");
+                matches = !JS_IsUndefined(original) && JS_IsStrictEqual(ctx, original, listener);
+                JS_FreeValue(ctx, original);
+            }
+            if (matches) { dropped = true; JS_FreeValue(ctx, l); }
+            else JS_SetPropertyUint32(ctx, kept, kept_len++, l);
+        }
+        if (kept_len == 0) JS_DeleteProperty(ctx, events, type, 0);
+        else if (kept_len == 1) {
+            JSValue single = JS_GetPropertyUint32(ctx, kept, 0);
+            JS_SetProperty(ctx, events, type, single);
+        } else {
+            JS_SetProperty(ctx, events, type, JS_DupValue(ctx, kept));
+        }
+        JS_FreeValue(ctx, kept);
+        JS_FreeValue(ctx, list); JS_FreeValue(ctx, events); JS_FreeAtom(ctx, type);
+        return JS_DupValue(ctx, this_val);
+    }
+    uint32_t found = len;
     for (uint32_t i = 0; i < len; i++) {
         JSValue l = JS_GetPropertyUint32(ctx, list, i);
-        JSValue original = JS_GetPropertyStr(ctx, l, "_original");
-        bool matches = JS_IsStrictEqual(ctx, l, listener) || (!JS_IsUndefined(original) && JS_IsStrictEqual(ctx, original, listener));
-        JS_FreeValue(ctx, original);
-        if (matches) JS_FreeValue(ctx, l);
-        else JS_SetPropertyUint32(ctx, out, out_len++, l);
+        bool matches = JS_IsStrictEqual(ctx, l, listener);
+        if (!matches) {
+            /* once() stores a wrapper, and off(original) has to find it. */
+            JSValue original = JS_GetPropertyStr(ctx, l, "_original");
+            matches = !JS_IsUndefined(original) && JS_IsStrictEqual(ctx, original, listener);
+            JS_FreeValue(ctx, original);
+        }
+        JS_FreeValue(ctx, l);
+        if (matches) { found = i; break; }
     }
+    if (found == len) {
+        JS_FreeValue(ctx, list); JS_FreeValue(ctx, events); JS_FreeAtom(ctx, type);
+        return JS_DupValue(ctx, this_val);
+    }
+    for (uint32_t i = found + 1; i < len; i++)
+        JS_SetPropertyUint32(ctx, list, i - 1, JS_GetPropertyUint32(ctx, list, i));
+    uint32_t out_len = len - 1;
+    JS_SetPropertyStr(ctx, list, "length", JS_NewUint32(ctx, out_len));
+    JSValue out = JS_DupValue(ctx, list);
     if (out_len == 0) {
         JS_DeleteProperty(ctx, events, type, 0);
         JS_FreeValue(ctx, out);
@@ -563,6 +609,11 @@ static JSValue js_ee_emit(JSContext *ctx, JSValueConst this_val, int argc, JSVal
         return JS_Throw(ctx, err);
     }
     if (type_owned) JS_FreeAtom(ctx, type);
+    /* A listener removed while this loop is running must not disturb it --
+       Node emits to the set of listeners that existed when emit started. off()
+       reads this depth and copies the list instead of closing it up in place
+       when it is not zero. */
+    sxn_ee_emit_depth++;
     for (uint32_t i = 0; i < n; i++) {
         JSValue l;
         if (fast) {
@@ -574,9 +625,14 @@ static JSValue js_ee_emit(JSContext *ctx, JSValueConst this_val, int argc, JSVal
         }
         JSValue ret = JS_Call(ctx, l, this_val, argc - 1, argv + 1);
         JS_FreeValue(ctx, l);
-        if (JS_IsException(ret)) { if (list_owned) JS_FreeValue(ctx, list); return ret; }
+        if (JS_IsException(ret)) {
+            sxn_ee_emit_depth--;
+            if (list_owned) JS_FreeValue(ctx, list);
+            return ret;
+        }
         JS_FreeValue(ctx, ret);
     }
+    sxn_ee_emit_depth--;
     if (list_owned) JS_FreeValue(ctx, list);
     return JS_NewBool(ctx, true);
 }
@@ -967,6 +1023,13 @@ static JSValue js_path_posix_relative(JSContext *ctx, JSValueConst this_val, int
    which is exactly how the three pairs of Node functions differ. Streaming
    Gzip/Gunzip objects are built on these in node_compat.js, one call per
    chunk boundary being unnecessary because the whole payload is in memory. */
+/* A stream that failed mid-run is not reusable: end it and let the next
+   call build a fresh one. */
+static void sxn_zlib_drop(bool *live, z_stream *zs, bool compress) {
+    if (compress) deflateEnd(zs); else inflateEnd(zs);
+    *live = false;
+}
+
 static JSValue sxn_zlib_run(JSContext *ctx, JSValueConst input,
                             int window_bits, int level, bool compress) {
     size_t in_len = 0;
@@ -978,43 +1041,70 @@ static JSValue sxn_zlib_run(JSContext *ctx, JSValueConst input,
         return JS_ThrowTypeError(ctx, "zlib expects bytes");
     }
 
-    z_stream zs;
-    memset(&zs, 0, sizeof(zs));
-    int rc = compress
-        ? deflateInit2(&zs, level, Z_DEFLATED, window_bits, 8, Z_DEFAULT_STRATEGY)
-        : inflateInit2(&zs, window_bits);
+    /* deflateInit2 allocates the window and the hash tables -- a quarter of
+       a megabyte at these settings -- and deflateEnd gives them straight
+       back, so a run of small compressions spent most of its time in malloc.
+       zlib's own answer is deflateReset, which keeps the state and the
+       settings, so one stream per (direction, window, level) is kept here
+       and reset instead. See spec/NODE.md for the measurement. */
+    static struct {
+        z_stream zs;
+        int window_bits, level;
+        bool live;
+    } cache[2];
+    int slot = compress ? 1 : 0;
+    z_stream *cached = &cache[slot].zs;
+    int rc;
+    if (cache[slot].live && cache[slot].window_bits == window_bits &&
+        (!compress || cache[slot].level == level)) {
+        rc = compress ? deflateReset(cached) : inflateReset(cached);
+    } else {
+        if (cache[slot].live) {
+            compress ? deflateEnd(cached) : inflateEnd(cached);
+            cache[slot].live = false;
+        }
+        memset(cached, 0, sizeof(*cached));
+        rc = compress
+            ? deflateInit2(cached, level, Z_DEFLATED, window_bits, 8, Z_DEFAULT_STRATEGY)
+            : inflateInit2(cached, window_bits);
+        if (rc == Z_OK) {
+            cache[slot].live = true;
+            cache[slot].window_bits = window_bits;
+            cache[slot].level = level;
+        }
+    }
     if (rc != Z_OK) return JS_ThrowInternalError(ctx, "zlib init failed: %d", rc);
 
     size_t cap = in_len < 1024 ? 1024 : in_len * 2;
     uint8_t *out = js_malloc(ctx, cap);
-    if (!out) { compress ? deflateEnd(&zs) : inflateEnd(&zs); return JS_EXCEPTION; }
+    if (!out) { sxn_zlib_drop(&cache[slot].live, cached, compress); return JS_EXCEPTION; }
 
-    zs.next_in = in;
-    zs.avail_in = (uInt)in_len;
+    cached->next_in = in;
+    cached->avail_in = (uInt)in_len;
     size_t produced = 0;
     for (;;) {
         if (produced == cap) {
             size_t ncap = cap * 2;
             uint8_t *grown = js_realloc(ctx, out, ncap);
-            if (!grown) { js_free(ctx, out); compress ? deflateEnd(&zs) : inflateEnd(&zs); return JS_EXCEPTION; }
+            if (!grown) { js_free(ctx, out); sxn_zlib_drop(&cache[slot].live, cached, compress); return JS_EXCEPTION; }
             out = grown; cap = ncap;
         }
-        zs.next_out = out + produced;
-        zs.avail_out = (uInt)(cap - produced);
-        rc = compress ? deflate(&zs, Z_FINISH) : inflate(&zs, Z_FINISH);
-        produced = cap - zs.avail_out;
+        cached->next_out = out + produced;
+        cached->avail_out = (uInt)(cap - produced);
+        rc = compress ? deflate(cached, Z_FINISH) : inflate(cached, Z_FINISH);
+        produced = cap - cached->avail_out;
         if (rc == Z_STREAM_END) break;
         if (rc == Z_OK || rc == Z_BUF_ERROR) {
-            if (zs.avail_out == 0) continue;           /* needs more room */
+            if (cached->avail_out == 0) continue;           /* needs more room */
             if (!compress && rc == Z_BUF_ERROR) break; /* truncated input */
             continue;
         }
         js_free(ctx, out);
-        compress ? deflateEnd(&zs) : inflateEnd(&zs);
+        sxn_zlib_drop(&cache[slot].live, cached, compress);
         return JS_ThrowInternalError(ctx, "zlib %s failed: %d",
                                      compress ? "deflate" : "inflate", rc);
     }
-    compress ? deflateEnd(&zs) : inflateEnd(&zs);
+    /* The stream stays; the next call resets it rather than rebuilding it. */
     JSValue result = JS_NewUint8ArrayCopy(ctx, out, produced);
     js_free(ctx, out);
     return result;

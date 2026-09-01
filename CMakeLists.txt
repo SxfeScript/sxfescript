@@ -366,6 +366,10 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # multi-byte character across chunks.
   add_test(NAME sxn-node-string-decoder COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_string_decoder.mjs)
   set_tests_properties(sxn-node-string-decoder PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # zlib keeps its stream between calls and resets it; the bytes must not
+  # change, across window bits, levels and sizes.
+  add_test(NAME sxn-node-zlib-reuse COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_zlib_reuse.mjs)
+  set_tests_properties(sxn-node-zlib-reuse PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   # util.inspect, native: every kind of value, the depth limit and a cycle.
   add_test(NAME sxn-node-inspect COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_inspect.mjs)
   set_tests_properties(sxn-node-inspect PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")

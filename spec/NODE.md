@@ -355,14 +355,38 @@ JavaScript, so that nothing is left merely assumed:
 | `util.types.isDate` | 0.050 us | one `instanceof` |
 | `net.isIP`, `isIPv4` | 0.050 us | the wrapper around a native call |
 | `url.format` | 0.040 us | `String(url)` |
-| `readable.unpipe` | 0.700 us | Node's is 0.220; it is `off` three times, and `off` is C |
+| `readable.unpipe` | 0.700 us | Node's is 0.300; it is `off` three times, and `off` is C |
 | `url.parse` | 0.900 us | the engine's `new URL` in a try |
 | `createRequire` | 0.900 us | already native underneath |
-| `zlib.gzipSync` of 240 bytes | 2.65 us | zlib itself |
+| `zlib.gzipSync` of 240 bytes | 2.50 us | zlib itself; Node is 3.40 |
 | iterating a buffered stream | 0.380 us | a promise and a result object per item, which is the protocol |
 | `new Readable` / `new Writable` | 0.500 / 0.360 us | field stores, measured slower from C |
 | `res.writeHead` | 0.330 us | `setHeader` in a loop, and that is C |
 | `Buffer.from` an array | 0.375 us | from C it measured 1.185 |
+
+Two of those were then attacked directly, since the user asked.
+
+**zlib.** Every call ran `deflateInit2` and `deflateEnd`, and those allocate
+and free the window and the hash tables -- a quarter of a megabyte at these
+settings -- around a compression of 240 bytes. zlib's own answer is
+`deflateReset`, which keeps the state and the settings, so one stream per
+direction is kept and reset instead; a change of window bits or level throws
+it away and builds a fresh one. `gzipSync` of 240 bytes went from 3.45 to
+2.50 microseconds, `deflateSync` from 2.85 to 2.25, `gunzipSync` from 3.35 to
+2.90. Every one of those is now faster than Node's, which spends 3.40, 3.20
+and 4.05 on the same calls. Swapping zlib for zlib-ng or libdeflate was
+considered and rejected: both are a new dependency, libdeflate cannot stream
+at all, and this code is already ahead of Node without either.
+
+**unpipe.** Removing a listener rebuilt the whole listener array, allocating
+a new one and copying every entry, on every removal. `off` now finds the
+first match and closes the list up in place. The catch is that `emit` walks
+that same array, and Node emits to the set of listeners that existed when it
+started, so `emit` counts its own depth and `off` still takes the copying
+path while an emit is running. Unpiping 20000 sources from one destination
+went from 368 to 58 microseconds a call, against Node's 168; removing a
+listener from a list of 200 went from 4.87 to 1.24 microseconds. An ordinary
+`unpipe`, where the destination has one pipe on it, is unchanged at 0.70.
 
 Nothing in that list is a JavaScript loop any more. What remains in the file
 around them is dispatch: argument shuffling, a check, and a call into
