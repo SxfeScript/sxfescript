@@ -401,7 +401,10 @@ static JSValue js_ee_on(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     return JS_DupValue(ctx, this_val);
 }
 
-static int sxn_ee_emit_depth;   /* how many emits are on the stack */
+/* How many emits are on the stack. Process-wide for the same reason the
+   zlib cache above is, and it only ever chooses between two correct paths
+   in off(), so a stale value would cost speed rather than correctness. */
+static int sxn_ee_emit_depth;
 
 static JSValue js_ee_off(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     sxn_ee_gen++; /* listener set changes: invalidate the emit memo */
