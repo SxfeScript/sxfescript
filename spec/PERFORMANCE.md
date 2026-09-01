@@ -348,6 +348,23 @@ require an interpreter frame. A JIT is the usual way to remove that frame,
 and it's ruled out here; closing the gap some other way is open, and hasn't
 been attempted yet.
 
+## Startup
+
+The Node layer used to register all forty-four `node:` modules at startup --
+a `JSModuleDef` and an atom per export name each -- and to construct every
+module object, whatever the program went on to import. Both now happen when
+something asks: the loader registers a module on the specifier it was handed,
+and the seventeen builtins past the original twenty build their objects on
+first use. Cold start on the Mac, minimum of 150 interleaved launches:
+7.15 -> 6.97 ms.
+
+What is left above the 6.83 ms this measured before the Minimum Common API
+work is `src/bootstrap.js`: `URLPattern`, the compression streams, the stream
+controller classes and the three event-handler properties are built eagerly,
+because a page-shaped global has to be there before the program's first line
+runs. Deferring the node_compat half was worth about 0.2 ms; deferring this
+half would mean a getter per global, and the globals are the surface.
+
 Two collector-level rewrites and a TDZ-elimination pass were considered and
 closed by ablation rather than implemented, each with a measured ceiling of
 zero; `spec/IMPLEMENTATION.md` records the method and the numbers. The
