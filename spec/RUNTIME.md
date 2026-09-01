@@ -164,6 +164,21 @@ that belongs to the engine rather than to Node compatibility.
 `Sxn.file(path)` and `Sxn.write(path, data)` for file I/O in the Bun-style
 idiom; `Sxn.memoryUsage()`; `Sxn.version`.
 
+`Sxn.memoryUsage()` reports the engine allocator's accounting -- `mallocSize`,
+`objects`, `gcCount` and the GC timings -- plus `rss`, which is what the
+operating system says the process holds. The two move independently: the
+system allocator may keep freed pages rather than return them, so `rss` can
+stay high after a collection that reclaimed everything. Assert on
+`mallocSize`; read `rss`.
+
+`Sxn.gc()` collects reference cycles and returns the tracked size left behind.
+Refcounting frees everything else the moment its last reference goes, but a
+cycle -- an object that points at itself, a closure the object it captures
+also holds -- needs the collector, and the collector otherwise runs only when
+an allocation crosses a threshold. A process that stops allocating stops
+collecting, which is why a server is also swept while its event loop is idle;
+see `spec/CLI.md` for `--no-idle-gc` and `--idle-gc-floor`.
+
 ## What's deliberately not here
 
 WebAssembly. It is the one part of the Minimum Common API this runtime does

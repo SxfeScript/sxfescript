@@ -204,6 +204,24 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # expected value here is Node's, checked with the annotations stripped.
   add_test(NAME sxn-typed-inline COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/typed_inline.sx)
   set_tests_properties(sxn-typed-inline PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # Reference cycles are invisible to refcounting and reclaimable only by the
+  # cycle collector, which runs only on allocation. Sxn.gc() is the explicit
+  # ask; this asserts a burst of 100k cyclic closures comes back.
+  add_test(NAME sxn-leak-cycle-stress COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/leak_cycle_stress.sx)
+  set_tests_properties(sxn-leak-cycle-stress PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # And the same reclamation with nobody asking: a daemon that takes a burst
+  # and then waits must give the memory back on its own. Run both ways, since
+  # the whole point of --no-idle-gc is that it does not.
+  add_test(NAME sxn-leak-idle-sweep COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/leak_idle_sweep.mjs)
+  set_tests_properties(sxn-leak-idle-sweep PROPERTIES TIMEOUT 60 FAIL_REGULAR_EXPRESSION "FAIL")
+  add_test(NAME sxn-leak-idle-sweep-off
+           COMMAND sxn --no-idle-gc ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/leak_idle_sweep.mjs --expect-no-sweep)
+  set_tests_properties(sxn-leak-idle-sweep-off PROPERTIES TIMEOUT 60 FAIL_REGULAR_EXPRESSION "FAIL")
+  # Listeners added and never removed are how a server grows one closure at a
+  # time. Every expectation here is Node's: the fixture passes unchanged under
+  # `node tests/fixtures/events_maxlisteners.mjs`.
+  add_test(NAME sxn-events-maxlisteners COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/events_maxlisteners.mjs)
+  set_tests_properties(sxn-events-maxlisteners PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   # Regression coverage: SX's contextual `interface` grammar hook must not
   # leak into ordinary .cjs execution (see update_token_ident in quickjs.c).
   add_test(NAME sxn-interface-ident COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/interface-ident.cjs)

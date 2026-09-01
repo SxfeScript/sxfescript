@@ -421,3 +421,34 @@ body to load every parameter once in declaration order, so anything reusing a
 parameter still pays for its frame. And an inlined callee no longer appears in
 a stack trace if its arithmetic throws, which is the tradeoff every inlining
 compiler makes.
+
+## An idle process never collected
+
+Not a speed result but a memory one, and the counterpart to the zero ceilings
+below: the collector's cadence was worth far more than its mechanism.
+
+Nothing in `src/` called `JS_RunGC`. Collection happened only inside
+`js_trigger_gc`, when an allocation crossed a threshold that is then set to
+1.5x whatever was live. A burst of 200,000 cyclic objects, held while built
+and then dropped, left 229 MB that 96 MB of subsequent churn did not collect
+once -- the collection at the peak had raised the bar above what leaked, and
+the bigger the garbage the higher the bar.
+
+The event loop now sweeps when it has been blocked waiting, is holding more
+than 32 MB, and has not swept in half a second, and resets the threshold
+afterwards. A burst-then-idle daemon reclaims 171 MB across one loop turn with
+nothing calling anything; `Sxn.gc()` is the explicit ask. A server under
+sustained load takes no sweep at all -- 4,000 requests, zero collections, the
+same wall time with the feature on and off -- because `uv_run` never blocks
+long enough. The rows above are unmoved, worst pause included.
+
+`benchmarks/engine/gc_idle_probe.sx` re-derives it, and reports RSS beside the
+allocator's own accounting because the two diverge: after a sweep took tracked
+bytes from 164 MB to 0.7, RSS moved only 199.8 to 196.8 MB. The system
+allocator kept the pages. Assert on `mallocSize`; read `rss`.
+
+Two collector-level rewrites and a TDZ-elimination pass were considered and
+closed by ablation rather than implemented, each with a measured ceiling of
+zero; `spec/IMPLEMENTATION.md` records the method and the numbers. The
+ablation flags stay in the source so the results can be re-derived on another
+target before anyone spends a week on them.

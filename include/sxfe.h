@@ -106,6 +106,14 @@ int sxn_install_network(struct JSContext *context);
    calls Sxn.serve or the async file API). */
 int sxn_run_event_loop(struct JSContext *context);
 
+/* Idle cycle sweeping, configured by the CLI before the loop starts.
+   `enabled` false turns it off entirely (`--no-idle-gc`); `floor_bytes` is
+   the tracked-allocation size below which the loop will not spend a
+   collection (`--idle-gc-floor=<MB>`), so a small server keeps the pause
+   profile it has today. Call before sxn_run_event_loop; the defaults apply
+   if it is never called. */
+void sxn_configure_idle_gc(int enabled, size_t floor_bytes);
+
 /* Installs the `node:buffer`/`node:path`/`node:events`/`node:process`
    compatibility modules (src/node.c + src/node_compat.js), following the
    same native-primitives-plus-JS-bootstrap split as sxn_install_network.
@@ -118,6 +126,11 @@ struct JSModuleDef *sxn_node_module_load(struct JSContext *context, const char *
 /* Releases the atoms sxn_install_node_compat cached; call once, before
    JS_FreeContext, or the runtime reports them as leaked. */
 void sxn_free_node_compat(struct JSContext *context);
+/* Drops the emit memo's strong references to one emitter's `_events` object,
+   event name and listener list. A cycle sweep cannot see past them, so both
+   Sxn.gc() and the idle sweep release the memo first. Safe to call at any
+   time: the memo is a cache and the next emit rebuilds it. */
+void sxn_free_ee_memo(struct JSContext *context);
 
 #ifdef __cplusplus
 }

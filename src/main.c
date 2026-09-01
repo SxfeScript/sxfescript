@@ -1127,6 +1127,7 @@ static void usage(void) {
          "  sxn remove package\n"
          "  sxn init\n"
          "  sxn [--memory-report] [--leak-check] [--compile-cache] <file.sx|file.ts|file.js|file.mjs|file.cjs> [args...]\n"
+         "  sxn [--no-idle-gc] [--idle-gc-floor=<MB>] <file>   -- cycle sweeping while the event loop is quiet\n"
          "  sxn compile <file> [-o out.sxbc] [--strip]   -- compile to bytecode for distribution\n"
          "  sxn <file.sxbc> [args...]          -- run precompiled bytecode directly\n"
          "  sxn lsp --stdio\n"
@@ -1150,16 +1151,31 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "run") || !strcmp(argv[1], "install") || !strcmp(argv[1], "add") ||
         !strcmp(argv[1], "remove") || !strcmp(argv[1], "init")) return sxn_package_command(argc, argv);
     bool memory_report = false, leak_check = false, compile_cache = false;
+    int idle_gc = 1;
+    size_t idle_gc_floor = 0; /* 0 keeps sxn_configure_idle_gc's own default */
     int file_index = 1;
     while (file_index < argc && (!strcmp(argv[file_index], "--memory-report") ||
                                  !strcmp(argv[file_index], "--leak-check") ||
+                                 !strcmp(argv[file_index], "--no-idle-gc") ||
+                                 !strncmp(argv[file_index], "--idle-gc-floor=", 16) ||
                                  !strcmp(argv[file_index], "--compile-cache"))) {
         if (!strcmp(argv[file_index], "--memory-report")) memory_report = true;
         else if (!strcmp(argv[file_index], "--leak-check")) leak_check = true;
+        else if (!strcmp(argv[file_index], "--no-idle-gc")) idle_gc = 0;
+        else if (!strncmp(argv[file_index], "--idle-gc-floor=", 16)) {
+            char *end = NULL;
+            long long mb = strtoll(argv[file_index] + 16, &end, 10);
+            if (!end || *end || mb < 0) {
+                fprintf(stderr, "sxn: --idle-gc-floor expects a size in MB\n");
+                return 2;
+            }
+            idle_gc_floor = (size_t)mb * 1024u * 1024u;
+        }
         else compile_cache = true;
         ++file_index;
     }
     if (file_index >= argc) { usage(); return 2; }
+    sxn_configure_idle_gc(idle_gc, idle_gc_floor);
     /* An argument that names a real file is a file to run, whatever it is
        called. Node and Bun both run `./node_modules/.bin/whatever`, and every
        CLI shipped by an npm package is extensionless, so requiring a known

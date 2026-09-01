@@ -1,0 +1,59 @@
+// What a burst of cyclic garbage costs a long-running process, and what a
+// sweep gets back.
+//
+//   sxn benchmarks/engine/gc_idle_probe.sx
+//
+// Two numbers per row, because they answer different questions and move
+// independently:
+//
+//   tracked  the engine allocator's own accounting, which is what the GC
+//            threshold is compared against and what a leak test can assert on.
+//   rss      what the operating system says the process is holding. The
+//            system allocator is free to keep freed pages rather than return
+//            them, so rss can stay high after a sweep that reclaimed
+//            everything. Report it, never assert on it.
+//
+// TICKS is 200,000 rather than the millions a soak test would use. The effect
+// is a step function, not a slow drift: the burst either survives the drop or
+// it does not, and 200k already puts ~200 MB on the wrong side of the 32 MB
+// idle-sweep floor. Raise it to watch a bigger heap; it will not change the
+// shape of the answer.
+const TICKS = 200000;
+
+function row(label: string): void {
+  const m = Sxn.memoryUsage();
+  const mb = (n) => (n / (1024 * 1024)).toFixed(1).padStart(8);
+  console.log(label.padEnd(28), "tracked", mb(m.mallocSize), "MB   rss",
+              mb(m.rss), "MB   collections", m.gcCount);
+}
+
+// One simulated request: state that points at itself and a handler the state
+// holds. Refcounting can never free either, whatever the request does next.
+function tick(i: i32) {
+  const state = { id: i, body: new Array(24).fill(i) };
+  state.self = state;
+  const respond = () => state.body.length;
+  state.respond = respond;
+  return respond;
+}
+
+// The batch is held while it is built. That is what a burst looks like from
+// the collector's side, and it is what raises the allocation threshold to 1.5x
+// the peak -- the reason the garbage then survives being dropped.
+function burst(n: i32) {
+  const batch = [];
+  for (let i = 0; i < n; i++) batch.push(tick(i));
+  return batch.length;
+}
+
+row("before the burst");
+burst(TICKS);
+row("after it is dropped");
+
+// Everything above this line is unreachable. Without a sweep it stays, and
+// the next burst has to be half again as large before the allocator notices.
+const reclaimed = Sxn.memoryUsage().mallocSize - Sxn.gc();
+row("after a sweep");
+console.log("\nreclaimed", (reclaimed / (1024 * 1024)).toFixed(1), "MB of unreachable cycles");
+console.log("A server left idle reclaims this on its own; see sxn --help for");
+console.log("--no-idle-gc and --idle-gc-floor=<MB>.");

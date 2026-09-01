@@ -360,6 +360,107 @@ static uint32_t sxn_ee_length(JSContext *ctx, JSValueConst list) {
     return len;
 }
 
+/* EventEmitter.defaultMaxListeners, kept here rather than as a plain property
+   on the class because the check below is native. node_compat.js exposes it as
+   an accessor pair so `require('events').defaultMaxListeners = 20` still
+   works. Zero or less means unlimited, as in Node. */
+static int32_t sxn_ee_default_max_listeners = 10;
+
+static JSValue js_ee_default_max(JSContext *ctx, JSValueConst this_val,
+                                 int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc > 0) {
+        int32_t v = 0;
+        if (JS_ToInt32(ctx, &v, argv[0])) return JS_EXCEPTION;
+        sxn_ee_default_max_listeners = v;
+    }
+    return JS_NewInt32(ctx, sxn_ee_default_max_listeners);
+}
+
+/* A listener count crossing the limit is the standard signal that handlers are
+   being added and never removed -- the leak that grows a long-running server
+   one closure at a time. Node warns once per emitter and event; so does this,
+   marking the emitter rather than counting again, so a server registering
+   thousands of listeners prints one line and not thousands.
+
+   The marker lives on the emitter as `_warnedEvents`, a null-prototype object
+   keyed by event name, which is deliberately not `_events`: that object's
+   exact shape is what emit's fast path and tests/fixtures/events_singleton.mjs
+   both read. */
+static void sxn_ee_check_max_listeners(JSContext *ctx, JSValueConst this_val,
+                                       JSAtom type, uint32_t count) {
+    JSValue max_val, warned, seen, warning, emit;
+    int32_t max = sxn_ee_default_max_listeners;
+
+    max_val = JS_GetPropertyStr(ctx, this_val, "_maxListeners");
+    if (JS_IsNumber(max_val)) JS_ToInt32(ctx, &max, max_val);
+    JS_FreeValue(ctx, max_val);
+    if (max <= 0 || count <= (uint32_t)max) return;
+
+    warned = JS_GetPropertyStr(ctx, this_val, "_warnedEvents");
+    if (!JS_IsObject(warned)) {
+        JS_FreeValue(ctx, warned);
+        warned = JS_NewObjectProto(ctx, JS_NULL);
+        if (JS_IsException(warned)) { JS_FreeValue(ctx, warned); return; }
+        if (JS_SetPropertyStr(ctx, this_val, "_warnedEvents",
+                              JS_DupValue(ctx, warned)) < 0) {
+            JS_FreeValue(ctx, warned);
+            return;
+        }
+    }
+    seen = JS_GetProperty(ctx, warned, type);
+    if (JS_ToBool(ctx, seen)) { JS_FreeValue(ctx, seen); JS_FreeValue(ctx, warned); return; }
+    JS_FreeValue(ctx, seen);
+    JS_SetProperty(ctx, warned, type, JS_TRUE);
+    JS_FreeValue(ctx, warned);
+
+    /* Node's own shape and wording: an Error named MaxListenersExceededWarning
+       whose message names the count, the emitter and the limit. Matching the
+       object rather than just the text is what lets a `process.on('warning')`
+       handler written against Node work unchanged. */
+    {
+        const char *name = JS_AtomToCString(ctx, type);
+        const char *owner = NULL;
+        JSValue ctor = JS_GetPropertyStr(ctx, this_val, "constructor");
+        JSValue ctor_name = JS_IsObject(ctor)
+            ? JS_GetPropertyStr(ctx, ctor, "name") : JS_UNDEFINED;
+        char message[320];
+        if (JS_IsString(ctor_name)) owner = JS_ToCString(ctx, ctor_name);
+        snprintf(message, sizeof(message),
+                 "Possible EventEmitter memory leak detected. "
+                 "%u %s listeners added to [%s]. MaxListeners is %d. "
+                 "Use emitter.setMaxListeners() to increase limit",
+                 count, name ? name : "?", owner ? owner : "EventEmitter", max);
+        if (owner) JS_FreeCString(ctx, owner);
+        JS_FreeValue(ctx, ctor_name);
+        JS_FreeValue(ctx, ctor);
+        JS_FreeCString(ctx, name);
+        warning = JS_NewError(ctx);
+        if (JS_IsException(warning)) return;
+        JS_SetPropertyStr(ctx, warning, "message", JS_NewString(ctx, message));
+        JS_SetPropertyStr(ctx, warning, "name",
+                          JS_NewString(ctx, "MaxListenersExceededWarning"));
+    }
+    /* process.emitWarning, if node_compat.js has been installed. A bare
+       runtime with no `process` simply does not warn. */
+    emit = JS_UNDEFINED;
+    {
+        JSValue global = JS_GetGlobalObject(ctx);
+        JSValue process = JS_GetPropertyStr(ctx, global, "process");
+        if (JS_IsObject(process)) emit = JS_GetPropertyStr(ctx, process, "emitWarning");
+        JS_FreeValue(ctx, process);
+        JS_FreeValue(ctx, global);
+    }
+    if (JS_IsFunction(ctx, emit)) {
+        JSValueConst args[1] = { warning };
+        JSValue r = JS_Call(ctx, emit, JS_UNDEFINED, 1, args);
+        if (JS_IsException(r)) JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, r);
+    }
+    JS_FreeValue(ctx, emit);
+    JS_FreeValue(ctx, warning);
+}
+
 static JSValue js_ee_on(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     sxn_ee_gen++; /* listener set changes: invalidate the emit memo */
     if (argc < 2 || !JS_IsFunction(ctx, argv[1])) return JS_ThrowTypeError(ctx, "listener must be a function");
@@ -367,20 +468,26 @@ static JSValue js_ee_on(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     if (type == JS_ATOM_NULL) return JS_EXCEPTION;
     JSValue events = sxn_ee_events(ctx, this_val);
     JSValue list = JS_GetProperty(ctx, events, type);
+    uint32_t count;
     if (JS_IsUndefined(list)) {
         /* Node stores the common one-listener case directly as a function;
            promote to a fast array only when another listener arrives. */
         JS_SetProperty(ctx, events, type, JS_DupValue(ctx, argv[1]));
+        count = 1;
     } else if (JS_IsFunction(ctx, list)) {
         JSValue promoted = JS_NewArray(ctx);
         JS_SetPropertyUint32(ctx, promoted, 0, list); /* consumes list */
         JS_SetPropertyUint32(ctx, promoted, 1, JS_DupValue(ctx, argv[1]));
         JS_SetProperty(ctx, events, type, promoted);
         list = JS_UNDEFINED; /* promoted now owns the old function */
+        count = 2;
     } else {
-        JS_SetPropertyUint32(ctx, list, sxn_ee_length(ctx, list), JS_DupValue(ctx, argv[1]));
+        count = sxn_ee_length(ctx, list);
+        JS_SetPropertyUint32(ctx, list, count, JS_DupValue(ctx, argv[1]));
+        count += 1;
     }
     JS_FreeValue(ctx, list);
+    sxn_ee_check_max_listeners(ctx, this_val, type, count);
     /* Arm the call-site emit fusion for the sole-listener case, the only shape
        it handles. Registration is where the layout is known; the call site
        re-validates it by shape and slot on every call, and reads sxn_ee_gen,
@@ -4660,6 +4767,15 @@ static JSModuleDef *sxn_init_module_node_process(JSContext *ctx, const char *nam
     return m;
 }
 
+/* The memo below is a one-slot cache, so it cannot grow -- but it does hold
+   strong references to one arbitrary emitter's `_events` object, event name
+   and listener list until the next emit of a different shape replaces them.
+   That is a root a cycle sweep cannot see past, which is why the sweep drops
+   it first. Rebuilding costs one emit. */
+void sxn_free_ee_memo(JSContext *ctx) {
+    sxn_ee_memo_clear(ctx);
+}
+
 void sxn_free_node_compat(JSContext *ctx) {
     /* Release the call-site fusion caches here rather than leaving them to
        JS_FreeContext, which returns early when anything still holds a context
@@ -4782,6 +4898,7 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
     JS_SetPropertyStr(ctx, global, "__sxnEeListenerCount", JS_NewCFunction(ctx, js_ee_listener_count, "listenerCount", 1));
     JS_SetPropertyStr(ctx, global, "__sxnEeListeners", JS_NewCFunction(ctx, js_ee_listeners, "listeners", 1));
     JS_SetPropertyStr(ctx, global, "__sxnEeRemoveAllListeners", JS_NewCFunction(ctx, js_ee_remove_all_listeners, "removeAllListeners", 1));
+    JS_SetPropertyStr(ctx, global, "__sxnEeDefaultMax", JS_NewCFunction(ctx, js_ee_default_max, "defaultMaxListeners", 1));
     JS_SetPropertyStr(ctx, global, "__sxnPosixJoin", JS_NewCFunction(ctx, js_path_posix_join, "join", 0));
     JS_SetPropertyStr(ctx, global, "__sxnPosixResolve", JS_NewCFunction(ctx, js_path_posix_resolve, "resolve", 0));
     JS_SetPropertyStr(ctx, global, "__sxnPosixNormalize", JS_NewCFunction(ctx, js_path_posix_normalize, "normalize", 1));

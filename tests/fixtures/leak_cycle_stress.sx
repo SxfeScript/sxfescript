@@ -1,0 +1,76 @@
+// Cyclic garbage must be reclaimable on demand.
+//
+// Reference counting frees an object when its last reference goes, which is
+// never for a cycle: a closure that captures the object holding it keeps both
+// alive with nobody able to reach either. Only the cycle collector can free
+// them, and it runs only when an allocation crosses a threshold -- so a
+// process that stops allocating stops collecting. Sxn.gc() is the explicit
+// way to ask, and this asserts it actually works.
+//
+// Assertions are on `mallocSize`, the engine allocator's own accounting, not
+// on `rss`. The system allocator is free to keep freed pages rather than
+// return them to the kernel, so RSS routinely stays high after a sweep that
+// reclaimed everything; asserting on it would fail for a reason that is not
+// a leak. RSS is reported by benchmarks/engine/gc_idle_probe.sx instead.
+
+const CYCLES = 100000;
+
+let failures = 0;
+function check(name: string, ok: bool, detail: string): void {
+  if (!ok) { console.log("FAIL", name, detail); failures += 1; }
+}
+
+const before = Sxn.memoryUsage().mallocSize;
+
+// A mock request loop. Each "request" builds the two shapes that defeat
+// refcounting: an object that points at itself, and a closure pair where the
+// function reaches an object that holds the function.
+//
+// The batch is held while it is built and dropped at the end, which is the
+// shape that actually leaks. A loop that drops each item as it goes does not:
+// it keeps allocating, so the allocation trigger keeps firing and collects
+// the cycles behind it. What breaks is a burst held live -- the collection at
+// its peak sizes the next threshold for that peak -- and then released, after
+// which nothing allocates enough to cross the raised bar again.
+function handleBatch(n: i32) {
+  const batch = [];
+  for (let i = 0; i < n; i++) {
+    const state = { id: i, body: new Array(24).fill(i) };
+    state.self = state;
+    const respond = () => state.body.length;
+    state.respond = respond;
+    batch.push(respond);
+  }
+  return batch.length;
+}
+
+handleBatch(CYCLES);   // built, then dropped on return
+
+const peak = Sxn.memoryUsage().mallocSize;
+check("the cycles survived the drop", peak > before + 8 * 1024 * 1024,
+      "peak " + peak + " vs before " + before);
+
+const after = Sxn.gc();
+
+// Back to within 1 MB of where we started. The margin covers the fixture's
+// own strings and the console output, not the 100k cycles.
+check("Sxn.gc reclaims the cycles", after < before + 1024 * 1024,
+      "after " + after + " vs before " + before);
+check("Sxn.gc reports what it left", after === Sxn.memoryUsage().mallocSize,
+      "returned " + after);
+
+// Sweeping again must be stable rather than reclaiming more, which would mean
+// the first pass had missed something reachable only after it ran.
+const twice = Sxn.gc();
+check("a second sweep is a no-op", Math.abs(twice - after) < 64 * 1024,
+      "first " + after + " second " + twice);
+
+// The collector must not have taken anything still reachable with it.
+const live = [];
+for (let i = 0; i < 1000; i++) { const s = { i }; s.self = s; live.push(s); }
+Sxn.gc();
+check("live cycles survive a sweep", live.length === 1000 && live[999].self === live[999],
+      "live " + live.length);
+
+if (failures !== 0) throw new Error(failures + " cycle-stress checks failed");
+console.log("cycle stress: reclaimed " + (peak - after) + " bytes, all checks passed");

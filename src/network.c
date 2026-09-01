@@ -185,12 +185,50 @@ static const char *reason(int status) {
         default: return "Response"; }
 }
 
+/* The floor a sweep will not reduce the GC threshold below, and the initial
+   threshold main.c sets. Kept in one place because the idle sweep and
+   Sxn.gc() both have to restore it (see sxn_sweep_cycles). */
+#define SXN_GC_THRESHOLD_FLOOR (8u * 1024u * 1024u)
+
+/* Collect cycles, then put the allocation threshold back where the amount now
+   live says it belongs.
+
+   The second half is the part that matters. QuickJS only ever collects from
+   js_trigger_gc, which fires when an allocation would cross
+   malloc_gc_threshold and then sets the next threshold to 1.5x whatever was
+   live at that moment. So a burst that dies right after a collection leaves
+   the threshold sized for the peak and nothing lowers it again: the garbage
+   is unreachable, but the bar for noticing has been raised above it, and the
+   bigger the garbage the higher the bar. JS_RunGC reclaims without touching
+   the threshold, so a sweep that does not also reset it fixes one burst and
+   leaves the ratchet in place for the next. */
+static size_t sxn_sweep_cycles(JSRuntime *rt) {
+    size_t live, threshold;
+    JS_RunGC(rt);
+    live = JS_GetMallocSize(rt);
+    threshold = live + (live >> 1);
+    if (threshold < SXN_GC_THRESHOLD_FLOOR) threshold = SXN_GC_THRESHOLD_FLOOR;
+    JS_SetGCThreshold(rt, threshold);
+    return live;
+}
+
+static JSValue sxn_gc(JSContext *ctx, JSValueConst this_val,
+                      int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    /* The emit memo holds strong references to one emitter's _events object,
+       its event name and its listener list, so it is a root the sweep cannot
+       see past. Releasing it first is what lets that graph go. */
+    sxn_free_ee_memo(ctx);
+    return JS_NewInt64(ctx, (int64_t)sxn_sweep_cycles(JS_GetRuntime(ctx)));
+}
+
 static JSValue sxn_memory_usage(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv) {
     (void)this_val; (void)argc; (void)argv;
     JSRuntime *rt = JS_GetRuntime(ctx);
     JSMemoryUsage mem;
     JSGCStats gc;
+    size_t rss = 0;
     JS_ComputeMemoryUsage(rt, &mem);
     JS_GetGCStats(rt, &gc);
     JSValue result = JS_NewObject(ctx);
@@ -209,6 +247,12 @@ static JSValue sxn_memory_usage(JSContext *ctx, JSValueConst this_val,
     MEM_FIELD("gcTotalNs", gc.total_ns);
     MEM_FIELD("gcLastNs", gc.last_ns);
     MEM_FIELD("gcMaxNs", gc.max_ns);
+    /* Every field above is the engine allocator's own accounting. `rss` is
+       the operating system's, which is the only one that answers "is this
+       process growing": the allocator can hold freed pages rather than
+       return them, so the two move independently. Reported, never asserted
+       on -- see tests/fixtures/leak_cycle_stress.sx. */
+    if (uv_resident_set_memory(&rss) == 0) MEM_FIELD("rss", rss);
 #undef MEM_FIELD
     return result;
 }
@@ -984,10 +1028,12 @@ static JSValue js_serve(JSContext *ctx, JSValueConst this_val, int argc, JSValue
 /* --- Borrow lock: guards native chunk memory handed to JS zero-copy -----
    (Task 4.) Nothing in this codebase constructs an SX20xx diagnostic
    before this file: include/sxfe.h's SX2001-SX2004 were unused enum
-   values (only referenced by frontend.c's name-lookup switch), and there
-   is no compile-time borrow checker anywhere -- this is the first real
-   runtime use of one of them (SX2002_BORROW_CONFLICT, in
+   values (only referenced by frontend.c's name-lookup switch) -- this is
+   the first real runtime use of one of them (SX2002_BORROW_CONFLICT, in
    sxn_throw_borrow_conflict below), and it stays a runtime notion only.
+   The parser has since grown one compile-time ownership rule of its own
+   (SX2003, `&mut` on an immutable binding), but it is a separate notion:
+   it never reaches this lock, and this lock never consults it.
 
    Single-threaded-cooperative, like the rest of this file: fetch_write_cb
    (libcurl's data callback) only ever runs from inside curl_multi_socket_action,
@@ -2940,6 +2986,7 @@ int sxn_install_network(JSContext *ctx) {
     JS_SetPropertyStr(ctx, runtime, "file", JS_NewCFunction(ctx, sxn_file, "file", 1));
     JS_SetPropertyStr(ctx, runtime, "write", JS_NewCFunction(ctx, sxn_write, "write", 2));
     JS_SetPropertyStr(ctx, runtime, "memoryUsage", JS_NewCFunction(ctx, sxn_memory_usage, "memoryUsage", 0));
+    JS_SetPropertyStr(ctx, runtime, "gc", JS_NewCFunction(ctx, sxn_gc, "gc", 0));
     sxn_ffi_init(ctx);
     JS_SetPropertyStr(ctx, runtime, "ffi", JS_NewCFunction(ctx, sxn_ffi, "ffi", 4));
     JS_SetPropertyStr(ctx, global, "Sxn", runtime);
@@ -3026,9 +3073,16 @@ int sxn_install_network(JSContext *ctx) {
    forever -- the promise could only be settled by work that never got a
    chance to run. Mirrors js_std_await's contract: consumes obj, returns the
    fulfilled value or throws the rejection, and passes non-promises through. */
+/* Defined below with the rest of the idle-sweep machinery. Both loops in this
+   file call it: a module with top-level await never reaches
+   sxn_run_event_loop, so hooking only that one leaves every `await` daemon
+   uncollected. */
+static void sxn_maybe_idle_gc(JSContext *ctx, JSRuntime *rt, uint64_t blocked_ns);
+
 JSValue sxn_await_with_loop(JSContext *ctx, JSValue obj) {
     JSRuntime *rt = JS_GetRuntime(ctx);
     uv_loop_t *loop = sxn_loop();
+    uint64_t blocked_ns = 0, before;
     for (;;) {
         int state = JS_PromiseState(ctx, obj);
         if (state == JS_PROMISE_FULFILLED) {
@@ -3055,7 +3109,11 @@ JSValue sxn_await_with_loop(JSContext *ctx, JSValue obj) {
            blocks until something is ready rather than spinning. If nothing is
            pending either, the promise can never settle -- return it and let
            the caller see a still-pending module rather than hang. */
-        if (!uv_run(loop, UV_RUN_ONCE) && !JS_IsJobPending(rt))
+        sxn_maybe_idle_gc(ctx, rt, blocked_ns);
+        before = uv_hrtime();
+        int more_handles = uv_run(loop, UV_RUN_ONCE);
+        blocked_ns = uv_hrtime() - before;
+        if (!more_handles && !JS_IsJobPending(rt))
             return obj;
     }
 }
@@ -3081,24 +3139,82 @@ static void sxn_flush_rejections(JSContext *ctx) {
     JS_FreeValue(ctx, global);
 }
 
+/* --- Idle cycle sweeping -------------------------------------------------
+   QuickJS only collects from an allocation, so a process that stops
+   allocating stops collecting. That is fine for a script and wrong for a
+   daemon: a burst that leaves cyclic garbage behind and then goes quiet keeps
+   every byte of it, and because js_trigger_gc sized the threshold for the
+   peak, the next burst has to be half again as large before anything
+   notices. Measured, 200k cyclic objects dropped and then 96 MB of further
+   churn produced zero collections and held 229 MB.
+
+   The loop below knows something no allocation site does: when it is about to
+   block in uv_run there is no request in flight, so a collection costs
+   nothing anyone is waiting on. The gate is deliberately narrow.
+
+   - Above a floor, 32 MB by default. Under it there is not enough to reclaim
+     to be worth a pause, so a small server keeps exactly the pause profile it
+     has today and this code is a load and a compare.
+   - The previous uv_run actually blocked for a while. That is the direct
+     measurement of "quiet" and it is why this is timed rather than inferred
+     from the allocation rate: a first attempt gated on tracked size not
+     growing between turns never fired, because a loop with any timer on it
+     allocates a trickle every turn and the size always crept up.
+   - At least half a second since the last sweep, so a loop woken constantly
+     by short timers cannot turn this into a collection per turn. */
+#define SXN_IDLE_GC_FLOOR_DEFAULT (32u * 1024u * 1024u)
+#define SXN_IDLE_GC_INTERVAL_NS   (500u * 1000u * 1000u)
+#define SXN_IDLE_GC_BLOCKED_NS    (20u * 1000u * 1000u)
+
+static int sxn_idle_gc_enabled = 1;
+static size_t sxn_idle_gc_floor = SXN_IDLE_GC_FLOOR_DEFAULT;
+
+void sxn_configure_idle_gc(int enabled, size_t floor_bytes) {
+    sxn_idle_gc_enabled = enabled;
+    if (floor_bytes) sxn_idle_gc_floor = floor_bytes;
+}
+
+/* blocked_ns is how long the previous uv_run waited for work. */
+static void sxn_maybe_idle_gc(JSContext *ctx, JSRuntime *rt, uint64_t blocked_ns) {
+    static uint64_t last_sweep_ns;
+    uint64_t now;
+
+    if (!sxn_idle_gc_enabled) return;
+    if (blocked_ns < SXN_IDLE_GC_BLOCKED_NS) return;
+    if (JS_GetMallocSize(rt) < sxn_idle_gc_floor) return;
+    now = uv_hrtime();
+    if (last_sweep_ns && now - last_sweep_ns < SXN_IDLE_GC_INTERVAL_NS) return;
+    last_sweep_ns = now;
+    sxn_free_ee_memo(ctx);
+    sxn_sweep_cycles(rt);
+}
+
 int sxn_run_event_loop(JSContext *ctx) {
     uv_loop_t *loop = sxn_loop();
     JSRuntime *rt = JS_GetRuntime(ctx);
+    uint64_t blocked_ns = 0;
     for (;;) {
         JSContext *ctx1; int err;
+        uint64_t before;
         while ((err = JS_ExecutePendingJob(rt, &ctx1)) > 0) {}
         if (err < 0) break;
         /* Every job that could still settle a rejected promise has now run,
            so anything still on the list is unhandled: report it (which is
            what fires onunhandledrejection) before waiting for more I/O. */
         sxn_flush_rejections(ctx);
+        /* Nothing is in flight here and uv_run is about to block, so this is
+           the cheapest moment in the process to spend a collection -- and how
+           long the last one blocked says whether there was anything to do. */
+        sxn_maybe_idle_gc(ctx, rt, blocked_ns);
         /* UV_RUN_ONCE blocks (no busy-loop) until the next batch of I/O is
            ready, then returns so we can drain any jobs it just enqueued
            before waiting on the next batch. Exits once nothing is left:
            no active/ref'd handles (e.g. no serve() was ever called) and no
            pending job, which is what keeps a plain script's exit identical
            to before this loop existed. */
+        before = uv_hrtime();
         int more_handles = uv_run(loop, UV_RUN_ONCE);
+        blocked_ns = uv_hrtime() - before;
         if (!more_handles && !JS_IsJobPending(rt)) break;
     }
     return JS_HasException(ctx);

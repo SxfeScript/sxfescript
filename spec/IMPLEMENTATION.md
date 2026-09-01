@@ -51,6 +51,13 @@
   `tests/fixtures/typed_inline.sx` asserts the splice changes nothing
   observable -- values, coercions, exceptions, reassignment, capture, wrong
   arity, use as a value -- with every expected value taken from Node.
+- Cycle sweeping when the event loop is quiet, plus `Sxn.gc()` and an `rss`
+  field on `Sxn.memoryUsage()`. Why it was needed, and what it is worth, is
+  below.
+- `EventEmitter` warns once per emitter and event when a listener count
+  crosses its limit, with Node's `MaxListenersExceededWarning` object and
+  wording, and `setMaxListeners`/`getMaxListeners` to raise or disable it.
+  `defaultMaxListeners` had been a constant nothing read.
 - Fixed-layout calculation and aligned growable/poisonable arena primitives.
 - Module-loader hook that transforms imported `.sx` modules in memory.
 - Package command surface with safe argument validation, disabled lifecycle
@@ -251,6 +258,86 @@ dispatch floor above is the floor of what's been tried, not a proof that
 nothing faster exists. Benchmarks against JIT runtimes should be read with
 that in mind: on JIT-bound microbenchmarks the comparison is against a
 technique this project won't use, not necessarily a result it can't reach.
+
+### An idle process never collected, and the leak protected itself
+
+This one is a correctness result rather than a speed one, and it is the
+counterpart to the two negative results below: the collector's *cadence*
+turned out to be worth far more than its *mechanism*.
+
+Before this change, nothing in `src/` ever called `JS_RunGC`. The only
+GC-related line in the whole project was `JS_SetGCThreshold(runtime, 8 MB)` in
+`src/main.c`. Collection happened solely inside `js_trigger_gc`, when an
+allocation would cross the threshold -- and that function then sets the next
+threshold to `malloc_size + (malloc_size >> 1)`, 1.5x whatever was live.
+
+Those two facts combine badly. Measured with `Sxn.memoryUsage()`, building
+200,000 objects that each hold `self` and a closure reaching back into them,
+holding the batch, then dropping it:
+
+| | tracked bytes | collections |
+|---|---|---|
+| start | 734,672 | 0 |
+| after the same burst built **acyclic** | 735,584 | 8 |
+| after the **cyclic** burst is dropped | 229,535,648 | 9 |
+| after 12 further rounds of ~8 MB churn | 246,984,720 | **9** |
+
+Peak RSS 251 MB. The last two rows are the finding: 96 MB of subsequent
+allocation and release produced *zero* collections. The collection at the peak
+correctly sized the threshold for a 229 MB live set; the burst then died, but
+nothing re-evaluates a threshold except another collection, and the later
+churn is freed by refcounting as it goes so the bar is never reached again.
+**The larger the cyclic garbage, the higher the bar for collecting it**, and
+each burst raises a floor that never comes down.
+
+Three things it is *not*, each checked rather than assumed. Acyclic garbage is
+freed immediately by refcounting (row two). Cycles under sustained load are
+collected fine -- 500,000 cyclic closures in a tight loop fired 708
+collections and finished at 743 KB against a 736 KB baseline, and a
+3,000-request `Sxn.serve` run creating a cycle per request stayed at 787 KB.
+And the connection and callback registries do not retain: `ConnState` is a C
+list unlinked on close and is deliberately passed through its promise
+continuations *as an integer* rather than a JS value, `SxnTimer` is unlinked
+in `sxn_timer_stop`, and the fetch, chunk-view and UDP states each hold their
+callbacks in a C struct with a matching finalizer. Only quiescence after a
+peak leaks.
+
+The fix is `sxn_maybe_idle_gc`, called from both loops in `src/network.c` --
+`sxn_run_event_loop` and `sxn_await_with_loop`, because a module with
+top-level await never reaches the first, and hooking only it left every
+`await` daemon uncollected. It sweeps when the previous `uv_run` blocked for
+20 ms or more, tracked size is above a 32 MB floor, and half a second has
+passed since the last sweep. It then resets the threshold, which is the
+load-bearing half: `JS_RunGC` reclaims without touching it, so a sweep that
+does not also reset leaves the ratchet in place for the next burst.
+
+The first attempt gated on tracked size not growing between turns and never
+fired at all -- any loop with a timer on it allocates a trickle every turn, so
+the size always crept up. Timing how long `uv_run` blocked is the direct
+measurement and is what shipped.
+
+Results. A burst-then-idle daemon now reclaims 171 MB across one loop turn
+with nothing calling anything (`tests/fixtures/leak_idle_sweep.mjs`), and
+`Sxn.gc()` takes 229.5 MB back to 735 KB explicitly. A server under sustained
+load takes *no* sweep at all -- 4,000 requests, zero collections, and the same
+wall time with the feature on and off -- because `uv_run` never blocks long
+enough to open the gate. The benchmark rows are unmoved: buffer 18.9 ms,
+textencoder 4.8, events 6.5, worst pause 0.04 ms, all matching the figures
+above and matching a `--no-idle-gc` run.
+
+`benchmarks/engine/gc_idle_probe.sx` re-derives the whole thing and reports
+RSS beside tracked bytes. Note the two diverge exactly as expected: after a
+sweep that took tracked bytes from 164 MB to 0.7 MB, RSS only moved 199.8 ->
+196.8 MB, because the system allocator kept the pages. That is why the
+fixtures assert on `mallocSize` and only report `rss`.
+
+Two items proposed alongside this were not built. Reworking the network
+registries onto `WeakRef` has nothing to attach to, per the audit above.
+Statically flagging non-escaping values to skip cycle-collector registration
+is the `-DSXN_ABLATE_GC_LIST` experiment below, whose exact upper bound is
+0-1 ns -- and unregistering a value that can still enter a cycle is how a
+collector frees something reachable, so the risk is not proportionate to a
+measured zero.
 
 ### The remaining collector rewrites are measured at ~zero ceiling
 

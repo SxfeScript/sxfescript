@@ -64,7 +64,7 @@ covers, briefly, and where it's worth knowing the gap:
 | `assert`, `assert/strict` | The standard assertion functions. |
 | `buffer` | See below — this one gets its own section. |
 | `crypto` | `Hash`, `Hmac` (standard construction over the digest primitive), `randomBytes`, `randomUUID`, `timingSafeEqual`. |
-| `events` | `EventEmitter`, including the mixin pattern (`Object.assign(fn, EventEmitter.prototype)`) Express uses, where `_events` is created lazily on first `on()`/`emit()` rather than in a constructor that never runs. |
+| `events` | `EventEmitter`, including the mixin pattern (`Object.assign(fn, EventEmitter.prototype)`) Express uses, where `_events` is created lazily on first `on()`/`emit()` rather than in a constructor that never runs. `setMaxListeners`/`getMaxListeners` and `defaultMaxListeners` are real: crossing the limit raises Node's `MaxListenersExceededWarning` through `process.emitWarning`, once per emitter and event, which is the standard signal that handlers are being added and never removed. |
 | `fs`, `fs/promises` | `readFile`/`writeFile` and their sync forms, `existsSync`, `stat`/`lstat` and their sync forms with a real `Stats`, and `createReadStream` (which reads the file, rather than windowing a file too large to hold). |
 | `http` | `createServer`, `IncomingMessage`, `ServerResponse`, `ClientRequest`, `STATUS_CODES`, `METHODS`. The request body defers behind `_read` rather than pushing eagerly, because a body-parser attaches its listener after the handler returns — push first and it gets nothing. |
 | `module` | The `Module` constructor (what `require('module').prototype` expects), `createRequire`, `builtinModules`, `isBuiltin`. |
@@ -435,7 +435,7 @@ alone.
 
 | Section | Lines | What is native | What the JavaScript still does |
 | --- | --- | --- | --- |
-| `events` | 74 | `on`, `off`, `emit`, `once`, `listeners`, `listenerCount`, `removeAllListeners` | the class shape, and the two async helpers `once(emitter)` and `on(emitter)`, which are promise plumbing |
+| `events` | 74 | `on`, `off`, `emit`, `once`, `listeners`, `listenerCount`, `removeAllListeners`, the max-listener count check | the class shape, `setMaxListeners`/`getMaxListeners`, and the two async helpers `once(emitter)` and `on(emitter)`, which are promise plumbing |
 | `buffer` | 146 | every encoding both ways, the lenient readers, `concat`, `compare`, copying a view, the numeric accessors | `Buffer.from`'s dispatch on argument type, and `toString`'s on encoding name |
 | `path` | 56 | all of it, both posix and win32 | the two tables and the platform choice between them |
 | `process` | 108 | `env`, `cwd`, `chdir`, `nextTick`, `exit`, `pid`, `platform`, `arch`, signal watching | `argv`, the stdio objects, `emitWarning`, `uptime` |

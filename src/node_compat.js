@@ -69,7 +69,30 @@
   // No `.default` here: Node does not define one, and the ESM default export
   // is set on the module itself rather than as a property of the class.
   EventEmitter.captureRejectionSymbol = Symbol.for("nodejs.rejection");
-  EventEmitter.defaultMaxListeners = 10;
+  // A listener count crossing this limit is Node's standard signal that
+  // handlers are being added and never removed, which is how a long-running
+  // server grows one closure at a time. The count check lives with the rest
+  // of the native listener code (sxn_ee_check_max_listeners in src/node.c),
+  // so the default lives there too and this is the accessor over it --
+  // `require('events').defaultMaxListeners = 20` still reads and writes the
+  // value the check actually uses. 0 or less means unlimited, as in Node.
+  Object.defineProperty(EventEmitter, "defaultMaxListeners", {
+    get: () => __sxnEeDefaultMax(),
+    set: (n) => { __sxnEeDefaultMax(n); },
+    enumerable: true, configurable: true,
+  });
+  // Per-emitter override. Without these the warning would be unsuppressable,
+  // which is worse than not warning: a program that legitimately wants 50
+  // listeners could do nothing about the noise.
+  EventEmitter.prototype.setMaxListeners = function (n) {
+    this._maxListeners = n;
+    return this;
+  };
+  EventEmitter.prototype.getMaxListeners = function () {
+    return typeof this._maxListeners === "number"
+      ? this._maxListeners
+      : EventEmitter.defaultMaxListeners;
+  };
   globalThis.__sxnEventEmitter = EventEmitter;
   delete globalThis.__sxnEeOn;
   delete globalThis.__sxnEeOnce;
@@ -78,6 +101,7 @@
   delete globalThis.__sxnEeListenerCount;
   delete globalThis.__sxnEeListeners;
   delete globalThis.__sxnEeRemoveAllListeners;
+  // __sxnEeDefaultMax stays on the global: the accessor above closes over it.
 
   // ---------------- buffer: Buffer ----------------
   // Only called for non-utf-8 encodings -- Buffer.from's string branch
@@ -351,7 +375,14 @@
   // resolve back to this executable, so there is nothing to pass but the
   // module object it should fill in.
   if (typeof __sxnDlopen === "function") process.dlopen = __sxnDlopen;
-  process.emitWarning = function (w) { console.error("Warning: " + (w && w.message ? w.message : w)); };
+  // Node prints "<Name>: <message>" and callers lean on the name to tell
+  // warnings apart -- MaxListenersExceededWarning is the one this runtime
+  // raises itself, from sxn_ee_check_max_listeners.
+  process.emitWarning = function (w) {
+    const message = w && w.message ? w.message : String(w);
+    const name = w && w.name && w.name !== "Error" ? w.name + ": " : "";
+    console.error("Warning: " + name + message);
+  };
   process.uptime = function () { return performance.now() / 1000; };
   // The real one: a program that runs several copies of itself -- which is
   // how this runtime uses more than one core -- has nothing else to tell them
