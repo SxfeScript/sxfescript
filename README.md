@@ -189,8 +189,8 @@ runtime's startup cost.
 
 | Category | sxn | Node | Bun | Winner |
 |---|---|---|---|---|
-| Real-world end-to-end task | **8.4 ms** | 80.7 ms | 18.6 ms | sxn |
-| Cold start | **9.2 ms** | 45.1 ms | 10.2 ms | sxn |
+| Real-world end-to-end task | **8.4 ms** | 76.6 ms | 15.6 ms | sxn |
+| Cold start | **7.5 ms** | 42.5 ms | 9.4 ms | sxn |
 | Sustained throughput: Buffer ops | **19.4 ms** | 24.5 ms | 27.1 ms | sxn |
 | Sustained throughput: TextEncoder | **4.7 ms** | 39.8 ms | 6.2 ms | sxn |
 | Sustained throughput: EventEmitter | 6.7 ms | **5.4 ms** | 9.2 ms | Node |
