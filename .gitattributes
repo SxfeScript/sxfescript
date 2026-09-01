@@ -1,6 +1,14 @@
-# GitHub Linguist does not know `.sx`, so it renders SxfeScript as plain text.
-# TypeScript is the closest grammar it ships: same expression and statement
-# syntax, same `:` type annotations. `let mut`, `&mut`, and `unsafe` are the
-# only tokens it misses. The real grammar lives in
-# tooling/vscode/syntaxes/sxfe.tmLanguage.json.
-*.sx linguist-language=TypeScript
+# GitHub Linguist has no entry for `.sx`, so SxfeScript renders as plain text
+# and is left out of the language statistics. Rust is the closest grammar
+# Linguist ships. It is the only one that treats the ownership keywords the way
+# SxfeScript means them: `mut` in `let mut`, `mut` in `&mut`, and `unsafe
+# extern` all highlight as keywords, and type names get the type color.
+#
+# The cost is that `interface`, `function`, and `void` lose their keyword
+# color, and template-literal text is not colored as a string. Everything else
+# -- `const`, `let`, `if`, `return`, `async`, `await`, strings, numbers, and
+# comments -- is shared between the two languages and highlights either way.
+# `safe` is not a Rust keyword and stays plain under both.
+#
+# The real grammar lives in tooling/vscode/syntaxes/sxfe.tmLanguage.json.
+*.sx linguist-language=Rust
