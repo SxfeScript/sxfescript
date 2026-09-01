@@ -494,6 +494,55 @@ static char *sxn_pkg_entry(JSContext *ctx, const char *pkg_dir) {
     return out;
 }
 
+/* An uncaught exception, and a promise rejection nothing ever handled, are
+   both reportable events before they are fatal: the page-style handlers
+   (onerror, onunhandledrejection, onrejectionhandled) get first refusal, and
+   only what they decline is printed. The dispatch itself is JavaScript, in
+   src/bootstrap.js; this is the wiring. */
+static bool sxn_dispatch_uncaught(JSContext *ctx) {
+    JSValue error = JS_GetException(ctx);
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue fn = JS_GetPropertyStr(ctx, global, "__sxnUncaught");
+    bool handled = false;
+    if (JS_IsFunction(ctx, fn)) {
+        JSValueConst args[1] = { error };
+        JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 1, args);
+        if (JS_IsException(r)) JS_FreeValue(ctx, JS_GetException(ctx));
+        else handled = JS_ToBool(ctx, r);
+        JS_FreeValue(ctx, r);
+    }
+    JS_FreeValue(ctx, fn);
+    JS_FreeValue(ctx, global);
+    if (!handled) {
+        JS_Throw(ctx, error);          /* put it back for the usual report */
+        return false;
+    }
+    JS_FreeValue(ctx, error);
+    return true;
+}
+
+static void sxn_report_uncaught(JSContext *ctx) {
+    if (!sxn_dispatch_uncaught(ctx)) js_std_dump_error(ctx);
+}
+
+/* Both halves of the rejection tracker are handed to JavaScript, which keeps
+   the list and decides when a rejection has gone unhandled for good. */
+static void sxn_rejection_tracker(JSContext *ctx, JSValueConst promise,
+                                  JSValueConst reason, bool is_handled, void *opaque) {
+    (void)opaque;
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue fn = JS_GetPropertyStr(ctx, global,
+                                   is_handled ? "__sxnRejectionHandled" : "__sxnRejectionRaised");
+    if (JS_IsFunction(ctx, fn)) {
+        JSValueConst args[2] = { promise, reason };
+        JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 2, args);
+        if (JS_IsException(r)) JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, r);
+    }
+    JS_FreeValue(ctx, fn);
+    JS_FreeValue(ctx, global);
+}
+
 static char *sxn_module_normalize(JSContext *ctx, const char *base_name,
                                   const char *name, void *opaque);
 
@@ -921,7 +970,7 @@ static int execute_file(int argc, char **argv, const char *filename,
         goto failure;
     }
     JS_SetModuleLoaderFunc2(runtime, sxn_module_normalize, sxn_module_loader, js_module_check_attributes, NULL);
-    JS_SetHostPromiseRejectionTracker(runtime, js_std_promise_rejection_tracker, NULL);
+    JS_SetHostPromiseRejectionTracker(runtime, sxn_rejection_tracker, NULL);
 
     bool is_sxbc = suffix(filename, ".sxbc");
     if (!is_sxbc) {
@@ -996,13 +1045,13 @@ static int execute_file(int argc, char **argv, const char *filename,
        it has to drive the uv loop too, or any await on a timer, a fetch or a
        server never resumes. */
     if (!JS_IsException(value)) value = sxn_await_with_loop(context, value);
-    if (JS_IsException(value)) { js_std_dump_error(context); JS_FreeValue(context, value); goto failure; }
+    if (JS_IsException(value)) { sxn_report_uncaught(context); JS_FreeValue(context, value); goto failure; }
     JS_FreeValue(context, value);
-    if (js_std_loop(context)) { js_std_dump_error(context); goto failure; }
+    if (js_std_loop(context)) { sxn_report_uncaught(context); goto failure; }
     /* Drains any server sockets / async file reads registered by network.c;
        a no-op that returns immediately for scripts that never called
        Sxn.serve or Sxn.file(...).text(). */
-    if (sxn_run_event_loop(context)) { js_std_dump_error(context); goto failure; }
+    if (sxn_run_event_loop(context)) { sxn_report_uncaught(context); goto failure; }
     if (memory_report) {
         JSMemoryUsage usage;
         JS_ComputeMemoryUsage(runtime, &usage);

@@ -1113,6 +1113,101 @@ static JSValue sxn_zlib_run(JSContext *ctx, JSValueConst input,
     return result;
 }
 
+/* Streaming zlib, for CompressionStream/DecompressionStream and anything else
+   that has to hand bytes over a chunk at a time. The one-shot path above
+   keeps a reset stream for the whole call; this one keeps a z_stream per
+   object for as long as the object lives, which is what a stream needs. */
+static JSClassID sxn_zstream_class_id;
+
+typedef struct { z_stream zs; bool compress, open; } SxnZStream;
+
+static void sxn_zstream_finalizer(JSRuntime *rt, JSValue val) {
+    SxnZStream *s = JS_GetOpaque(val, sxn_zstream_class_id);
+    if (!s) return;
+    if (s->open) { if (s->compress) deflateEnd(&s->zs); else inflateEnd(&s->zs); }
+    js_free_rt(rt, s);
+}
+
+static JSClassDef sxn_zstream_class_def = {
+    .class_name = "ZlibStream",
+    .finalizer = sxn_zstream_finalizer,
+};
+
+/* __sxnZlibStreamNew(windowBits, level, decompress) */
+static JSValue js_zlib_stream_new(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    int32_t window_bits = 15, level = Z_DEFAULT_COMPRESSION;
+    if (argc > 0) JS_ToInt32(ctx, &window_bits, argv[0]);
+    if (argc > 1) JS_ToInt32(ctx, &level, argv[1]);
+    bool decompress = argc > 2 && JS_ToBool(ctx, argv[2]);
+
+    SxnZStream *s = js_mallocz(ctx, sizeof(*s));
+    if (!s) return JS_EXCEPTION;
+    s->compress = !decompress;
+    int rc = decompress ? inflateInit2(&s->zs, window_bits)
+                        : deflateInit2(&s->zs, level, Z_DEFLATED, window_bits, 8, Z_DEFAULT_STRATEGY);
+    if (rc != Z_OK) { js_free(ctx, s); return JS_ThrowInternalError(ctx, "zlib init failed: %d", rc); }
+    s->open = true;
+
+    JS_NewClassID(JS_GetRuntime(ctx), &sxn_zstream_class_id);
+    JS_NewClass(JS_GetRuntime(ctx), sxn_zstream_class_id, &sxn_zstream_class_def);
+    JSValue obj = JS_NewObjectClass(ctx, sxn_zstream_class_id);
+    if (JS_IsException(obj)) { sxn_zstream_finalizer(JS_GetRuntime(ctx), obj); return obj; }
+    JS_SetOpaque(obj, s);
+    return obj;
+}
+
+/* __sxnZlibStreamPush(stream, bytes, finish) -> Uint8Array of whatever came out */
+static JSValue js_zlib_stream_push(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    SxnZStream *s = argc > 0 ? JS_GetOpaque(argv[0], sxn_zstream_class_id) : NULL;
+    if (!s || !s->open) return JS_ThrowTypeError(ctx, "not an open zlib stream");
+    size_t in_len = 0;
+    uint8_t *in = NULL;
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        in = JS_GetUint8Array(ctx, &in_len, argv[1]);
+        if (!in) return JS_ThrowTypeError(ctx, "zlib expects bytes");
+    }
+    bool finish = argc > 2 && JS_ToBool(ctx, argv[2]);
+
+    size_t cap = in_len + 64, len = 0;
+    uint8_t *out = js_malloc(ctx, cap);
+    if (!out) return JS_EXCEPTION;
+    s->zs.next_in = in;
+    s->zs.avail_in = (uInt)in_len;
+    int rc = Z_OK;
+    do {
+        if (len == cap) {
+            uint8_t *grown = js_realloc(ctx, out, cap * 2);
+            if (!grown) { js_free(ctx, out); return JS_EXCEPTION; }
+            out = grown; cap *= 2;
+        }
+        s->zs.next_out = out + len;
+        s->zs.avail_out = (uInt)(cap - len);
+        rc = s->compress ? deflate(&s->zs, finish ? Z_FINISH : Z_NO_FLUSH)
+                         : inflate(&s->zs, finish ? Z_FINISH : Z_NO_FLUSH);
+        len = cap - s->zs.avail_out;
+        if (rc == Z_STREAM_END) break;
+        if (rc != Z_OK && rc != Z_BUF_ERROR) {
+            js_free(ctx, out);
+            return JS_ThrowInternalError(ctx, "zlib %s failed: %d", s->compress ? "deflate" : "inflate", rc);
+        }
+        if (rc == Z_BUF_ERROR && !finish) break;
+    } while (s->zs.avail_out == 0 || (finish && rc != Z_STREAM_END));
+
+    if (finish) {
+        if (!s->compress && rc != Z_STREAM_END) {
+            js_free(ctx, out);
+            return JS_ThrowInternalError(ctx, "unexpected end of compressed data");
+        }
+        if (s->compress) deflateEnd(&s->zs); else inflateEnd(&s->zs);
+        s->open = false;
+    }
+    JSValue bytes = JS_NewUint8ArrayCopy(ctx, out, len);
+    js_free(ctx, out);
+    return bytes;
+}
+
 static JSValue js_zlib_deflate(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
     int32_t bits = 15, level = Z_DEFAULT_COMPRESSION;
@@ -2832,8 +2927,40 @@ static const SxnBuiltinEntry sxn_builtin_table[] = {
     { "zlib", "__sxnZlib", NULL },
     { "crypto", "__sxnCrypto", NULL },
     { "net", "__sxnNet", NULL },
+    { "child_process", "__sxnChildProcess", NULL },
+    { "dns", "__sxnDns", NULL },
+    { "dns/promises", "__sxnDnsPromises", NULL },
+    { "https", "__sxnHttps", NULL },
+    { "tls", "__sxnTls", NULL },
+    { "http2", "__sxnHttp2", NULL },
+    { "stream/web", "__sxnStreamWeb", NULL },
+    { "vm", "__sxnVm", NULL },
+    { "v8", "__sxnV8", NULL },
+    { "worker_threads", "__sxnWorkerThreads", NULL },
+    { "cluster", "__sxnCluster", NULL },
+    { "readline", "__sxnReadline", NULL },
+    { "readline/promises", "__sxnReadlinePromises", NULL },
+    { "async_hooks", "__sxnAsyncHooks", NULL },
+    { "inspector", "__sxnInspector", NULL },
+    { "dgram", "__sxnDgram", NULL },
+    { "console", "__sxnConsole", NULL },
+    { "constants", "__sxnConstants", NULL },
+    { "punycode", "__sxnPunycode", NULL },
+    { "diagnostics_channel", "__sxnDiagnosticsChannel", NULL },
     { NULL, NULL, NULL },
 };
+
+/* module.builtinModules, read off the same table require() uses -- the list
+   used to be written out by hand in JavaScript and had fallen behind it. */
+static JSValue js_builtin_names(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    JSValue list = JS_NewArray(ctx);
+    uint32_t n = 0;
+    JS_SetPropertyUint32(ctx, list, n++, JS_NewString(ctx, "buffer"));
+    for (const SxnBuiltinEntry *e = sxn_builtin_table; e->name; e++)
+        JS_SetPropertyUint32(ctx, list, n++, JS_NewString(ctx, e->name));
+    return list;
+}
 
 /* Returns JS_UNINITIALIZED for a name that is not a builtin, so the caller
    decides between throwing and answering false. */
@@ -4376,9 +4503,92 @@ NODE_SIMPLE_MODULE(timers_promises, "__sxnTimersPromises", node_timers_promises_
 static const char *node_stream_promises_names[] = { "pipeline", "finished" };
 NODE_SIMPLE_MODULE(stream_promises, "__sxnStreamPromises", node_stream_promises_names)
 
+static const char *node_child_process_names[] = {
+    "spawn", "spawnSync", "exec", "execSync", "execFile", "execFileSync",
+    "fork", "ChildProcess",
+};
+static const char *node_dns_names[] = {
+    "lookup", "resolve", "resolve4", "resolve6", "resolveMx", "resolveTxt",
+    "resolveSrv", "resolveNs", "resolveCname", "reverse", "getServers",
+    "setServers", "promises", "Resolver",
+};
+static const char *node_dns_promises_names[] = { "lookup", "resolve", "resolve4", "resolve6", "getServers" };
+static const char *node_https_names[] = { "request", "get", "Agent", "globalAgent", "createServer", "Server" };
+static const char *node_tls_names[] = {
+    "connect", "createServer", "TLSSocket", "Server", "createSecureContext",
+    "rootCertificates", "DEFAULT_MIN_VERSION", "DEFAULT_MAX_VERSION",
+};
+static const char *node_http2_names[] = {
+    "constants", "connect", "createServer", "createSecureServer", "getDefaultSettings",
+};
+static const char *node_stream_web_names[] = {
+    "ReadableStream", "ReadableStreamDefaultReader", "ReadableStreamBYOBReader",
+    "ReadableStreamDefaultController", "ReadableByteStreamController",
+    "ReadableStreamBYOBRequest", "WritableStream", "WritableStreamDefaultWriter",
+    "WritableStreamDefaultController", "TransformStream",
+    "TransformStreamDefaultController", "ByteLengthQueuingStrategy",
+    "CountQueuingStrategy", "TextEncoderStream", "TextDecoderStream",
+    "CompressionStream", "DecompressionStream",
+};
+static const char *node_vm_names[] = {
+    "runInThisContext", "runInNewContext", "runInContext", "createContext",
+    "isContext", "compileFunction", "Script",
+};
+static const char *node_v8_names[] = {
+    "getHeapStatistics", "getHeapSpaceStatistics", "setFlagsFromString",
+    "serialize", "deserialize", "cachedDataVersionTag",
+};
+static const char *node_worker_threads_names[] = {
+    "isMainThread", "threadId", "parentPort", "workerData", "resourceLimits",
+    "SHARE_ENV", "Worker", "MessageChannel", "MessagePort", "BroadcastChannel",
+    "markAsUntransferable", "moveMessagePortToContext", "receiveMessageOnPort",
+    "setEnvironmentData", "getEnvironmentData",
+};
+static const char *node_cluster_names[] = {
+    "isPrimary", "isMaster", "isWorker", "worker", "workers", "settings",
+    "schedulingPolicy", "setupPrimary", "setupMaster", "fork", "disconnect",
+};
+static const char *node_readline_names[] = {
+    "Interface", "createInterface", "clearLine", "clearScreenDown", "cursorTo",
+    "moveCursor", "emitKeypressEvents", "promises",
+};
+static const char *node_readline_promises_names[] = { "Interface", "createInterface" };
+static const char *node_async_hooks_names[] = {
+    "AsyncLocalStorage", "AsyncResource", "executionAsyncId", "triggerAsyncId",
+    "executionAsyncResource", "createHook",
+};
+static const char *node_inspector_names[] = { "url", "open", "close", "waitForDebugger", "console", "Session", "promises" };
+
+NODE_SIMPLE_MODULE(child_process, "__sxnChildProcess", node_child_process_names)
+NODE_SIMPLE_MODULE(dns, "__sxnDns", node_dns_names)
+NODE_SIMPLE_MODULE(dns_promises, "__sxnDnsPromises", node_dns_promises_names)
+NODE_SIMPLE_MODULE(https, "__sxnHttps", node_https_names)
+NODE_SIMPLE_MODULE(tls, "__sxnTls", node_tls_names)
+NODE_SIMPLE_MODULE(http2, "__sxnHttp2", node_http2_names)
+NODE_SIMPLE_MODULE(stream_web, "__sxnStreamWeb", node_stream_web_names)
+NODE_SIMPLE_MODULE(vm, "__sxnVm", node_vm_names)
+NODE_SIMPLE_MODULE(v8, "__sxnV8", node_v8_names)
+NODE_SIMPLE_MODULE(worker_threads, "__sxnWorkerThreads", node_worker_threads_names)
+NODE_SIMPLE_MODULE(cluster, "__sxnCluster", node_cluster_names)
+NODE_SIMPLE_MODULE(readline, "__sxnReadline", node_readline_names)
+NODE_SIMPLE_MODULE(readline_promises, "__sxnReadlinePromises", node_readline_promises_names)
+NODE_SIMPLE_MODULE(async_hooks, "__sxnAsyncHooks", node_async_hooks_names)
+NODE_SIMPLE_MODULE(inspector, "__sxnInspector", node_inspector_names)
+
+static const char *node_dgram_names[] = { "Socket", "createSocket" };
+static const char *node_punycode_names[] = { "encode", "decode", "toASCII", "toUnicode", "ucs2", "version" };
+static const char *node_diagnostics_channel_names[] = {
+    "Channel", "channel", "hasSubscribers", "subscribe", "unsubscribe", "tracingChannel",
+};
+NODE_SIMPLE_MODULE(dgram, "__sxnDgram", node_dgram_names)
+NODE_SIMPLE_MODULE(punycode, "__sxnPunycode", node_punycode_names)
+NODE_SIMPLE_MODULE(diagnostics_channel, "__sxnDiagnosticsChannel", node_diagnostics_channel_names)
+
+
+
 static const char *node_fs_export_names[] = {
     "readFileSync", "writeFileSync", "existsSync", "statSync", "lstatSync",
-    "createReadStream", "Stats",
+    "createReadStream", "Stats", "constants",
 };
 
 static int node_fs_init(JSContext *ctx, JSModuleDef *m) {
@@ -4584,6 +4794,9 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
     JS_SetPropertyStr(ctx, global, "__sxnJoinChunks", JS_NewCFunction(ctx, js_join_chunks, "__sxnJoinChunks", 1));
     JS_SetPropertyStr(ctx, global, "__sxnHttpHeaders", JS_NewCFunction(ctx, js_http_headers, "__sxnHttpHeaders", 1));
     JS_SetPropertyStr(ctx, global, "__sxnBuiltinRequire", JS_NewCFunction(ctx, js_builtin_require, "__sxnBuiltinRequire", 1));
+    JS_SetPropertyStr(ctx, global, "__sxnZlibStreamNew", JS_NewCFunction(ctx, js_zlib_stream_new, "__sxnZlibStreamNew", 3));
+    JS_SetPropertyStr(ctx, global, "__sxnZlibStreamPush", JS_NewCFunction(ctx, js_zlib_stream_push, "__sxnZlibStreamPush", 3));
+    JS_SetPropertyStr(ctx, global, "__sxnBuiltinNames", JS_NewCFunction(ctx, js_builtin_names, "__sxnBuiltinNames", 0));
     JS_SetPropertyStr(ctx, global, "__sxnIsBuiltin", JS_NewCFunction(ctx, js_is_builtin, "__sxnIsBuiltin", 1));
     JS_SetPropertyStr(ctx, global, "__sxnLatin1Bytes", JS_NewCFunctionMagic(ctx, js_buffer_encode_units, "__sxnLatin1Bytes", 1, JS_CFUNC_generic_magic, 0));
     JS_SetPropertyStr(ctx, global, "__sxnUtf16leBytes", JS_NewCFunctionMagic(ctx, js_buffer_encode_units, "__sxnUtf16leBytes", 1, JS_CFUNC_generic_magic, 1));
@@ -4652,5 +4865,23 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
     if (!sxn_init_module_node_stream_promises(ctx, "node:stream/promises")) return -1;
     if (!sxn_init_module_node_perf_hooks(ctx, "node:perf_hooks")) return -1;
     if (!sxn_init_module_node_module(ctx, "node:module")) return -1;
+    if (!sxn_init_module_node_child_process(ctx, "node:child_process")) return -1;
+    if (!sxn_init_module_node_dns(ctx, "node:dns")) return -1;
+    if (!sxn_init_module_node_dns_promises(ctx, "node:dns/promises")) return -1;
+    if (!sxn_init_module_node_https(ctx, "node:https")) return -1;
+    if (!sxn_init_module_node_tls(ctx, "node:tls")) return -1;
+    if (!sxn_init_module_node_http2(ctx, "node:http2")) return -1;
+    if (!sxn_init_module_node_stream_web(ctx, "node:stream/web")) return -1;
+    if (!sxn_init_module_node_vm(ctx, "node:vm")) return -1;
+    if (!sxn_init_module_node_v8(ctx, "node:v8")) return -1;
+    if (!sxn_init_module_node_worker_threads(ctx, "node:worker_threads")) return -1;
+    if (!sxn_init_module_node_cluster(ctx, "node:cluster")) return -1;
+    if (!sxn_init_module_node_readline(ctx, "node:readline")) return -1;
+    if (!sxn_init_module_node_readline_promises(ctx, "node:readline/promises")) return -1;
+    if (!sxn_init_module_node_async_hooks(ctx, "node:async_hooks")) return -1;
+    if (!sxn_init_module_node_inspector(ctx, "node:inspector")) return -1;
+    if (!sxn_init_module_node_dgram(ctx, "node:dgram")) return -1;
+    if (!sxn_init_module_node_punycode(ctx, "node:punycode")) return -1;
+    if (!sxn_init_module_node_diagnostics_channel(ctx, "node:diagnostics_channel")) return -1;
     return 0;
 }

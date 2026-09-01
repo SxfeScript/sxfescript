@@ -1,5 +1,5 @@
 /* Minimal `node:*` compatibility layer, layered the same way bootstrap.js
-   layers WinterCG globals: pure spec/behavior logic lives here in JS, native
+   layers WinterTC globals: pure spec/behavior logic lives here in JS, native
    primitives (env, cwd, exit, signal watching) are thin C wrappers installed
    by sxn_install_node_compat before this file is evaluated. The four
    `node:*` C modules (see src/node.c) just re-export the globals this file
@@ -451,6 +451,9 @@
       return stream;
     },
   };
+  // The flag numbers come from this platform's headers (js_fs_constants in
+  // src/network.c), which is the only way to get O_CREAT right everywhere.
+  fs.constants = __sxnFsConstants();
   globalThis.__sxnFs = fs;
   delete globalThis.__sxnWriteFileSync;
   delete globalThis.__sxnExistsSync;
@@ -1327,10 +1330,10 @@
   const moduleModule = Object.assign(Module, {
     Module,
     createRequire: (from) => __sxnMakeRequire(String(from)),
-    builtinModules: ["assert","buffer","events","fs","http","os","path","process",
-                     "querystring","stream","string_decoder","timers","tty","url","util"],
-    // Native, and the same answer require() gives, which the hand-written
-    // list above was not: it is short of several modules that do resolve.
+    // Native, and read off the table require() itself uses (js_builtin_names
+    // in src/node.c): the list here used to be written by hand and had fallen
+    // short of several modules that do resolve.
+    builtinModules: __sxnBuiltinNames(),
     isBuiltin: __sxnIsBuiltin,
   });
   globalThis.__sxnModule = moduleModule;
@@ -1500,4 +1503,724 @@
     parse: (s) => { try { return new URL(s); } catch { return null; } },
   };
   globalThis.__sxnUrl = url;
+  // ---------------- node:child_process ----------------
+  // One native primitive (js_spawn_sync in src/network.c) runs a child to
+  // completion on a loop of its own. The synchronous calls are that call; the
+  // asynchronous ones are that call plus the events Node emits afterwards, so
+  // a child does not overlap with the rest of the program the way it does in
+  // Node. Anything that streams a long-running child's output as it arrives
+  // will see it all at once, at the end.
+  function spawnArgs(command, args, options) {
+    if (!Array.isArray(args)) { options = args; args = []; }
+    return [args || [], options || {}];
+  }
+  function shellRun(command, options) {
+    const shell = (options && typeof options.shell === "string" && options.shell) ||
+      (process.platform === "win32" ? "cmd.exe" : "/bin/sh");
+    const flag = process.platform === "win32" ? "/d/s/c" : "-c";
+    return __sxnSpawnSync(shell, [flag, command], options || {});
+  }
+  function decodeOut(raw, options) {
+    const encoding = options && options.encoding;
+    if (encoding === "buffer" || encoding === null) return Buffer.from(raw);
+    return new TextDecoder().decode(raw);
+  }
+  function spawnError(result, command) {
+    const e = new Error("spawnSync " + command + " " + (result.errno || "failed"));
+    e.code = result.errno || "UNKNOWN";
+    e.syscall = "spawnSync " + command;
+    e.path = command;
+    return e;
+  }
+  function spawnSync(command, args, options) {
+    const [list, opts] = spawnArgs(command, args, options);
+    const raw = opts.shell ? shellRun([command].concat(list).join(" "), opts)
+                           : __sxnSpawnSync(command, list, opts);
+    const out = {
+      pid: raw.pid || 0,
+      status: raw.status === undefined ? null : raw.status,
+      signal: raw.signal === undefined ? null : raw.signal,
+      stdout: decodeOut(raw.stdout, opts),
+      stderr: decodeOut(raw.stderr, opts),
+      error: raw.error ? spawnError(raw, command) : undefined,
+    };
+    out.output = [null, out.stdout, out.stderr];
+    return out;
+  }
+  function checkedSync(result, command) {
+    if (result.error) throw result.error;
+    if (result.status !== 0) {
+      const e = new Error("Command failed: " + command + "\n" +
+                          (typeof result.stderr === "string" ? result.stderr : ""));
+      e.status = result.status;
+      e.signal = result.signal;
+      e.stdout = result.stdout;
+      e.stderr = result.stderr;
+      throw e;
+    }
+    return result.stdout;
+  }
+  // The asynchronous forms: run the child, then deliver its output and its
+  // exit through the same events Node uses, one tick later.
+  function ChildProcess(result) {
+    EE.call(this);
+    this.pid = result.pid || 0;
+    this.exitCode = result.status === undefined ? null : result.status;
+    this.signalCode = result.signal || null;
+    this.killed = false;
+    this.stdin = new Writable({ write(c, e, cb) { cb(); } });
+    this.stdout = new Readable({ read() {} });
+    this.stderr = new Readable({ read() {} });
+  }
+  inheritEE(ChildProcess);
+  ChildProcess.prototype.kill = function () { this.killed = true; return false; };
+  ChildProcess.prototype.unref = function () { return this; };
+  ChildProcess.prototype.ref = function () { return this; };
+  function deliver(child, raw, opts, cb) {
+    process.nextTick(() => {
+      if (raw.error) {
+        child.emit("error", spawnError(raw, "child"));
+        if (cb) cb(spawnError(raw, "child"), decodeOut(raw.stdout, opts), decodeOut(raw.stderr, opts));
+        return;
+      }
+      if (raw.stdout.length) child.stdout.push(Buffer.from(raw.stdout));
+      if (raw.stderr.length) child.stderr.push(Buffer.from(raw.stderr));
+      child.stdout.push(null);
+      child.stderr.push(null);
+      if (cb) {
+        const stdout = decodeOut(raw.stdout, opts), stderr = decodeOut(raw.stderr, opts);
+        let e = null;
+        if (raw.status !== 0) {
+          e = new Error("Command failed");
+          e.code = raw.status;
+        }
+        cb(e, stdout, stderr);
+      }
+      child.emit("exit", raw.status === undefined ? null : raw.status, raw.signal || null);
+      child.emit("close", raw.status === undefined ? null : raw.status, raw.signal || null);
+    });
+    return child;
+  }
+  const childProcess = {
+    spawnSync,
+    execFileSync(file, args, options) {
+      const [list, opts] = spawnArgs(file, args, options);
+      return checkedSync(spawnSync(file, list, opts), file);
+    },
+    execSync(command, options) {
+      const opts = options || {};
+      const raw = shellRun(command, opts);
+      return checkedSync({
+        error: raw.error ? spawnError(raw, command) : undefined,
+        status: raw.status, signal: raw.signal,
+        stdout: decodeOut(raw.stdout, opts), stderr: decodeOut(raw.stderr, opts),
+      }, command);
+    },
+    spawn(command, args, options) {
+      const [list, opts] = spawnArgs(command, args, options);
+      const raw = opts.shell ? shellRun([command].concat(list).join(" "), opts)
+                             : __sxnSpawnSync(command, list, opts);
+      return deliver(new ChildProcess(raw), raw, opts, null);
+    },
+    exec(command, options, cb) {
+      if (typeof options === "function") { cb = options; options = {}; }
+      const opts = options || {};
+      const raw = shellRun(command, opts);
+      return deliver(new ChildProcess(raw), raw, opts, cb);
+    },
+    execFile(file, args, options, cb) {
+      if (typeof args === "function") { cb = args; args = []; options = {}; }
+      else if (typeof options === "function") { cb = options; options = {}; }
+      const opts = options || {};
+      const raw = __sxnSpawnSync(file, args || [], opts);
+      return deliver(new ChildProcess(raw), raw, opts, cb);
+    },
+    fork() { throw new Error("child_process.fork is not supported: a child would need its own runtime"); },
+    ChildProcess,
+  };
+  globalThis.__sxnChildProcess = childProcess;
+
+  // ---------------- node:dns ----------------
+  // uv_getaddrinfo, resolved on this thread (js_dns_lookup in src/network.c).
+  // The callback forms hand the answer back on a later tick, so they compose
+  // like Node's, but the resolution itself blocks. There is no resolver
+  // beyond the system one: the record types libuv cannot answer throw.
+  function dnsLookup(hostname, options, cb) {
+    if (typeof options === "function") { cb = options; options = {}; }
+    const opts = typeof options === "number" ? { family: options } : (options || {});
+    let list, error = null;
+    try { list = __sxnDnsLookup(hostname, opts.family || 0); }
+    catch (e) { error = e; list = []; }
+    process.nextTick(() => {
+      if (error) return cb(error);
+      if (!list.length) {
+        const e = new Error("getaddrinfo ENOTFOUND " + hostname);
+        e.code = "ENOTFOUND";
+        return cb(e);
+      }
+      if (opts.all) return cb(null, list);
+      cb(null, list[0].address, list[0].family);
+    });
+  }
+  function dnsResolve(family) {
+    return function (hostname, cb) {
+      dnsLookup(hostname, { family, all: true }, (e, list) =>
+        e ? cb(e) : cb(null, list.map((a) => a.address)));
+    };
+  }
+  function noResolver(kind) {
+    return function (hostname, cb) {
+      const e = new Error("dns.resolve" + kind + " is not supported: there is no resolver beyond the system one");
+      e.code = "ENOTIMP";
+      if (cb) return process.nextTick(() => cb(e));
+      throw e;
+    };
+  }
+  const dns = {
+    lookup: dnsLookup,
+    resolve4: dnsResolve(4),
+    resolve6: dnsResolve(6),
+    resolve(hostname, type, cb) {
+      if (typeof type === "function") { cb = type; type = "A"; }
+      if (type === "A") return dns.resolve4(hostname, cb);
+      if (type === "AAAA") return dns.resolve6(hostname, cb);
+      return noResolver(type)(hostname, cb);
+    },
+    resolveMx: noResolver("Mx"), resolveTxt: noResolver("Txt"),
+    resolveSrv: noResolver("Srv"), resolveNs: noResolver("Ns"),
+    resolveCname: noResolver("Cname"), reverse: noResolver("Ptr"),
+    getServers: () => [],
+    setServers() { throw new Error("dns.setServers is not supported: resolution goes through the system resolver"); },
+    ADDRCONFIG: 1024, V4MAPPED: 8, ALL: 16,
+  };
+  const promisify1 = (fn) => (...a) => new Promise((res, rej) =>
+    fn(...a, (e, v) => e ? rej(e) : res(v)));
+  dns.promises = {
+    lookup: (hostname, options) => new Promise((res, rej) =>
+      dnsLookup(hostname, options || {}, (e, address, family) =>
+        e ? rej(e) : res(typeof address === "string" ? { address, family } : address))),
+    resolve4: promisify1(dns.resolve4),
+    resolve6: promisify1(dns.resolve6),
+    resolve: promisify1(dns.resolve),
+    getServers: dns.getServers,
+  };
+  dns.Resolver = function Resolver() { return Object.assign(Object.create(null), dns); };
+  globalThis.__sxnDns = dns;
+  globalThis.__sxnDnsPromises = dns.promises;
+
+  // ---------------- node:https ----------------
+  // The same client node:http uses: the request goes out through the same
+  // native fetch, which speaks TLS. Only the default protocol differs.
+  // There is no https server, because Sxn.serve does not terminate TLS.
+  const https = {
+    request(options, cb) {
+      const opts = typeof options === "string" ? { url: options } : Object.assign({}, options);
+      if (!opts.url && !opts.protocol) opts.protocol = "https:";
+      return http.request(opts, cb);
+    },
+    get(options, cb) { const r = https.request(options, cb); r.end(); return r; },
+    Agent: function Agent(options) { this.options = options || {}; },
+    globalAgent: null,
+    createServer() { throw new Error("https.createServer is not supported: this runtime does not terminate TLS"); },
+    Server: function Server() { throw new Error("https.Server is not supported: this runtime does not terminate TLS"); },
+  };
+  https.globalAgent = new https.Agent({});
+  globalThis.__sxnHttps = https;
+
+  // ---------------- node:tls / node:http2 ----------------
+  // Named so that a `require` resolves and a feature check can fail cleanly,
+  // rather than dying on a missing module. TLS is only available as a client,
+  // through fetch and node:https; there is no socket to hand back.
+  const tls = {
+    connect() { throw new Error("tls.connect is not supported: use fetch or node:https"); },
+    createServer() { throw new Error("tls.createServer is not supported: this runtime does not terminate TLS"); },
+    TLSSocket: function TLSSocket() { throw new Error("tls.TLSSocket is not supported"); },
+    Server: function Server() { throw new Error("tls.Server is not supported"); },
+    createSecureContext: (options) => Object.assign({}, options),
+    rootCertificates: [],
+    DEFAULT_MIN_VERSION: "TLSv1.2",
+    DEFAULT_MAX_VERSION: "TLSv1.3",
+  };
+  globalThis.__sxnTls = tls;
+
+  const http2 = {
+    constants: {
+      HTTP2_HEADER_METHOD: ":method", HTTP2_HEADER_PATH: ":path",
+      HTTP2_HEADER_STATUS: ":status", HTTP2_HEADER_AUTHORITY: ":authority",
+      HTTP2_HEADER_SCHEME: ":scheme", HTTP2_HEADER_CONTENT_TYPE: "content-type",
+    },
+    connect() { throw new Error("http2.connect is not supported: the client speaks HTTP/1.1"); },
+    createServer() { throw new Error("http2.createServer is not supported: the server speaks HTTP/1.1"); },
+    createSecureServer() { throw new Error("http2.createSecureServer is not supported: the server speaks HTTP/1.1"); },
+    getDefaultSettings: () => ({}),
+  };
+  globalThis.__sxnHttp2 = http2;
+
+  // ---------------- node:stream/web ----------------
+  // The Web Streams already in the global scope, under the names Node also
+  // publishes them under. Nothing is reimplemented here.
+  globalThis.__sxnStreamWeb = {
+    ReadableStream: globalThis.ReadableStream,
+    ReadableStreamDefaultReader: globalThis.ReadableStreamDefaultReader,
+    ReadableStreamBYOBReader: globalThis.ReadableStreamBYOBReader,
+    ReadableStreamDefaultController: globalThis.ReadableStreamDefaultController,
+    ReadableByteStreamController: globalThis.ReadableByteStreamController,
+    ReadableStreamBYOBRequest: globalThis.ReadableStreamBYOBRequest,
+    WritableStream: globalThis.WritableStream,
+    WritableStreamDefaultWriter: globalThis.WritableStreamDefaultWriter,
+    WritableStreamDefaultController: globalThis.WritableStreamDefaultController,
+    TransformStream: globalThis.TransformStream,
+    TransformStreamDefaultController: globalThis.TransformStreamDefaultController,
+    ByteLengthQueuingStrategy: globalThis.ByteLengthQueuingStrategy,
+    CountQueuingStrategy: globalThis.CountQueuingStrategy,
+    TextEncoderStream: globalThis.TextEncoderStream,
+    TextDecoderStream: globalThis.TextDecoderStream,
+    CompressionStream: globalThis.CompressionStream,
+    DecompressionStream: globalThis.DecompressionStream,
+  };
+
+  // ---------------- node:vm ----------------
+  // The engine has one realm, so a "new context" is a function whose
+  // parameters are the sandbox's keys: the code sees those names, and writes
+  // to them come back out. It is not an isolated global.
+  const vm = {
+    runInThisContext(code, options) {
+      return (0, eval)(String(code));
+    },
+    runInNewContext(code, sandbox, options) {
+      const box = sandbox || {};
+      const keys = Object.keys(box);
+      const fn = new Function(...keys, '"use strict"; return (' + "function(){" + String(code) + "}" + ")()");
+      return fn(...keys.map((k) => box[k]));
+    },
+    runInContext(code, contextifiedObject, options) {
+      return vm.runInNewContext(code, contextifiedObject, options);
+    },
+    createContext: (sandbox) => sandbox || {},
+    isContext: (o) => typeof o === "object" && o !== null,
+    compileFunction(code, params, options) {
+      return new Function(...(params || []), String(code));
+    },
+    Script: function Script(code) {
+      this.code = String(code);
+      this.runInThisContext = () => vm.runInThisContext(this.code);
+      this.runInNewContext = (sandbox) => vm.runInNewContext(this.code, sandbox);
+      this.runInContext = (sandbox) => vm.runInNewContext(this.code, sandbox);
+    },
+  };
+  globalThis.__sxnVm = vm;
+
+  // ---------------- node:v8 ----------------
+  // The numbers come from the engine's own allocator, not V8's, and the names
+  // are Node's. serialize/deserialize are JSON, which covers the plain data
+  // packages put through them and rejects what it cannot carry.
+  const v8 = {
+    getHeapStatistics() {
+      const m = Sxn.memoryUsage();
+      return {
+        total_heap_size: m.mallocSize, used_heap_size: m.memoryUsed,
+        heap_size_limit: m.mallocSize, total_available_size: 0,
+        total_heap_size_executable: 0, total_physical_size: m.mallocSize,
+        malloced_memory: m.mallocSize, peak_malloced_memory: m.mallocSize,
+        does_zap_garbage: 0, number_of_native_contexts: 1, number_of_detached_contexts: 0,
+      };
+    },
+    getHeapSpaceStatistics: () => [],
+    setFlagsFromString() {},
+    serialize(value) { return Buffer.from(JSON.stringify(value), "utf8"); },
+    deserialize(buf) { return JSON.parse(Buffer.from(buf).toString("utf8")); },
+    cachedDataVersionTag: () => 0,
+  };
+  globalThis.__sxnV8 = v8;
+
+  // ---------------- node:worker_threads / node:cluster ----------------
+  // One JS thread, one process. Both modules answer the questions a library
+  // asks before it decides whether it is the main one -- which is most of
+  // what they are used for -- and throw where a second thread is required.
+  const workerThreads = {
+    isMainThread: true,
+    threadId: 0,
+    parentPort: null,
+    workerData: null,
+    resourceLimits: {},
+    SHARE_ENV: Symbol("nodejs.worker_threads.SHARE_ENV"),
+    Worker: function Worker() { throw new Error("worker_threads.Worker is not supported: this runtime has one JS thread"); },
+    MessageChannel: globalThis.MessageChannel,
+    MessagePort: globalThis.MessagePort,
+    BroadcastChannel: function BroadcastChannel() { throw new Error("BroadcastChannel is not supported: this runtime has one JS thread"); },
+    markAsUntransferable() {},
+    moveMessagePortToContext() { throw new Error("moveMessagePortToContext is not supported"); },
+    receiveMessageOnPort: () => undefined,
+    setEnvironmentData() {},
+    getEnvironmentData: () => undefined,
+  };
+  globalThis.__sxnWorkerThreads = workerThreads;
+
+  function Cluster() { EE.call(this); }
+  inheritEE(Cluster);
+  const cluster = new Cluster();
+  cluster.isPrimary = true;
+  cluster.isMaster = true;
+  cluster.isWorker = false;
+  cluster.worker = null;
+  cluster.workers = {};
+  cluster.settings = {};
+  cluster.schedulingPolicy = 2;
+  cluster.setupPrimary = function () {};
+  cluster.setupMaster = function () {};
+  cluster.fork = function () { throw new Error("cluster.fork is not supported: this runtime does not fork"); };
+  cluster.disconnect = function (cb) { if (cb) process.nextTick(cb); };
+  globalThis.__sxnCluster = cluster;
+
+  // ---------------- node:readline ----------------
+  // Lines out of any readable stream, and the promise form of question().
+  // Terminal editing -- history, completion, cursor keys -- is not here:
+  // stdin arrives as plain bytes.
+  function Interface(options) {
+    EE.call(this);
+    const opts = options || {};
+    this.input = opts.input || process.stdin;
+    this.output = opts.output || process.stdout;
+    this.terminal = false;
+    this.closed = false;
+    this._pending = [];
+    this._rest = "";
+    const self = this;
+    if (this.input && typeof this.input.on === "function") {
+      this.input.on("data", (chunk) => self._feed(String(chunk)));
+      this.input.on("end", () => self._end());
+      if (typeof this.input.resume === "function") this.input.resume();
+    }
+  }
+  inheritEE(Interface);
+  Interface.prototype._feed = function (text) {
+    const parts = (this._rest + text).split("\n");
+    this._rest = parts.pop();
+    for (const line of parts) {
+      const clean = line.endsWith("\r") ? line.slice(0, -1) : line;
+      const waiter = this._pending.shift();
+      if (waiter) waiter(clean);
+      else this.emit("line", clean);
+    }
+  };
+  Interface.prototype._end = function () {
+    if (this._rest) { this._feed("\n"); }
+    this.close();
+  };
+  Interface.prototype.question = function (query, cb) {
+    if (this.output && typeof this.output.write === "function") this.output.write(query);
+    this._pending.push(cb);
+  };
+  Interface.prototype.prompt = function () {};
+  Interface.prototype.write = function (text) {
+    if (this.output && typeof this.output.write === "function") this.output.write(text);
+  };
+  Interface.prototype.setPrompt = function () {};
+  Interface.prototype.pause = function () { return this; };
+  Interface.prototype.resume = function () { return this; };
+  Interface.prototype.close = function () {
+    if (this.closed) return;
+    this.closed = true;
+    this.emit("close");
+  };
+  Interface.prototype[Symbol.asyncIterator] = function () {
+    const lines = [];
+    let waiting = null, done = false;
+    this.on("line", (l) => { if (waiting) { const w = waiting; waiting = null; w({ value: l, done: false }); } else lines.push(l); });
+    this.on("close", () => { done = true; if (waiting) { const w = waiting; waiting = null; w({ value: undefined, done: true }); } });
+    return {
+      next() {
+        if (lines.length) return Promise.resolve({ value: lines.shift(), done: false });
+        if (done) return Promise.resolve({ value: undefined, done: true });
+        return new Promise((res) => { waiting = res; });
+      },
+      [Symbol.asyncIterator]() { return this; },
+    };
+  };
+  const readline = {
+    Interface,
+    createInterface: (options, output) =>
+      new Interface(options && options.read !== undefined ? { input: options, output } : options),
+    clearLine: () => true, clearScreenDown: () => true,
+    cursorTo: () => true, moveCursor: () => true,
+    emitKeypressEvents() {},
+    promises: null,
+  };
+  readline.promises = {
+    Interface,
+    createInterface(options, output) {
+      const rl = readline.createInterface(options, output);
+      const ask = rl.question.bind(rl);
+      rl.question = (query) => new Promise((res) => ask(query, res));
+      return rl;
+    },
+  };
+  globalThis.__sxnReadline = readline;
+  globalThis.__sxnReadlinePromises = readline.promises;
+
+  // ---------------- node:async_hooks ----------------
+  // AsyncLocalStorage is real and is the reason this module is here: a store
+  // entered for a synchronous run, and kept across an await by binding it to
+  // the promise chain the callback returns. The hook API around it reports
+  // one execution context, because that is what a single loop with no async
+  // tracking can honestly say.
+  function AsyncLocalStorage() { this._store = undefined; this._entered = false; }
+  AsyncLocalStorage.prototype.run = function (store, callback, ...args) {
+    const previous = this._store, wasIn = this._entered;
+    this._store = store;
+    this._entered = true;
+    let async = false;
+    const restore = () => { this._store = previous; this._entered = wasIn; };
+    try {
+      const out = callback(...args);
+      // A callback that returns a promise keeps the store until the promise
+      // settles. Anything else that runs while it is awaiting sees the store
+      // too, which is where this parts company with Node: there is no async
+      // context tracking underneath, only the promise chain handed back.
+      if (out && typeof out.then === "function") {
+        async = true;
+        return out.then((v) => { restore(); return v; }, (e) => { restore(); throw e; });
+      }
+      return out;
+    } finally {
+      if (!async) restore();
+    }
+  };
+  AsyncLocalStorage.prototype.exit = function (callback, ...args) {
+    return this.run(undefined, callback, ...args);
+  };
+  AsyncLocalStorage.prototype.getStore = function () { return this._entered ? this._store : undefined; };
+  AsyncLocalStorage.prototype.enterWith = function (store) { this._store = store; this._entered = true; };
+  AsyncLocalStorage.prototype.disable = function () { this._store = undefined; this._entered = false; };
+  function AsyncResource(type) { this.type = type; }
+  AsyncResource.prototype.runInAsyncScope = function (fn, thisArg, ...args) { return fn.apply(thisArg, args); };
+  AsyncResource.prototype.emitDestroy = function () { return this; };
+  AsyncResource.prototype.asyncId = function () { return 1; };
+  AsyncResource.prototype.triggerAsyncId = function () { return 0; };
+  AsyncResource.bind = (fn) => fn;
+  const asyncHooks = {
+    AsyncLocalStorage, AsyncResource,
+    executionAsyncId: () => 1,
+    triggerAsyncId: () => 0,
+    executionAsyncResource: () => ({}),
+    createHook: () => ({ enable() { return this; }, disable() { return this; } }),
+  };
+  globalThis.__sxnAsyncHooks = asyncHooks;
+
+  // ---------------- node:inspector ----------------
+  // There is no debug protocol behind this. It exists so that a library can
+  // ask whether a session is open and get "no" instead of a crash.
+  const inspector = {
+    url: () => undefined,
+    open() { throw new Error("inspector.open is not supported: this runtime has no debug protocol"); },
+    close() {},
+    waitForDebugger() { throw new Error("inspector.waitForDebugger is not supported"); },
+    console: globalThis.console,
+    Session: function Session() { throw new Error("inspector.Session is not supported: this runtime has no debug protocol"); },
+  };
+  inspector.promises = { Session: inspector.Session };
+  globalThis.__sxnInspector = inspector;
+
+  // ---------------- node:dgram ----------------
+  // A real UDP socket (uv_udp_t, in src/network.c) with the EventEmitter
+  // shape Node gives it. Multicast is not wired up.
+  function Socket(options) {
+    EE.call(this);
+    this.type = (options && (options.type || options)) === "udp6" ? "udp6" : "udp4";
+    this._port = 0;
+    this._handle = __sxnUdpOpen(this.type === "udp6", (bytes, address, port) => {
+      this.emit("message", Buffer.from(bytes), { address, port, family: this.type === "udp6" ? "IPv6" : "IPv4", size: bytes.length });
+    });
+  }
+  inheritEE(Socket);
+  Socket.prototype.bind = function (port, address, cb) {
+    if (typeof port === "object" && port !== null) { address = port.address; port = port.port; }
+    if (typeof address === "function") { cb = address; address = undefined; }
+    this._port = __sxnUdpBind(this._handle, Number(port) || 0, address);
+    if (cb) this.once("listening", cb);
+    process.nextTick(() => this.emit("listening"));
+    return this;
+  };
+  Socket.prototype.send = function (data, port, address, cb) {
+    if (typeof address === "function") { cb = address; address = undefined; }
+    const bytes = typeof data === "string" ? Buffer.from(data, "utf8")
+      : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+      : new Uint8Array(data);
+    let error = null, sent = 0;
+    try { sent = __sxnUdpSend(this._handle, bytes, Number(port) || 0, address); }
+    catch (e) { error = e; }
+    if (cb) process.nextTick(() => cb(error, sent));
+    else if (error) process.nextTick(() => this.emit("error", error));
+    return this;
+  };
+  Socket.prototype.address = function () {
+    return { address: this.type === "udp6" ? "::" : "0.0.0.0", port: this._port, family: this.type === "udp6" ? "IPv6" : "IPv4" };
+  };
+  Socket.prototype.close = function (cb) {
+    __sxnUdpClose(this._handle);
+    if (cb) this.once("close", cb);
+    process.nextTick(() => this.emit("close"));
+    return this;
+  };
+  Socket.prototype.ref = function () { return this; };
+  Socket.prototype.unref = function () { return this; };
+  Socket.prototype.setBroadcast = function () { return this; };
+  const dgram = {
+    Socket,
+    createSocket(options, listener) {
+      const s = new Socket(options);
+      if (typeof options === "object" && options && typeof listener !== "function") listener = options.listener;
+      if (typeof listener === "function") s.on("message", listener);
+      return s;
+    },
+  };
+  globalThis.__sxnDgram = dgram;
+
+  // ---------------- node:console / node:constants ----------------
+  // Both are the older shape of things that live elsewhere now: the global
+  // console, and the constants that hang off fs, os and crypto.
+  globalThis.__sxnConsole = Object.assign(Object.create(null), globalThis.console, {
+    Console: function Console() { return globalThis.console; },
+  });
+  globalThis.__sxnConstants = Object.assign({}, fs.constants, os.constants, {
+    SIGINT: 2, SIGTERM: 15, SIGKILL: 9,
+  });
+
+  // ---------------- node:punycode ----------------
+  // The algorithm from RFC 3492, which is small enough to be worth having
+  // rather than a stub: `url` used to need it and some packages still do.
+  const punyBase = 36, punyTMin = 1, punyTMax = 26, punySkew = 38,
+        punyDamp = 700, punyInitialBias = 72, punyInitialN = 128;
+  function punyAdapt(delta, numPoints, firstTime) {
+    delta = firstTime ? Math.floor(delta / punyDamp) : delta >> 1;
+    delta += Math.floor(delta / numPoints);
+    let k = 0;
+    while (delta > ((punyBase - punyTMin) * punyTMax) >> 1) {
+      delta = Math.floor(delta / (punyBase - punyTMin));
+      k += punyBase;
+    }
+    return k + Math.floor(((punyBase - punyTMin + 1) * delta) / (delta + punySkew));
+  }
+  function punyDecode(input) {
+    const output = [];
+    const basic = input.lastIndexOf("-");
+    let n = punyInitialN, bias = punyInitialBias, i = 0;
+    for (let j = 0; j < (basic < 0 ? 0 : basic); j++) output.push(input.charCodeAt(j));
+    for (let index = basic < 0 ? 0 : basic + 1; index < input.length;) {
+      const oldi = i;
+      for (let w = 1, k = punyBase;; k += punyBase) {
+        const code = input.charCodeAt(index++);
+        const digit = code - 48 < 10 ? code - 22 : code - 65 < 26 ? code - 65 : code - 97 < 26 ? code - 97 : punyBase;
+        if (digit >= punyBase) throw new RangeError("Invalid input");
+        i += digit * w;
+        const t = k <= bias ? punyTMin : k >= bias + punyTMax ? punyTMax : k - bias;
+        if (digit < t) break;
+        w *= punyBase - t;
+      }
+      bias = punyAdapt(i - oldi, output.length + 1, oldi === 0);
+      n += Math.floor(i / (output.length + 1));
+      i %= output.length + 1;
+      output.splice(i++, 0, n);
+    }
+    return String.fromCodePoint(...output);
+  }
+  function punyEncode(input) {
+    const points = Array.from(input).map((c) => c.codePointAt(0));
+    const basic = points.filter((c) => c < 128);
+    const output = basic.map((c) => String.fromCharCode(c));
+    let handled = basic.length;
+    if (handled) output.push("-");
+    let n = punyInitialN, delta = 0, bias = punyInitialBias;
+    while (handled < points.length) {
+      let m = Infinity;
+      for (const c of points) if (c >= n && c < m) m = c;
+      delta += (m - n) * (handled + 1);
+      n = m;
+      for (const c of points) {
+        if (c < n) delta++;
+        else if (c === n) {
+          let q = delta;
+          for (let k = punyBase;; k += punyBase) {
+            const t = k <= bias ? punyTMin : k >= bias + punyTMax ? punyTMax : k - bias;
+            if (q < t) break;
+            output.push(String.fromCharCode(punyDigit(t + ((q - t) % (punyBase - t)))));
+            q = Math.floor((q - t) / (punyBase - t));
+          }
+          output.push(String.fromCharCode(punyDigit(q)));
+          bias = punyAdapt(delta, handled + 1, handled === basic.length);
+          delta = 0;
+          handled++;
+        }
+      }
+      delta++;
+      n++;
+    }
+    return output.join("");
+  }
+  const punyDigit = (d) => d + 22 + (d < 26 ? 75 : 0);
+  const mapDomain = (text, fn) => text.split(".").map(fn).join(".");
+  const punycode = {
+    encode: punyEncode,
+    decode: punyDecode,
+    toASCII: (text) => mapDomain(text, (part) =>
+      /[^\x00-\x7F]/.test(part) ? "xn--" + punyEncode(part) : part),
+    toUnicode: (text) => mapDomain(text, (part) =>
+      part.startsWith("xn--") ? punyDecode(part.slice(4)) : part),
+    ucs2: {
+      decode: (text) => Array.from(text).map((c) => c.codePointAt(0)),
+      encode: (points) => String.fromCodePoint(...points),
+    },
+    version: "2.3.1",
+  };
+  globalThis.__sxnPunycode = punycode;
+
+  // ---------------- node:diagnostics_channel ----------------
+  // Named channels with subscribers, which is all of it that does not depend
+  // on async context tracking.
+  const channels = new Map();
+  function Channel(name) { this.name = name; this._subscribers = []; }
+  Object.defineProperty(Channel.prototype, "hasSubscribers", {
+    get() { return this._subscribers.length > 0; },
+  });
+  Channel.prototype.publish = function (message) {
+    for (const fn of this._subscribers.slice()) {
+      try { fn(message, this.name); } catch { /* a subscriber must not break the publisher */ }
+    }
+  };
+  Channel.prototype.subscribe = function (fn) { this._subscribers.push(fn); };
+  Channel.prototype.unsubscribe = function (fn) {
+    const i = this._subscribers.indexOf(fn);
+    if (i < 0) return false;
+    this._subscribers.splice(i, 1);
+    return true;
+  };
+  Channel.prototype.bindStore = function () {};
+  Channel.prototype.runStores = function (message, fn, thisArg, ...args) {
+    this.publish(message);
+    return fn.apply(thisArg, args);
+  };
+  function channelFor(name) {
+    let c = channels.get(name);
+    if (!c) { c = new Channel(name); channels.set(name, c); }
+    return c;
+  }
+  const diagnosticsChannel = {
+    Channel,
+    channel: channelFor,
+    hasSubscribers: (name) => channels.has(name) && channels.get(name).hasSubscribers,
+    subscribe: (name, fn) => channelFor(name).subscribe(fn),
+    unsubscribe: (name, fn) => channelFor(name).unsubscribe(fn),
+    tracingChannel(name) {
+      return {
+        start: channelFor(name + ":start"), end: channelFor(name + ":end"),
+        asyncStart: channelFor(name + ":asyncStart"), asyncEnd: channelFor(name + ":asyncEnd"),
+        error: channelFor(name + ":error"),
+        traceSync(fn, context, thisArg, ...args) { return fn.apply(thisArg, args); },
+        tracePromise(fn, context, thisArg, ...args) { return fn.apply(thisArg, args); },
+        traceCallback(fn, position, context, thisArg, ...args) { return fn.apply(thisArg, args); },
+      };
+    },
+  };
+  globalThis.__sxnDiagnosticsChannel = diagnosticsChannel;
+
 })();

@@ -13,7 +13,7 @@ site, built from [`docs/index.html`](docs/index.html) and published by
 **Genuinely open to change**, including disagreement with the current
 approach: the shape and scope of `safe`/`unsafe`, which TypeScript forms get
 real support next, ownership and borrow-checking rules and their error
-messages, `node:`/WinterCG coverage priorities, naming, ergonomics — and the
+messages, `node:`/WinterTC coverage priorities, naming, ergonomics — and the
 underlying ideas themselves. If you think the ownership model solves the
 wrong problem, open an issue and make the case.
 

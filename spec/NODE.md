@@ -43,8 +43,13 @@ desktop-and-server capability, unlike `Sxn.ffi`.
 
 ## `node:` builtins
 
-24 of the ~37 Node ships. What each one covers, briefly, and where it's
-worth knowing the gap:
+37 of the ~37 Node ships, counting base names rather than the `/promises`,
+`/strict` and `/web` sub-paths (which also resolve, and bring the total to
+44). It was 20 base names before; the seventeen added are described after the
+table below. `require("module").builtinModules` is the whole list, read off
+the same table `require` itself uses -- it used to be written out by hand in
+JavaScript, and had fallen behind. What each one
+covers, briefly, and where it's worth knowing the gap:
 
 | Module | Covers |
 |---|---|
@@ -64,10 +69,30 @@ worth knowing the gap:
 | `string_decoder`, `timers`, `timers/promises`, `tty` | Small, focused shims. |
 | `zlib` | `gzipSync`/`gunzipSync`/`deflateSync`/`inflateSync` and the stream equivalents (`createGzip` etc.), over the zlib already linked in. No `promises` namespace — Node doesn't have one either. |
 
-Not implemented: `child_process`, `cluster`, `dns`, `http2`, `https`,
-`readline`, `stream/web`, `tls`, `v8`, `vm`, `worker_threads`, `inspector`,
-`async_hooks`. `child_process` is the one that stops `next build` today —
-see `spec/NATIVE.md`'s account of running Next.js's own compiler for the
+### The seventeen added on top of the original 20
+
+| Module | Covers | Where it stops |
+|---|---|---|
+| `child_process` | `spawn`, `exec`, `execFile`, `fork`'s siblings and every `Sync` form, over `uv_spawn` in `src/network.c`: arguments, `cwd`, `env`, stdin input, stdout and stderr, exit status and signal. | The child runs to completion on a loop of its own, so the asynchronous forms are the synchronous run plus the events Node would have emitted. Output arrives in one piece at the end rather than as it is produced, and `fork` throws — a child would need a second runtime. |
+| `dns`, `dns/promises` | `lookup`, `resolve4`, `resolve6` through `uv_getaddrinfo`. | The system resolver is the only resolver: `resolveMx` and the other record types throw `ENOTIMP`, and `setServers` throws. Resolution blocks; the callback still arrives on a later tick. |
+| `dgram` | Real UDP: `bind`, `send`, `message`, on a `uv_udp_t` on the main loop. | No multicast. |
+| `https` | `request`/`get`, which is `node:http`'s client — the same native fetch, which speaks TLS. | No server: `Sxn.serve` does not terminate TLS. |
+| `tls`, `http2` | Named, so a `require` resolves and a feature check answers. | Every entry point throws with the reason. TLS is client-side only, through fetch and `node:https`; the server speaks HTTP/1.1. |
+| `stream/web` | The global Web Streams, under Node's names. | Nothing is reimplemented; the objects are identical (`require("stream/web").ReadableStream === globalThis.ReadableStream`). |
+| `vm` | `runInThisContext`, `runInNewContext`, `Script`, `compileFunction`. | One realm: a "new context" is a function whose parameters are the sandbox's keys, not an isolated global. |
+| `v8` | `getHeapStatistics` under Node's key names, `serialize`/`deserialize`. | The numbers come from QuickJS's allocator, not V8's. The serializer is JSON, so it carries plain data and rejects the rest. |
+| `worker_threads`, `cluster` | The questions asked before a library decides whether it is the main one: `isMainThread`, `threadId`, `isPrimary`, `workers`. | One JS thread, one process. `Worker` and `fork` throw. |
+| `readline`, `readline/promises` | Lines out of any readable stream, `question`, and `for await`. | No terminal editing: no history, completion, or cursor keys. |
+| `async_hooks` | `AsyncLocalStorage` — `run`, `getStore`, `enterWith`, and a store that survives an `await` by riding the promise the callback returns. | There is no async context tracking underneath, so code that runs *while* that promise is pending sees the store too. `createHook` is inert. |
+| `inspector` | `url()` answering "no session". | No debug protocol; `open` and `Session` throw. |
+| `punycode`, `diagnostics_channel`, `console`, `constants` | RFC 3492 in full; named channels with subscribers; the global console; the flag numbers, taken from this platform's own headers rather than written down. | `diagnostics_channel`'s tracing helpers publish but do not track async context. |
+
+Everything that is not supported throws with the reason in the message,
+rather than being absent — a feature check gets an answer instead of a
+`MODULE_NOT_FOUND`.
+
+`child_process` was the module that stopped `next build`; see
+`spec/NATIVE.md`'s account of running Next.js's own compiler for the
 full trace of what does and doesn't stand in the way.
 
 ## Buffer
@@ -418,6 +443,7 @@ alone.
 | `os` | 37 | all of it, from libuv | the object it hangs on |
 | `querystring` | 17 | all four functions | the object it hangs on |
 | `url` | 16 | `fileURLToPath`, `pathToFileURL`'s text | `format` and `parse`, which are the engine's `URL` |
+| the eighteen added modules | 717 | spawning a process, resolving a name, the UDP socket, fs's flag numbers | the module shapes around those four calls, and the modules that are answers rather than work |
 
 
 Still JavaScript, with the reason measured rather than asserted:
@@ -442,3 +468,8 @@ Still JavaScript, with the reason measured rather than asserted:
 - **Thin wrappers** — `zlib`'s callback and promise forms, `fs`'s encoding
   branch, `process`, `os`'s method objects — are three lines each around a
   native call, and moving them would add C without removing work.
+- **The modules that answer rather than compute** — `worker_threads`,
+  `cluster`, `tls`, `http2`, `inspector`, `vm`, `v8` — are constants and
+  refusals. There is no work in them to move.
+- **`punycode`** runs once per hostname at most, on a string short enough
+  that the arithmetic is not the cost.

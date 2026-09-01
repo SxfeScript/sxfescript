@@ -1,8 +1,8 @@
 # The runtime surface
 
-This is what `sxn` gives you independent of Node compatibility: the WinterCG
-web APIs (45 of 55 names in the common surface), the `Sxn` host namespace, and
-the engine capabilities that go with it. `spec/NODE.md` is the other half —
+This is what `sxn` gives you independent of Node compatibility: the WinterTC
+web APIs (every name in the Minimum Common API except WebAssembly's), the
+`Sxn` host namespace, and the engine capabilities that go with it. `spec/NODE.md` is the other half —
 what runs because it imitates Node.
 The split matters because only this half travels when the engine is embedded
 elsewhere (`spec/NATIVE.md` explains why for the native-code case
@@ -81,12 +81,31 @@ further read. A request larger than 64MB is refused rather than buffered.
 
 ## Web Streams
 
-`ReadableStream`, `WritableStream`, `TransformStream`, and both queuing
-strategies, plus `TextEncoderStream`/`TextDecoderStream` built on them. A
-fetch response body is a real `ReadableStream`, not a stand-in, so
-`pipeThrough`, `pipeTo`, and `for await` all work on one. Not yet
-implemented: `CompressionStream`/`DecompressionStream` (`node:zlib` covers
-the same ground synchronously — see spec/NODE.md) and the BYOB reader.
+`ReadableStream`, `WritableStream`, `TransformStream`, both queuing
+strategies, and each of the controller and reader classes the spec names, so
+`instanceof` answers the way it does elsewhere. `TextEncoderStream`/
+`TextDecoderStream` are built on them. A fetch response body is a real
+`ReadableStream`, not a stand-in, so `pipeThrough`, `pipeTo`, and `for await`
+all work on one.
+
+A BYOB reader (`getReader({ mode: "byob" })`) fills the view you hand it and
+keeps whatever did not fit for the next read. What it does not do is let the
+*source* write into your buffer: `byobRequest` is always null, so a source
+written to only ever fill a `byobRequest` finds nothing to fill. Reading is
+still a copy, one chunk at a time; what BYOB buys here is the calling shape,
+not zero-copy.
+
+`CompressionStream`/`DecompressionStream` handle `gzip`, `deflate` and
+`deflate-raw`, over the same zlib `node:zlib` uses, with one stream kept per
+object so chunks compress as a single stream rather than one per chunk.
+
+## URLPattern
+
+`new URLPattern({ pathname: "/books/:id" })`, `test`, and `exec` with named
+groups. Each URL component is compiled separately: `:name` captures up to the
+component's own separator (`/` in a path, `.` in a hostname), `(...)` is a
+regular expression written in place, `*` is anything, and `{...}?` makes what
+it wraps optional. A component you leave out matches anything.
 
 ## Crypto
 
@@ -106,10 +125,24 @@ not wrapped — see the README benchmarks for why that matters).
 `console.log`/`info`/`debug` write to stdout and `console.error`/`warn` to
 stderr, which is also what `process.stderr` is built on.
 
-Not implemented: `URLPattern`, `BroadcastChannel`, `Worker`, `WebSocket` as an
-*outbound client* (the server side — upgrading an incoming connection to a
-WebSocket from a `Sxn.serve` handler — works), `ErrorEvent`,
-`PromiseRejectionEvent`, and `Intl`.
+`ErrorEvent` and `PromiseRejectionEvent` exist, and so do the three handlers
+that carry them.
+
+## Errors that reach the top
+
+The global object is an event target: `addEventListener("error", ...)` and
+`onerror` both see an exception nothing caught, and either can keep it from
+being printed — a listener by calling `preventDefault()`, `onerror` by
+returning true. `reportError(e)` reports one without throwing it.
+
+A promise rejection nothing handled is reported once every job that could
+still have handled it has run, as an `unhandledrejection` event; if something
+handles it later, `rejectionhandled` follows. With no handler registered,
+nothing changes: an unhandled rejection is as quiet as it was before.
+
+Not implemented: `BroadcastChannel`, `Worker`, `WebSocket` as an *outbound
+client* (the server side — upgrading an incoming connection to a WebSocket
+from a `Sxn.serve` handler — works), and `Intl`.
 
 ## `Sxn.ffi` — calling a C function
 
@@ -129,6 +162,11 @@ that belongs to the engine rather than to Node compatibility.
 idiom; `Sxn.memoryUsage()`; `Sxn.version`.
 
 ## What's deliberately not here
+
+WebAssembly. It is the one part of the Minimum Common API this runtime does
+not have, and it is not a small gap to close: QuickJS has no WebAssembly
+engine, so `WebAssembly` is undefined rather than a stub that throws, which
+lets feature detection do the right thing.
 
 Anything that only makes sense with a machine-code tier — a JIT, or
 `process.dlopen`/`.node` addons — lives in the Node-compatibility layer

@@ -1,5 +1,5 @@
 import subprocess, time, sys, os, signal
-DIR="benchmarks/wintercg"; SXN="build/release/sxn"
+DIR="benchmarks/wintertc"; SXN="build/release/sxn"
 def run20(label, cmd, n=20):
     ts=[]
     for _ in range(n):

@@ -9,7 +9,7 @@
 # the PATH a login shell does and a runtime installed under ~/.local or ~/.bun
 # would otherwise be silently skipped:
 #
-#   SXN=build/release/sxn NODE=node BUN=~/.bun/bin/bun sh benchmarks/wintercg/run.sh
+#   SXN=build/release/sxn NODE=node BUN=~/.bun/bin/bun sh benchmarks/wintertc/run.sh
 #
 # bun stays optional and its rows are skipped with a note when it is absent.
 set -e

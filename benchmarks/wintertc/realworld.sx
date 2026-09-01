@@ -1,4 +1,4 @@
-/* One realistic end-to-end WinterCG task: fetch, parse, dispatch events,
+/* One realistic end-to-end WinterTC task: fetch, parse, dispatch events,
    encode, path/URL work. Wall-clock including process startup -- how a
    CLI tool, serverless function, or CI script is actually invoked. */
 import { Buffer } from 'node:buffer';

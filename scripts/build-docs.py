@@ -45,7 +45,7 @@ PAGES = [
      "Compiling to .sxbc, the compile cache, the measured gains, and the trust boundary."),
 
     ("spec/RUNTIME.md", "runtime", "Runtime surface", "The runtime",
-     "The WinterCG web APIs and the Sxn host namespace: fetch, Sxn.serve, streams, crypto, FFI."),
+     "The WinterTC web APIs and the Sxn host namespace: fetch, Sxn.serve, streams, crypto, FFI."),
     ("spec/NODE.md", "node", "Node compatibility", "The runtime",
      "CommonJS, the node: builtins, and .node native addons through a from-scratch Node-API."),
     ("spec/NATIVE.md", "native", "Native code", "The runtime",
@@ -284,7 +284,7 @@ def write_llms(out_dir, rendered):
         "natively with no build step. It runs on ArcSX, a QuickJS-based runtime built "
         "as `sxn` that is designed to run the same on a phone as it does on a server.",
         "",
-        "ArcSX implements the WinterCG web APIs (fetch, Sxn.serve, Web Streams, Web "
+        "ArcSX implements the WinterTC web APIs (fetch, Sxn.serve, Web Streams, Web "
         "Crypto) and a Node compatibility layer (CommonJS, node: builtins, .node "
         "native addons). It has no JIT, deliberately: iOS will not grant a "
         "third-party app the entitlement to generate machine code, and running there "

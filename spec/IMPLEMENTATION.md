@@ -37,7 +37,7 @@
   generated header; `third_party/QUICKJS-PROVENANCE.md` has the lineage this
   is built on.
 
-## Performance shape (measured, benchmarks/wintercg/run.sh)
+## Performance shape (measured, benchmarks/wintertc/run.sh)
 
 - sxn wins seven of the eight README benchmark categories on both measured
   machines: startup, cold start, Buffer and TextEncoder throughput, both
@@ -221,7 +221,7 @@ The remaining item is a generational nursery for object churn
 refcounting versus a nursery that reclaims dead young objects for free).
 On the nursery's cost, an earlier claim in this ledger was overstated and is
 corrected here. The 0.05 ms vs 2.62 ms worst-pause figure comes from
-`benchmarks/wintercg/pause.sx`, where every allocation dies immediately --
+`benchmarks/wintertc/pause.sx`, where every allocation dies immediately --
 the pattern that most flatters refcounting and most penalises a collector,
 which must still scavenge. Re-measured on `benchmarks/workload/
 pause_survivors.js`, which keeps 2000 objects live while churning 2M, the

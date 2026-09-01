@@ -71,7 +71,7 @@ endif()
 # writing to a directory the other one hasn't created yet.
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
-# WinterCG globals (TextEncoder, URL, Headers, fetch's JS glue, ...) are
+# WinterTC globals (TextEncoder, URL, Headers, fetch's JS glue, ...) are
 # authored as plain JS in src/bootstrap.js and compiled to bytecode at build
 # time, so startup reads a prepared function instead of parsing 140KB of
 # JavaScript on every launch -- worth about 3ms of a 10ms cold start.
@@ -94,7 +94,7 @@ add_custom_target(sxn_bootstrap_header DEPENDS ${SXN_BOOTSTRAP_HEADER})
 
 # node:buffer/path/events/process are authored and compiled the same way
 # (src/node_compat.js), kept as a separate file/header from bootstrap.js
-# since it's a distinct WinterCG-vs-Node-compat concern.
+# since it's a distinct WinterTC-vs-Node-compat concern.
 set(SXN_NODE_COMPAT_JS ${CMAKE_CURRENT_SOURCE_DIR}/src/node_compat.js)
 set(SXN_NODE_COMPAT_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/sxn_node_compat.h)
 add_custom_command(
@@ -465,6 +465,14 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # expectations are Node's own output, so a divergence fails.
   add_test(NAME sxn-json-edges COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/json_edges.mjs)
   set_tests_properties(sxn-json-edges PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # Every name the Minimum Common API asks for, and what the new ones do:
+  # URLPattern's matching, the compression streams, BYOB reads.
+  add_test(NAME sxn-wintertc-surface COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/wintertc_surface.mjs)
+  set_tests_properties(sxn-wintertc-surface PROPERTIES TIMEOUT 60 FAIL_REGULAR_EXPRESSION "FAIL")
+  # The builtins beyond the original 24, exercised rather than probed: a real
+  # child process, a real DNS answer, a real UDP round trip.
+  add_test(NAME sxn-node-new-builtins COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/node_new_builtins.mjs)
+  set_tests_properties(sxn-node-new-builtins PROPERTIES TIMEOUT 60 FAIL_REGULAR_EXPRESSION "FAIL")
   # 4000 seeded-random documents through parse and stringify, hashed. The
   # expected hash is Node's, so one byte of divergence anywhere fails.
   add_test(NAME sxn-json-fuzz COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/json_fuzz.mjs)

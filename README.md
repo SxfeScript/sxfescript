@@ -104,13 +104,15 @@ yet represented as complete production implementations.
 Two documents cover what actually runs, and split the same way the codebase
 does:
 
-- **`spec/RUNTIME.md`** -- the WinterCG web APIs and the `Sxn` host namespace:
-  `fetch`, `Sxn.serve` (HTTP, SSE, WebSocket upgrade), Web Streams, Web
-  Crypto, `structuredClone`, and `Sxn.ffi` for calling a C function directly.
+- **`spec/RUNTIME.md`** -- the WinterTC web APIs and the `Sxn` host namespace:
+  `fetch`, `Sxn.serve` (HTTP, SSE, WebSocket upgrade), Web Streams,
+  `URLPattern`, Web Crypto, `structuredClone`, and `Sxn.ffi` for calling a C
+  function directly. Every name in the Minimum Common API is there except
+  WebAssembly's.
   This is the half that travels when the engine is embedded elsewhere, and
   the only half a mobile build needs.
 - **`spec/NODE.md`** -- what makes `sxn` usable as a Node alternative:
-  CommonJS, `node:` builtins (24 of ~37), and `.node` native-addon loading
+  CommonJS, `node:` builtins (37 of ~37), and `.node` native-addon loading
   through a from-scratch Node-API implementation. This half exists to
   emulate Node and nothing else, so a build with no Node surface drops it
   and loses nothing on the runtime side.
@@ -131,7 +133,7 @@ negligible on a one-liner.
 
 ## Benchmarks: sxn vs Node vs Bun
 
-`benchmarks/wintercg/run.sh` runs matched WinterCG-style workloads against
+`benchmarks/wintertc/run.sh` runs matched WinterTC-style workloads against
 `sxn`, Node and Bun side by side. No category is
 hidden -- the others win the ones you'd expect them to. Each runtime runs the
 same workload with the same iteration counts, written in that runtime's
@@ -141,14 +143,14 @@ three. Bun is optional -- its rows are skipped with a note if it isn't
 installed.
 
 ```sh
-sh benchmarks/wintercg/run.sh
+sh benchmarks/wintertc/run.sh
 ```
 
 For performance measurements, use the optimized binary explicitly; the script
 accepts any SXN path. For example:
 
 ```sh
-RUNS=1000 SXN=build/release/sxn sh benchmarks/wintercg/run.sh
+RUNS=1000 SXN=build/release/sxn sh benchmarks/wintertc/run.sh
 ```
 
 Keep Debug for leak and correctness checks; Release is the appropriate binary

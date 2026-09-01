@@ -1,5 +1,5 @@
 // Sxn.serve in Request/Response terms -- the shape spec/RUNTIME.md documents
-// and the one a handler written for any other WinterCG runtime already uses.
+// and the one a handler written for any other WinterTC runtime already uses.
 // Regression for three things that each broke the documented example: a
 // returned Response wrote a garbled reply, `new URL(req.url)` threw because
 // req.url was a bare path, and `port: 0` reported 0 instead of the port the

@@ -1,4 +1,4 @@
-/* WinterCG-ish globals layered on top of the native bindings installed by
+/* WinterTC-ish globals layered on top of the native bindings installed by
    sxn_install_network (the __sxn* functions below). Pure parsing/spec logic
    lives here in JS; anything needing tight C integration (the streaming
    fetch body, random bytes, digests, the monotonic clock) is a thin native
@@ -572,7 +572,7 @@
   AbortController.prototype.abort = function (reason) { this.signal._doAbort(reason); };
   globalThis.AbortController = AbortController;
 
-  // ---------------- Blob (WinterCG) ----------------
+  // ---------------- Blob (WinterTC) ----------------
   // Bytes are concatenated eagerly at construction time into a single
   // Uint8Array (this._bytes) -- a deliberately minimal, honestly-scoped
   // in-memory backing store rather than a lazy/streamed one, matching the
@@ -1009,6 +1009,9 @@
     this._closedDeferred = deferred();
     this._disturbed = false;
     const c = new ReadableStreamDefaultController(this, source, strategy);
+    // A byte stream's controller answers to the name the spec gives it. The
+    // queue underneath is the same one: chunks are views either way.
+    if (source.type === "bytes") Object.setPrototypeOf(c, ReadableByteStreamController.prototype);
     this._controller = c;
     const started = typeof source.start === "function"
       ? Promise.resolve().then(() => source.start(c)) : Promise.resolve();
@@ -1019,9 +1022,8 @@
     get() { return this._reader !== null; },
   });
   ReadableStream.prototype.getReader = function (options) {
-    if (options && options.mode === "byob")
-      throw new TypeError("byob readers are not supported");
     streamAssert(!this.locked, "stream is already locked");
+    if (options && options.mode === "byob") return new ReadableStreamBYOBReader(this);
     return new ReadableStreamDefaultReader(this);
   };
   ReadableStream.prototype.cancel = function (reason) {
@@ -1325,16 +1327,27 @@
   };
   globalThis.WritableStreamDefaultWriter = WritableStreamDefaultWriter;
 
+  // The handle a transformer is given. It reaches the readable side's own
+  // controller through a getter, because that one does not exist yet when
+  // this is constructed.
+  function TransformStreamDefaultController(readable) {
+    Object.defineProperty(this, "_readable", { value: readable });
+  }
+  TransformStreamDefaultController.prototype.enqueue = function (chunk) { this._readable().enqueue(chunk); };
+  TransformStreamDefaultController.prototype.error = function (e) { this._readable().error(e); };
+  TransformStreamDefaultController.prototype.terminate = function () {
+    try { this._readable().close(); } catch {}
+  };
+  Object.defineProperty(TransformStreamDefaultController.prototype, "desiredSize", {
+    get() { return this._readable().desiredSize; },
+  });
+  globalThis.TransformStreamDefaultController = TransformStreamDefaultController;
+
   // ---- transform ----
   function TransformStream(transformer, writableStrategy, readableStrategy) {
     transformer = transformer || {};
     let readableController;
-    const controller = {
-      enqueue: (chunk) => readableController.enqueue(chunk),
-      error: (e) => { readableController.error(e); },
-      terminate: () => { try { readableController.close(); } catch {} },
-      get desiredSize() { return readableController.desiredSize; },
-    };
+    const controller = new TransformStreamDefaultController(() => readableController);
     this.readable = new ReadableStream({
       start(c) { readableController = c; },
     }, readableStrategy || {});
@@ -1391,6 +1404,358 @@
     this.encoding = dec.encoding;
   }
   globalThis.TextDecoderStream = TextDecoderStream;
+
+  // ---- byte streams ----
+  // The queue is the same one the default controller keeps; what is different
+  // is the reader, which copies out of the queued views into the caller's
+  // buffer. A byobRequest is never handed to a source, because nothing here
+  // reads straight into the caller's memory -- so it reads null, and a source
+  // that only writes through one will find nothing to write into.
+  function ReadableByteStreamController() { throw new TypeError("Illegal constructor"); }
+  ReadableByteStreamController.prototype = Object.create(ReadableStreamDefaultController.prototype);
+  ReadableByteStreamController.prototype.constructor = ReadableByteStreamController;
+  Object.defineProperty(ReadableByteStreamController.prototype, "byobRequest", { get() { return null; } });
+  globalThis.ReadableByteStreamController = ReadableByteStreamController;
+
+  function ReadableStreamBYOBRequest() { throw new TypeError("Illegal constructor"); }
+  globalThis.ReadableStreamBYOBRequest = ReadableStreamBYOBRequest;
+
+  function ReadableStreamBYOBReader(stream) {
+    ReadableStreamDefaultReader.call(this, stream);
+    this._left = null;
+  }
+  ReadableStreamBYOBReader.prototype = Object.create(ReadableStreamDefaultReader.prototype);
+  ReadableStreamBYOBReader.prototype.constructor = ReadableStreamBYOBReader;
+  ReadableStreamBYOBReader.prototype.read = function (view) {
+    if (!ArrayBuffer.isView(view)) return Promise.reject(new TypeError("read needs a view"));
+    if (view.byteLength === 0) return Promise.reject(new TypeError("view is empty"));
+    const self = this;
+    const fill = (source) => {
+      const room = view.byteLength;
+      const take = Math.min(room, source.byteLength);
+      new Uint8Array(view.buffer, view.byteOffset, room)
+        .set(source.subarray(0, take));
+      self._left = take < source.byteLength ? source.subarray(take) : null;
+      const Kind = view.constructor;
+      return { value: new Kind(view.buffer, view.byteOffset, take / (view.BYTES_PER_ELEMENT || 1)), done: false };
+    };
+    if (this._left) return Promise.resolve(fill(this._left));
+    return ReadableStreamDefaultReader.prototype.read.call(this).then((r) => {
+      if (r.done) return { value: new view.constructor(view.buffer, view.byteOffset, 0), done: true };
+      const bytes = ArrayBuffer.isView(r.value)
+        ? new Uint8Array(r.value.buffer, r.value.byteOffset, r.value.byteLength)
+        : new Uint8Array(r.value);
+      return fill(bytes);
+    });
+  };
+  globalThis.ReadableStreamBYOBReader = ReadableStreamBYOBReader;
+  globalThis.ReadableStreamDefaultController = ReadableStreamDefaultController;
+  globalThis.WritableStreamDefaultController = WritableStreamDefaultController;
+
+  // ---- CompressionStream / DecompressionStream ----
+  // A TransformStream over the streaming zlib in src/node.c: one z_stream per
+  // stream object, chunks pushed through as they arrive.
+  const zlibWindow = { gzip: 31, deflate: 15, "deflate-raw": -15 };
+  function compressionTransform(format, decompress) {
+    const bits = zlibWindow[format];
+    if (bits === undefined) throw new TypeError("Unsupported compression format: " + format);
+    const handle = __sxnZlibStreamNew(bits, -1, decompress);
+    const stream = new TransformStream({
+      transform(chunk, controller) {
+        const bytes = ArrayBuffer.isView(chunk)
+          ? new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+          : new Uint8Array(chunk);
+        const out = __sxnZlibStreamPush(handle, bytes, false);
+        if (out.length) controller.enqueue(out);
+      },
+      flush(controller) {
+        const out = __sxnZlibStreamPush(handle, null, true);
+        if (out.length) controller.enqueue(out);
+      },
+    });
+    return stream;
+  }
+  function CompressionStream(format) {
+    const t = compressionTransform(format, false);
+    this.readable = t.readable;
+    this.writable = t.writable;
+  }
+  function DecompressionStream(format) {
+    const t = compressionTransform(format, true);
+    this.readable = t.readable;
+    this.writable = t.writable;
+  }
+  globalThis.CompressionStream = CompressionStream;
+  globalThis.DecompressionStream = DecompressionStream;
+
+  // ---- the rest of the Minimum Common API's names ----
+  function ErrorEvent(type, init) {
+    Event.call(this, type, init);
+    init = init || {};
+    this.message = init.message === undefined ? "" : String(init.message);
+    this.filename = init.filename === undefined ? "" : String(init.filename);
+    this.lineno = init.lineno || 0;
+    this.colno = init.colno || 0;
+    this.error = init.error;
+  }
+  ErrorEvent.prototype = Object.create(Event.prototype);
+  ErrorEvent.prototype.constructor = ErrorEvent;
+  globalThis.ErrorEvent = ErrorEvent;
+
+  function PromiseRejectionEvent(type, init) {
+    Event.call(this, type, init);
+    init = init || {};
+    this.promise = init.promise;
+    this.reason = init.reason;
+  }
+  PromiseRejectionEvent.prototype = Object.create(Event.prototype);
+  PromiseRejectionEvent.prototype.constructor = PromiseRejectionEvent;
+  globalThis.PromiseRejectionEvent = PromiseRejectionEvent;
+
+  // reportError reports an exception the way an uncaught one is reported,
+  // without unwinding the caller.
+  globalThis.reportError = function (error) {
+    const text = error instanceof Error && error.stack ? error.stack : String(error);
+    __sxnWriteStderr("Uncaught " + text + "\n");
+  };
+
+  // A worker-shaped runtime names its own global `self`.
+  if (typeof globalThis.self === "undefined") globalThis.self = globalThis;
+
+  function Performance() { throw new TypeError("Illegal constructor"); }
+  Performance.prototype.now = function () { return __sxnNow(); };
+  Object.defineProperty(Performance.prototype, "timeOrigin", { get() { return 0; } });
+  Performance.prototype.toJSON = function () { return { timeOrigin: 0 }; };
+  globalThis.Performance = Performance;
+  Object.setPrototypeOf(globalThis.performance, Performance.prototype);
+
+  // ---------------- global event handlers ----------------
+  // The global object is an event target: `addEventListener("error", ...)`
+  // and the matching `onerror` property both work, and both see the same
+  // events. The C side (src/main.c, src/network.c) calls in here.
+  if (typeof globalThis.addEventListener !== "function") {
+    const target = new EventTarget();
+    globalThis.addEventListener = EventTarget.prototype.addEventListener.bind(target);
+    globalThis.removeEventListener = EventTarget.prototype.removeEventListener.bind(target);
+    globalThis.dispatchEvent = EventTarget.prototype.dispatchEvent.bind(target);
+  }
+  for (const name of ["onerror", "onunhandledrejection", "onrejectionhandled"]) {
+    let handler = null;
+    Object.defineProperty(globalThis, name, {
+      configurable: true,
+      get() { return handler; },
+      set(fn) { handler = typeof fn === "function" ? fn : null; },
+    });
+  }
+  function fireGlobal(event, handlerName) {
+    let handled = false;
+    try { handled = globalThis.dispatchEvent(event) === false; } catch {}
+    const handler = globalThis[handlerName];
+    if (handler) {
+      try {
+        const r = handler.call(globalThis, event);
+        // onerror is the odd one: returning true from it is what cancels it.
+        if (r === true || event.defaultPrevented) handled = true;
+      } catch {}
+    }
+    return handled || event.defaultPrevented;
+  }
+  // Called with the exception that reached the top; true means it was
+  // handled and should not be printed.
+  globalThis.__sxnUncaught = function (error) {
+    const event = new ErrorEvent("error", {
+      cancelable: true,
+      message: error instanceof Error ? error.message : String(error),
+      error,
+    });
+    return fireGlobal(event, "onerror");
+  };
+  // Rejections are collected as they happen and reported once every job that
+  // could still have handled one has run.
+  const pendingRejections = [];
+  const reportedRejections = [];
+  globalThis.__sxnRejectionRaised = function (promise, reason) {
+    if (!pendingRejections.some((e) => e.promise === promise))
+      pendingRejections.push({ promise, reason });
+  };
+  globalThis.__sxnRejectionHandled = function (promise) {
+    const i = pendingRejections.findIndex((e) => e.promise === promise);
+    if (i >= 0) pendingRejections.splice(i, 1);
+    const j = reportedRejections.findIndex((e) => e.promise === promise);
+    if (j >= 0) {
+      const entry = reportedRejections.splice(j, 1)[0];
+      fireGlobal(new PromiseRejectionEvent("rejectionhandled", {
+        cancelable: true, promise, reason: entry.reason,
+      }), "onrejectionhandled");
+    }
+  };
+  globalThis.__sxnFlushRejections = function () {
+    while (pendingRejections.length) {
+      const entry = pendingRejections.shift();
+      reportedRejections.push(entry);
+      fireGlobal(new PromiseRejectionEvent("unhandledrejection", {
+        cancelable: true, promise: entry.promise, reason: entry.reason,
+      }), "onunhandledrejection");
+    }
+  };
+
+  // ---------------- URLPattern ----------------
+  // Each component of a URL gets its own compiled pattern: `:name` captures a
+  // segment, `(...)` is a regular expression written in place, `*` is
+  // anything, and `{...}` groups what it wraps so a `?` after it can make the
+  // whole thing optional. What a bare `:name` or `*` will match stops at the
+  // separator its component uses -- `/` in a path, `.` in a hostname -- which
+  // is what makes `/books/:id` match one segment rather than the rest.
+  const patternSeparator = { pathname: "/", hostname: "." };
+  function compileComponent(pattern, kind) {
+    if (pattern === undefined || pattern === null || pattern === "*")
+      return { source: "^.*$", names: [], wildcard: true };
+    const text = String(pattern);
+    const sep = patternSeparator[kind];
+    const segment = sep ? "[^" + (sep === "." ? "." : "\\/") + "]+?" : "[^]+?";
+    const names = [];
+    let out = "";
+    let unnamed = 0;
+    for (let i = 0; i < text.length; i++) {
+      const ch = text[i];
+      if (ch === "\\") { out += escapeRe(text[++i] || ""); continue; }
+      if (ch === "*") { names.push(String(unnamed++)); out += "(.*)"; continue; }
+      if (ch === ":") {
+        let name = "";
+        while (i + 1 < text.length && /[A-Za-z0-9_$]/.test(text[i + 1])) name += text[++i];
+        let body = segment;
+        if (text[i + 1] === "(") {
+          const close = matchParen(text, i + 1);
+          body = text.slice(i + 2, close);
+          i = close;
+        }
+        names.push(name);
+        out += "(" + body + ")";
+        const mod = text[i + 1];
+        if (mod === "?" || mod === "*" || mod === "+") { out += mod; i++; }
+        continue;
+      }
+      if (ch === "(") {
+        const close = matchParen(text, i);
+        names.push(String(unnamed++));
+        out += "(" + text.slice(i + 1, close) + ")";
+        i = close;
+        continue;
+      }
+      if (ch === "{") {
+        const close = text.indexOf("}", i);
+        const inner = compileComponent(text.slice(i + 1, close < 0 ? text.length : close), kind);
+        out += "(?:" + inner.source.slice(1, -1) + ")";
+        for (const n of inner.names) names.push(n);
+        i = close < 0 ? text.length : close;
+        const mod = text[i + 1];
+        if (mod === "?" || mod === "*" || mod === "+") { out += mod; i++; }
+        continue;
+      }
+      out += escapeRe(ch);
+    }
+    return { source: "^" + out + "$", names, wildcard: false };
+  }
+  function escapeRe(ch) { return /[.*+?^${}()|[\]\\\/]/.test(ch) ? "\\" + ch : ch; }
+  function matchParen(text, start) {
+    let depth = 0;
+    for (let i = start; i < text.length; i++) {
+      if (text[i] === "\\") { i++; continue; }
+      if (text[i] === "(") depth++;
+      else if (text[i] === ")" && --depth === 0) return i;
+    }
+    return text.length;
+  }
+
+  const patternParts = ["protocol", "username", "password", "hostname", "port",
+                        "pathname", "search", "hash"];
+  // A pattern written as one string is split the way a URL is, without
+  // resolving it: the pieces are patterns, not values, so they cannot be
+  // handed to the URL parser.
+  function splitPatternString(text) {
+    const out = {};
+    let rest = String(text);
+    const scheme = rest.match(/^([^:\/?#]+):\/\//);
+    if (scheme) { out.protocol = scheme[1]; rest = rest.slice(scheme[0].length); }
+    const hash = rest.indexOf("#");
+    if (hash >= 0) { out.hash = rest.slice(hash + 1); rest = rest.slice(0, hash); }
+    const search = rest.indexOf("?");
+    if (search >= 0) { out.search = rest.slice(search + 1); rest = rest.slice(0, search); }
+    if (scheme) {
+      const slash = rest.indexOf("/");
+      let authority = slash < 0 ? rest : rest.slice(0, slash);
+      out.pathname = slash < 0 ? "*" : rest.slice(slash);
+      const at = authority.lastIndexOf("@");
+      if (at >= 0) {
+        const creds = authority.slice(0, at).split(":");
+        out.username = creds[0];
+        if (creds.length > 1) out.password = creds[1];
+        authority = authority.slice(at + 1);
+      }
+      const colon = authority.lastIndexOf(":");
+      if (colon > 0 && authority.indexOf("}", colon) < 0) {
+        out.port = authority.slice(colon + 1);
+        authority = authority.slice(0, colon);
+      }
+      out.hostname = authority;
+    } else {
+      out.pathname = rest;
+    }
+    return out;
+  }
+  function URLPattern(input, baseURL) {
+    const raw = typeof input === "string" ? splitPatternString(input) : Object.assign({}, input || {});
+    if (typeof baseURL === "string" || (input && typeof input === "object" && input.baseURL)) {
+      const base = new URL(typeof baseURL === "string" ? baseURL : input.baseURL);
+      if (raw.protocol === undefined) raw.protocol = base.protocol.replace(":", "");
+      if (raw.hostname === undefined) raw.hostname = base.hostname;
+      if (raw.port === undefined && base.port) raw.port = base.port;
+    }
+    this._compiled = {};
+    for (const part of patternParts) {
+      this[part] = raw[part] === undefined ? "*" : String(raw[part]);
+      this._compiled[part] = compileComponent(raw[part], part);
+    }
+  }
+  Object.defineProperty(URLPattern.prototype, "hasRegExpGroups", {
+    get() { return patternParts.some((p) => /[(:]/.test(this[p])); },
+  });
+  function patternInputParts(input, base) {
+    if (typeof input === "string" || input instanceof URL) {
+      let url;
+      try { url = new URL(String(input), base); } catch { return null; }
+      return {
+        protocol: url.protocol.replace(/:$/, ""),
+        username: url.username, password: url.password,
+        hostname: url.hostname, port: url.port,
+        pathname: url.pathname,
+        search: url.search.replace(/^\?/, ""),
+        hash: url.hash.replace(/^#/, ""),
+      };
+    }
+    const out = {};
+    for (const part of patternParts) out[part] = input && input[part] !== undefined ? String(input[part]) : "";
+    return out;
+  }
+  URLPattern.prototype.exec = function (input, base) {
+    const values = patternInputParts(input, base);
+    if (!values) return null;
+    const result = { inputs: base === undefined ? [input] : [input, base] };
+    for (const part of patternParts) {
+      const compiled = this._compiled[part];
+      const value = values[part];
+      // An unwritten component matches anything, including the empty string a
+      // URL leaves behind for a port or a hash it does not have.
+      const m = new RegExp(compiled.source).exec(value);
+      if (!m) return null;
+      const groups = {};
+      compiled.names.forEach((name, i) => { groups[name] = m[i + 1]; });
+      result[part] = { input: value, groups };
+    }
+    return result;
+  };
+  URLPattern.prototype.test = function (input, base) { return this.exec(input, base) !== null; };
+  globalThis.URLPattern = URLPattern;
 
   // ---------------- File / FormData ----------------
   // File is a Blob with a name and a modified time; FormData is the multi-map
@@ -1584,7 +1949,7 @@
   if (typeof globalThis.navigator === "undefined") {
     globalThis.navigator = Object.freeze({
       userAgent: "sxn/" + (Sxn && Sxn.version ? Sxn.version : "0"),
-      // WinterCG names this for runtime detection.
+      // WinterTC names this for runtime detection.
       platform: "",
     });
   }
@@ -1631,7 +1996,7 @@
   // node:http is built directly on it through __sxnServe, and Node's own
   // req.url is a path, not an absolute URL -- but it is not what
   // spec/RUNTIME.md documents or what a handler written for any other
-  // WinterCG runtime expects. Returning a Response used to write a garbled
+  // WinterTC runtime expects. Returning a Response used to write a garbled
   // reply, and `new URL(req.url)` threw, so the documented example did not
   // run. This adapts both ends in one place.
   (function () {

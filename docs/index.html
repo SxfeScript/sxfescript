@@ -380,7 +380,7 @@ sqrt(144)  = 12</code></pre>
       ArcSX is a QuickJS-ng fork, built as <code>sxn</code>. It runs <code>.sx</code>,
       <code>.ts</code>, and ordinary <code>.js</code>/<code>.mjs</code>/<code>.cjs</code>
       directly, with two compatibility layers built on top of the same engine core: one for the
-      browser-shaped WinterCG web APIs, one for Node.
+      browser-shaped WinterTC web APIs, one for Node.
     </p>
 
     <p style="color:var(--ink-mid); font-size:14.5px; max-width:68ch; margin-bottom:12px;">
@@ -422,19 +422,21 @@ sqrt(144)  = 12</code></pre>
     </div>
     <p style="color:var(--ink-soft); font-size:13px; margin: 10px 0 30px;">
       All five rows, every runtime, same machine, same workload, run side by side by
-      <code>benchmarks/wintercg/run.sh</code> in the repo. Nothing here is cherry-picked
+      <code>benchmarks/wintertc/run.sh</code> in the repo. Nothing here is cherry-picked
       or estimated.
     </p>
 
     <div class="grid-2">
       <div class="card">
-        <h3>WinterCG surface <span class="badge">45 / 55</span></h3>
-        <p><code>fetch</code>, <code>Sxn.serve</code> (HTTP, SSE, WebSocket upgrade), Web
-        Streams, Web Crypto, <code>structuredClone</code>. This half travels wherever the
-        engine is embedded. It's not tied to Node emulation.</p>
+        <h3>WinterTC surface <span class="badge">62 / 62</span></h3>
+        <p>Every name in the Minimum Common API except WebAssembly:
+        <code>fetch</code>, <code>Sxn.serve</code> (HTTP, SSE, WebSocket upgrade), Web
+        Streams including BYOB reads and the compression streams,
+        <code>URLPattern</code>, Web Crypto, <code>structuredClone</code>. This half
+        travels wherever the engine is embedded. It's not tied to Node emulation.</p>
       </div>
       <div class="card">
-        <h3>Node compatibility <span class="badge">24 / ~37</span></h3>
+        <h3>Node compatibility <span class="badge">37 / ~37</span></h3>
         <p>CommonJS, <code>node:</code> builtins, and <code>.node</code> native addons through
         a from-scratch Node-API implementation, real enough that <code>next-swc</code>,
         the Rust binary Next.js compiles JSX with, loads and runs under it.</p>
@@ -476,7 +478,7 @@ sqrt(144)  = 12</code></pre>
           <li>The shape and scope of <code>safe</code>/<code>unsafe</code></li>
           <li>Which TypeScript forms get real support next</li>
           <li>Ownership and borrow-checking rules and their error messages</li>
-          <li><code>node:</code> and WinterCG coverage priorities</li>
+          <li><code>node:</code> and WinterTC coverage priorities</li>
           <li>Naming, ergonomics, anything that reads as a mistake</li>
         </ul>
       </div>
