@@ -4679,6 +4679,63 @@ void sxn_free_node_compat(JSContext *ctx) {
    Sxn.ffi is the other half of the pair and sits on the runtime side. */
 void sxn_install_napi(JSContext *ctx, uv_loop_t *loop);
 
+/* Every node: module this runtime has, and the function that registers it.
+   Registration is not free -- a JSModuleDef plus an atom per export name --
+   and a program that imports two of them used to pay for all forty-four at
+   startup. They are registered when the loader asks for one instead. */
+typedef struct { const char *name; JSModuleDef *(*init)(JSContext *, const char *); } SxnNodeModule;
+static const SxnNodeModule sxn_node_modules[] = {
+    { "node:buffer", sxn_init_module_node_buffer },
+    { "node:events", sxn_init_module_node_events },
+    { "node:path", sxn_init_module_node_path },
+    { "node:process", sxn_init_module_node_process },
+    { "node:fs", sxn_init_module_node_fs },
+    { "node:fs/promises", sxn_init_module_node_fs_promises },
+    { "node:util", sxn_init_module_node_util },
+    { "node:os", sxn_init_module_node_os },
+    { "node:querystring", sxn_init_module_node_querystring },
+    { "node:url", sxn_init_module_node_url },
+    { "node:assert", sxn_init_module_node_assert },
+    { "node:assert/strict", sxn_init_module_node_assert },
+    { "node:stream", sxn_init_module_node_stream },
+    { "node:http", sxn_init_module_node_http },
+    { "node:net", sxn_init_module_node_net },
+    { "node:crypto", sxn_init_module_node_crypto },
+    { "node:zlib", sxn_init_module_node_zlib },
+    { "node:tty", sxn_init_module_node_tty },
+    { "node:string_decoder", sxn_init_module_node_string_decoder },
+    { "node:timers", sxn_init_module_node_timers },
+    { "node:timers/promises", sxn_init_module_node_timers_promises },
+    { "node:stream/promises", sxn_init_module_node_stream_promises },
+    { "node:perf_hooks", sxn_init_module_node_perf_hooks },
+    { "node:module", sxn_init_module_node_module },
+    { "node:child_process", sxn_init_module_node_child_process },
+    { "node:dns", sxn_init_module_node_dns },
+    { "node:dns/promises", sxn_init_module_node_dns_promises },
+    { "node:https", sxn_init_module_node_https },
+    { "node:tls", sxn_init_module_node_tls },
+    { "node:http2", sxn_init_module_node_http2 },
+    { "node:stream/web", sxn_init_module_node_stream_web },
+    { "node:vm", sxn_init_module_node_vm },
+    { "node:v8", sxn_init_module_node_v8 },
+    { "node:worker_threads", sxn_init_module_node_worker_threads },
+    { "node:cluster", sxn_init_module_node_cluster },
+    { "node:readline", sxn_init_module_node_readline },
+    { "node:readline/promises", sxn_init_module_node_readline_promises },
+    { "node:async_hooks", sxn_init_module_node_async_hooks },
+    { "node:inspector", sxn_init_module_node_inspector },
+    { "node:dgram", sxn_init_module_node_dgram },
+    { "node:punycode", sxn_init_module_node_punycode },
+    { "node:diagnostics_channel", sxn_init_module_node_diagnostics_channel },
+    { NULL, NULL },
+};
+
+JSModuleDef *sxn_node_module_load(JSContext *ctx, const char *name) {
+    for (const SxnNodeModule *m = sxn_node_modules; m->name; m++)
+        if (!strcmp(m->name, name)) return m->init(ctx, name);
+    return NULL;
+}
+
 int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
     if (sxn_atom_events == JS_ATOM_NULL) sxn_atom_events = JS_NewAtom(ctx, "_events");
     if (sxn_atom_length == JS_ATOM_NULL) sxn_atom_length = JS_NewAtom(ctx, "length");
@@ -4839,49 +4896,5 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
     JS_FreeValue(ctx, result);
     sxn_install_buffer_natives(ctx);
 
-    if (!sxn_init_module_node_buffer(ctx, "node:buffer")) return -1;
-    if (!sxn_init_module_node_events(ctx, "node:events")) return -1;
-    if (!sxn_init_module_node_path(ctx, "node:path")) return -1;
-    if (!sxn_init_module_node_process(ctx, "node:process")) return -1;
-    if (!sxn_init_module_node_fs(ctx, "node:fs")) return -1;
-    if (!sxn_init_module_node_fs_promises(ctx, "node:fs/promises")) return -1;
-    if (!sxn_init_module_node_util(ctx, "node:util")) return -1;
-    if (!sxn_init_module_node_os(ctx, "node:os")) return -1;
-    if (!sxn_init_module_node_querystring(ctx, "node:querystring")) return -1;
-    if (!sxn_init_module_node_url(ctx, "node:url")) return -1;
-    if (!sxn_init_module_node_assert(ctx, "node:assert")) return -1;
-    if (!sxn_init_module_node_assert(ctx, "node:assert/strict")) return -1;
-    if (!sxn_init_module_node_stream(ctx, "node:stream")) return -1;
-    if (!sxn_init_module_node_http(ctx, "node:http")) return -1;
-    if (!sxn_init_module_node_net(ctx, "node:net")) return -1;
-    if (!sxn_init_module_node_crypto(ctx, "node:crypto")) return -1;
-    if (!sxn_init_module_node_zlib(ctx, "node:zlib")) return -1;
-    if (!sxn_init_module_node_tty(ctx, "node:tty")) return -1;
-    if (!sxn_init_module_node_string_decoder(ctx, "node:string_decoder")) return -1;
-    if (!sxn_init_module_node_timers(ctx, "node:timers")) return -1;
-    /* The promises sub-path is a distinct specifier; register the object it
-       names directly rather than re-exporting the parent. */
-    if (!sxn_init_module_node_timers_promises(ctx, "node:timers/promises")) return -1;
-    if (!sxn_init_module_node_stream_promises(ctx, "node:stream/promises")) return -1;
-    if (!sxn_init_module_node_perf_hooks(ctx, "node:perf_hooks")) return -1;
-    if (!sxn_init_module_node_module(ctx, "node:module")) return -1;
-    if (!sxn_init_module_node_child_process(ctx, "node:child_process")) return -1;
-    if (!sxn_init_module_node_dns(ctx, "node:dns")) return -1;
-    if (!sxn_init_module_node_dns_promises(ctx, "node:dns/promises")) return -1;
-    if (!sxn_init_module_node_https(ctx, "node:https")) return -1;
-    if (!sxn_init_module_node_tls(ctx, "node:tls")) return -1;
-    if (!sxn_init_module_node_http2(ctx, "node:http2")) return -1;
-    if (!sxn_init_module_node_stream_web(ctx, "node:stream/web")) return -1;
-    if (!sxn_init_module_node_vm(ctx, "node:vm")) return -1;
-    if (!sxn_init_module_node_v8(ctx, "node:v8")) return -1;
-    if (!sxn_init_module_node_worker_threads(ctx, "node:worker_threads")) return -1;
-    if (!sxn_init_module_node_cluster(ctx, "node:cluster")) return -1;
-    if (!sxn_init_module_node_readline(ctx, "node:readline")) return -1;
-    if (!sxn_init_module_node_readline_promises(ctx, "node:readline/promises")) return -1;
-    if (!sxn_init_module_node_async_hooks(ctx, "node:async_hooks")) return -1;
-    if (!sxn_init_module_node_inspector(ctx, "node:inspector")) return -1;
-    if (!sxn_init_module_node_dgram(ctx, "node:dgram")) return -1;
-    if (!sxn_init_module_node_punycode(ctx, "node:punycode")) return -1;
-    if (!sxn_init_module_node_diagnostics_channel(ctx, "node:diagnostics_channel")) return -1;
     return 0;
 }

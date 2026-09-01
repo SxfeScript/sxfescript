@@ -111,6 +111,10 @@ int sxn_run_event_loop(struct JSContext *context);
    same native-primitives-plus-JS-bootstrap split as sxn_install_network.
    exec_path becomes process.argv[0]. */
 int sxn_install_node_compat(struct JSContext *context, const char *exec_path);
+/* Registers one node: builtin module by its full specifier ("node:fs"), or
+   returns NULL if this runtime has no such module. Called by the module
+   loader, so that a program pays only for the builtins it imports. */
+struct JSModuleDef *sxn_node_module_load(struct JSContext *context, const char *name);
 /* Releases the atoms sxn_install_node_compat cached; call once, before
    JS_FreeContext, or the runtime reports them as leaked. */
 void sxn_free_node_compat(struct JSContext *context);

@@ -884,14 +884,15 @@ static char *sxn_module_normalize(JSContext *ctx, const char *base_name,
 
 static JSModuleDef *sxn_module_loader(JSContext *ctx, const char *name, void *opaque,
                                       JSValueConst attributes) {
-    /* node:buffer/path/events/process/fs/fs-promises are pre-registered by
-       sxn_install_node_compat via JS_NewCModule (same mechanism as
-       qjs:std/qjs:os/qjs:bjson below), so `import ... from "node:xxx"`
-       resolves to them without ever reaching this loader. Only an
-       unregistered node: specifier gets here -- report it clearly instead
-       of falling through to file-based resolution, which would otherwise
-       try (and fail confusingly) to open a file literally named "node:xxx". */
+    /* A node: specifier is registered here, on the way through, rather than
+       at startup: JS_NewCModule plus an atom per export name is real work,
+       and a program that imports two builtins used to pay for all of them.
+       A name this runtime does not have is reported clearly instead of
+       falling through to file-based resolution, which would otherwise try
+       (and fail confusingly) to open a file literally named "node:xxx". */
     if (has_prefix(name, "node:")) {
+        JSModuleDef *m = sxn_node_module_load(ctx, name);
+        if (m) return m;
         JS_ThrowReferenceError(ctx, "unsupported node: module '%s'", name);
         return NULL;
     }
