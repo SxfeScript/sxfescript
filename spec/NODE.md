@@ -31,6 +31,14 @@ in the order `import`, `module`, `default`, `require`, `node`, then falling
 back to `module`, then `main`. Circular `require` sees the same partially
 filled `exports` a cycle sees in Node, rather than recursing forever.
 
+A `node:` specifier is registered as a module when the loader is asked for
+it, not at startup: registering all forty-four up front cost a JSModuleDef
+and an atom per export name on every launch, for a program that imports two
+of them. `require` never went through that path at all -- it reads a static
+table (`sxn_builtin_table` in `src/node.c`) and takes one property off the
+global object. The seventeen builtins past the original twenty build their
+objects on first use for the same reason.
+
 ## `.node` addons
 
 `require("./thing.node")` and the `process.dlopen` it calls under the hood
