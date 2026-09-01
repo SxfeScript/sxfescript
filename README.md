@@ -168,14 +168,15 @@ working laptop under load, and the Linux box is slower per core but idle.
 | Memory | 16 GB | 13 GB |
 | OS | macOS 26.6.2 (arm64) | Ubuntu 23.10, kernel 6.5.0-44 (x86_64) |
 | Compiler | Apple clang | gcc 13.2 |
-| Node | v25.2.1 | v18.13.0 |
-| Bun | 1.2.17 | 1.2.17 |
+| Node | v25.2.1 | v23.11.1 |
+| Bun | 1.2.17 | 1.2.21 |
 | Load while measuring | 2-5 | 0.4-1.2 |
 
-Read each machine's table against itself, never across the two. The Linux
-Node is four major versions behind, and `performance.now` costs far more per
-call on that kernel, which is why its pause totals read in seconds for all
-three runtimes. Same tree, same tests, same 95 fixtures passing on both.
+Read each machine's table against itself, never across the two. Both now run
+the same major Node; the Linux box's Bun is a few patches ahead. What still
+differs is the kernel: `performance.now` costs far more per call there, which
+is why its pause totals read in seconds for all three runtimes. Same tree,
+same tests, same 95 fixtures passing on both.
 
 How each row is measured: throughput rows are the harness's own 1,000-run
 medians. The two startup rows are 20 interleaved launches per runtime, quoted
