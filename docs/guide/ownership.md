@@ -83,12 +83,27 @@ console.log(JSON.stringify(pos));
 That is what code crossing into native memory needs, and the exact rules —
 sizes, alignment, padding — are in [the language contract](../language/).
 
-It is also why such a value costs nothing. A binding whose declared type is one
-of these interfaces is compiled to one ordinary local per field, so `pos` above
-is three numbers and no object exists to allocate, collect, or look a property
-up in. JavaScript cannot be compiled this way — any object might be aliased by
-something the compiler cannot see — which is the whole reason for writing the
-type down. [Types and `.sx`](../types/) has the measurement.
+It is also what lets such a value cost nothing. A binding of that type whose
+every use `sxn` can account for is compiled to one ordinary local per field, and
+no object is allocated, collected, or looked a property up in. JavaScript cannot
+be compiled this way — any object might be aliased by something the compiler
+cannot see — which is the whole reason for writing the type down.
+
+`pos` above is not one of those, and the reason is the borrow. `&mut pos` hands
+`applyVelocity` something it may write through, so the value has to exist as an
+object for the length of the call. Written in place instead, the same step is
+40 ns against 180:
+
+```sx
+let mut pos: Transform = { x: 0.0, y: 10.0, z: 5.0 };
+let vel: Transform = { x: 1.0, y: 0.0, z: 0.0 };
+pos.x += vel.x * 0.016;
+pos.y += vel.y * 0.016;
+pos.z += vel.z * 0.016;
+```
+
+Both are in [`examples/velocity.sx`](../examples/), side by side.
+[Types and `.sx`](../types/) has the rest of the measurement.
 
 ## What to read next
 

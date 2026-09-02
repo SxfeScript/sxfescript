@@ -34,7 +34,10 @@ counter: 2
 An interface whose fields are all primitives (`i32`, `f32`, `f64`, `bool`)
 describes a struct with declared field order and natural alignment — the same
 layout on every supported target, which is what code crossing into native
-memory needs.
+memory needs. It is also the one shape `sxn` does not allocate: the first pair
+of vectors below never becomes an object at all. The second pair does, and the
+difference is the borrow — a callee that may write through a value is a callee
+that needs one to write to.
 
 <!-- include: examples/velocity.sx as sx -->
 
@@ -43,6 +46,7 @@ sxn examples/velocity.sx
 ```
 
 ```
+{"x":0.016,"y":10,"z":5}
 {"x":0.016,"y":10,"z":5}
 ```
 

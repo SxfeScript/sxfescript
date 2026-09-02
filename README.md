@@ -40,7 +40,7 @@ Complete programs that run as-is are in [`examples/`](examples/), all of them
 | File | What it shows |
 |---|---|
 | [`hello.sx`](examples/hello.sx) | Erasable types, `let mut`, and an `&mut` borrow |
-| [`velocity.sx`](examples/velocity.sx) | A primitive-only interface as a fixed-layout struct |
+| [`velocity.sx`](examples/velocity.sx) | A primitive-only interface compiled to locals, and what a borrow costs |
 | [`server.sx`](examples/server.sx) | `Sxn.serve` with `Request`/`Response` routing and a JSON body |
 | [`fetch.sx`](examples/fetch.sx) | `fetch`, then the same response read as a stream |
 | [`files.sx`](examples/files.sx) | `Sxn.file`/`Sxn.write`, and `node:fs` over the same file |
