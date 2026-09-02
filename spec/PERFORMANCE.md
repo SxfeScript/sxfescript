@@ -450,10 +450,15 @@ iterations, reported per loop iteration:
 
 7.2x on the row that allocates a struct per iteration and 2.9x on the row that
 only reads and writes its fields, both landing on the hand-written ceiling --
-the same arithmetic over three separate `let`s. Plain JavaScript never
-qualifies, for the same reason it never qualifies for the inliner: the gate is
-a declared type, so a `.js` file is untouched. Remove the annotation and the
-object comes back.
+the same arithmetic over three separate `let`s. The Linux PC agrees on the
+shape and not on the size, which is what the two machines usually do: 187.55 to
+37.42 ns creating, against a ceiling of 38.49, and 41.83 to 16.12 updating,
+against 16.11. Every opcode there costs about twice what it costs on the M4,
+so the ratios come out at 5.0x and 2.6x rather than 7.2 and 2.9.
+
+Plain JavaScript never qualifies, for the same reason it never qualifies for
+the inliner: the gate is a declared type, so a `.js` file is untouched. Remove
+the annotation and the object comes back.
 
 This is the one row in this document where the absence of a JIT is not the
 thing being apologised for. V8 does escape analysis on the same loop, but it
