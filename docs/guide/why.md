@@ -94,10 +94,13 @@ console.log(counter.hits);
 ```
 
 Borrowing an immutable binding is a compile error rather than a convention, and
-a declared scalar type changes the code that is generated — `safe let mut n:
-i32` wraps at the 32-bit boundary, and a small function with a fully declared
-signature is inlined into its caller. [Types and `.sx`](../types/) and
-[ownership and borrows](../ownership/) are the two guides for that half.
+a declared type changes the code that is generated. `safe let mut n: i32` wraps
+at the 32-bit boundary. A small function with a fully declared signature is
+inlined into its caller. And a binding typed as an interface of only primitives
+is compiled to one local per field, so it is never allocated at all — the one
+place where writing the type down beats what a JIT can work out for itself.
+[Types and `.sx`](../types/) and [ownership and borrows](../ownership/) are the
+two guides for that half.
 
 ## Start here
 

@@ -41,8 +41,8 @@ sxfescript has 1 star
 
 That is an ordinary interface and an ordinary annotation, and there is no
 `tsc` and no bundler in front of it. `sxn` parses the types itself and emits
-no code for them — but it does not throw them away either: a declared scalar
-type is remembered and spent on the bytecode that comes out. See
+no code for them — but it does not throw them away either: a declared type is
+remembered and spent on the bytecode that comes out. See
 [types and `.sx`](../types/) for what that buys.
 
 ## Ownership, in one example
