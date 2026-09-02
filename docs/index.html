@@ -392,7 +392,7 @@ sqrt(144)  = 12</code></pre>
           <tr>
             <td>What happens to the types at runtime?</td>
             <td class="no">Erased entirely: a type is a compile-time fiction</td>
-            <td class="yes"><code>safe</code> bindings keep a runtime descriptor and incompatible writes are rejected. The declared type reaches codegen too: <code>i32</code> arithmetic wraps by definition, and a small function with a scalar signature is inlined into its caller</td>
+            <td class="yes"><code>safe</code> bindings keep a runtime descriptor and incompatible writes are rejected. The declared type reaches codegen too: <code>i32</code> arithmetic wraps by definition, a small function with a scalar signature is inlined into its caller, and a binding typed as a primitive-only <code>interface</code> is compiled to one local per field instead of an object</td>
           </tr>
           <tr>
             <td>Do you need a build step to run a file?</td>

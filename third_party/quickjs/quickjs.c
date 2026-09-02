@@ -892,7 +892,33 @@ typedef enum SxType {
     SX_TYPE_F64,
     SX_TYPE_BOOL,
     SX_TYPE_NUMBER,
+    SX_TYPE_STRUCT, /* a primitive-only interface (SxIface); consumed by
+                       sx_scalarize_structs */
 } SxType;
+
+/* arcsx: an SX fixed-layout struct -- an `interface` whose members are all
+   i32/f32/f64/bool (spec/LANGUAGE.md "Layout"). Recorded per compilation
+   unit on the JSParseState while the declaration itself is erased, so a
+   later `: Name` annotation classifies as SX_TYPE_STRUCT and
+   sx_scalarize_structs can split a binding of that type into one scalar
+   local per field. A name declared twice with different members, or with a
+   member that is not one of the four scalars, is kept with field_count == 0
+   so it never classifies as a struct. */
+#define SX_IFACE_MAX_FIELDS 16
+typedef struct SxIfaceField {
+    JSAtom atom;
+    uint8_t sx_type;
+} SxIfaceField;
+typedef struct SxIface {
+    JSAtom name;
+    uint8_t field_count; /* 0: a known name that is not a struct */
+    SxIfaceField fields[SX_IFACE_MAX_FIELDS];
+} SxIface;
+typedef struct SxIfaceTable {
+    SxIface *items;
+    int count;
+    int size;
+} SxIfaceTable;
 
 /* XXX: could use a different structure in bytecode functions to save
    memory */
@@ -930,6 +956,10 @@ typedef struct JSVarDef {
     /* if is_captured = true, provides the index of the corresponding
        JSVarRef on stack */
     uint16_t var_ref_idx;
+    /* arcsx: when sx_type == SX_TYPE_STRUCT, the 1-based index into the
+       file's SxIfaceTable (JSFunctionDef.sx_ifaces). Compile-time only, like
+       sx_type. */
+    uint16_t sx_struct_idx;
     /* only used during compilation: function pool index for lexical
        variables with var_kind =
        JS_VAR_FUNCTION_DECL/JS_VAR_NEW_FUNCTION_DECL or scope level of
@@ -24302,6 +24332,10 @@ typedef struct JSFunctionDef {
     int source_len;
 
     JSModuleDef *module; /* != NULL when parsing a module */
+    /* arcsx: the compilation unit's struct interfaces, owned by the
+       JSParseState and shared down the parent chain; read by
+       sx_scalarize_structs, which runs from js_create_function. */
+    SxIfaceTable *sx_ifaces;
 } JSFunctionDef;
 
 typedef struct JSToken {
@@ -24365,6 +24399,11 @@ typedef struct JSParseState {
     JSFunctionDef *cur_func;
     bool is_module; /* parsing a module */
     bool allow_html_comments;
+    /* arcsx: SX struct interfaces declared so far in this compilation unit,
+       and the struct (1-based, 0 = none) the last js_parse_type_annotation
+       named, for the declaration that consumes it. */
+    SxIfaceTable sx_ifaces;
+    int sx_last_struct;
 } JSParseState;
 
 typedef struct JSOpCode {
@@ -29967,7 +30006,7 @@ static __exception int js_parse_unary(JSParseState *s, int parse_flags)
     int op;
 
     switch(s->token.val) {
-    case '&':
+    case '&': {
         /* SX borrow-reference sigil (`&x` / `&mut x`). A bare '&' can never
            legally start a unary expression in JS (it's a binary operator
            only), so seeing it here is unambiguous -- erase the sigil and
@@ -30010,7 +30049,15 @@ static __exception int js_parse_unary(JSParseState *s, int parse_flags)
                 }
             }
         }
-        return js_parse_unary(s, parse_flags);
+        if (js_parse_unary(s, parse_flags))
+            return -1;
+        /* A phase-1 marker after the operand, so sx_scalarize_structs can
+           tell a borrow from a move. Stack neutral; resolve_labels drops it.
+           Whether the borrow was exclusive is deliberately not recorded: no
+           pass reads it yet, and both kinds keep the object either way. */
+        emit_op(s, OP_sx_borrow);
+        return 0;
+    }
     case '+':
     case '-':
     case '!':
@@ -30158,6 +30205,167 @@ static SxType sx_classify_type_token(JSParseState *s)
     }
 }
 
+/* arcsx: the compilation unit's struct interfaces (see SxIface). */
+static void sx_iface_table_free(JSContext *ctx, SxIfaceTable *t)
+{
+    int i, k;
+    for (i = 0; i < t->count; i++) {
+        JS_FreeAtom(ctx, t->items[i].name);
+        for (k = 0; k < t->items[i].field_count; k++)
+            JS_FreeAtom(ctx, t->items[i].fields[k].atom);
+    }
+    js_free(ctx, t->items);
+    t->items = NULL;
+    t->count = t->size = 0;
+}
+
+static int sx_iface_lookup(const SxIfaceTable *t, JSAtom name)
+{
+    int i;
+    for (i = t->count - 1; i >= 0; i--)
+        if (t->items[i].name == name)
+            return i;
+    return -1;
+}
+
+/* Record `name` as a struct with `fields` (n == 0: as a name that is not a
+   struct). Takes over every atom on every path. A redeclaration with the
+   same members is a no-op; with different members it turns the name into a
+   non-struct, since an annotation could then mean either. */
+static int sx_iface_register(JSContext *ctx, SxIfaceTable *t, JSAtom name,
+                             const SxIfaceField *fields, int n)
+{
+    int i = sx_iface_lookup(t, name), k;
+    SxIface *it;
+    if (i >= 0) {
+        bool same;
+        it = &t->items[i];
+        same = (it->field_count == n);
+        for (k = 0; same && k < n; k++)
+            same = it->fields[k].atom == fields[k].atom &&
+                   it->fields[k].sx_type == fields[k].sx_type;
+        if (!same) {
+            for (k = 0; k < it->field_count; k++)
+                JS_FreeAtom(ctx, it->fields[k].atom);
+            it->field_count = 0;
+        }
+        JS_FreeAtom(ctx, name);
+        for (k = 0; k < n; k++)
+            JS_FreeAtom(ctx, fields[k].atom);
+        return 0;
+    }
+    if (js_resize_array(ctx, (void **)&t->items, sizeof(t->items[0]),
+                        &t->size, t->count + 1)) {
+        JS_FreeAtom(ctx, name);
+        for (k = 0; k < n; k++)
+            JS_FreeAtom(ctx, fields[k].atom);
+        return -1;
+    }
+    it = &t->items[t->count++];
+    it->name = name;
+    it->field_count = n;
+    for (k = 0; k < n; k++)
+        it->fields[k] = fields[k];
+    return 0;
+}
+
+/* Erase an `interface Name { ... }` declaration; the current token is the
+   `interface` pseudo-keyword and the caller has seen `Name {` follow it.
+   Emits nothing. When every member is `name: i32|f32|f64|bool`, the struct
+   is recorded on the parse state; any other body -- `extends`, a method, an
+   optional or readonly member, an index signature, a non-scalar type, a
+   duplicate name, more than SX_IFACE_MAX_FIELDS fields -- is skipped token
+   by token as before and the name recorded as not-a-struct. A trailing ';'
+   is consumed either way. */
+static __exception int sx_parse_interface_decl(JSParseState *s)
+{
+    JSContext *ctx = s->ctx;
+    JSParsePos start;
+    JSAtom name = JS_ATOM_NULL;
+    SxIfaceField fields[SX_IFACE_MAX_FIELDS];
+    int n = 0, k;
+
+    js_parse_get_pos(s, &start);
+    if (next_token(s))
+        return -1;
+    if (s->token.val != TOK_IDENT)
+        goto skip;
+    name = JS_DupAtom(ctx, s->token.u.ident.atom);
+    if (next_token(s))
+        goto fail;
+    if (s->token.val != '{')
+        goto skip;
+    if (next_token(s))
+        goto fail;
+    while (s->token.val != '}') {
+        SxType t;
+        if (s->token.val != TOK_IDENT || n >= SX_IFACE_MAX_FIELDS)
+            goto skip;
+        for (k = 0; k < n; k++)
+            if (fields[k].atom == s->token.u.ident.atom)
+                goto skip;
+        fields[n].atom = JS_DupAtom(ctx, s->token.u.ident.atom);
+        fields[n].sx_type = SX_TYPE_NONE;
+        n++;
+        if (next_token(s))
+            goto fail;
+        if (s->token.val != ':')
+            goto skip;
+        if (next_token(s))
+            goto fail;
+        t = sx_classify_type_token(s);
+        if (t != SX_TYPE_I32 && t != SX_TYPE_F32 &&
+            t != SX_TYPE_F64 && t != SX_TYPE_BOOL)
+            goto skip;
+        fields[n - 1].sx_type = t;
+        if (next_token(s))
+            goto fail;
+        if (s->token.val == ';' || s->token.val == ',') {
+            if (next_token(s))
+                goto fail;
+        } else if (s->token.val != '}' && !s->got_lf) {
+            goto skip;
+        }
+    }
+    if (n == 0)
+        goto skip;
+    if (next_token(s))
+        goto fail;
+    if (s->token.val == ';' && next_token(s))
+        goto fail;
+    return sx_iface_register(ctx, &s->sx_ifaces, name, fields, n);
+
+skip:
+    for (k = 0; k < n; k++)
+        JS_FreeAtom(ctx, fields[k].atom);
+    n = 0;
+    if (js_parse_seek_token(s, &start))
+        goto fail;
+    {
+        int depth = 0;
+        bool saw_body = false;
+        do {
+            if (next_token(s))
+                goto fail;
+            if (s->token.val == '{') { depth++; saw_body = true; }
+            else if (s->token.val == '}' && depth) depth--;
+        } while ((!saw_body || depth > 0) && s->token.val != TOK_EOF);
+        if (next_token(s))
+            goto fail;
+        if (s->token.val == ';' && next_token(s))
+            goto fail;
+    }
+    if (name != JS_ATOM_NULL)
+        return sx_iface_register(ctx, &s->sx_ifaces, name, NULL, 0);
+    return 0;
+
+fail:
+    for (k = 0; k < n; k++)
+        JS_FreeAtom(ctx, fields[k].atom);
+    JS_FreeAtom(ctx, name);
+    return -1;
+}
+
 /* Skip an erasable SX/TypeScript type after the colon, classifying it on the
    way past. The declaration and its binding metadata are kept; only the type
    tokens are discarded from the emitted code.
@@ -30173,7 +30381,9 @@ static __exception int js_parse_type_annotation(JSParseState *s, bool return_typ
 {
     int depth = 0;
     int content = 0;
+    int struct_idx = 0;
     SxType first = SX_TYPE_NONE;
+    s->sx_last_struct = 0;
     if (s->token.val != ':') { if (out) *out = SX_TYPE_NONE; return 0; }
     for (;;) {
         if (next_token(s)) return -1;
@@ -30191,10 +30401,24 @@ static __exception int js_parse_type_annotation(JSParseState *s, bool return_typ
                        s->token.val == ')' ||
                        (return_type && (s->token.val == TOK_ARROW))))
             break;
-        if (content == 0)
+        if (content == 0) {
             first = sx_classify_type_token(s);
+            /* A bare name that a primitive-only `interface` declared earlier
+               in this file is a struct; sx_scalarize_structs is what reads
+               it. `&T`, `T[]` and `T | U` are more than one token and stay
+               SX_TYPE_OTHER below. */
+            if (first == SX_TYPE_OTHER && s->token.val == TOK_IDENT) {
+                int k = sx_iface_lookup(&s->sx_ifaces, s->token.u.ident.atom);
+                if (k >= 0 && s->sx_ifaces.items[k].field_count != 0) {
+                    first = SX_TYPE_STRUCT;
+                    struct_idx = k + 1;
+                }
+            }
+        }
         content++;
     }
+    if (content == 1 && first == SX_TYPE_STRUCT)
+        s->sx_last_struct = struct_idx;
     if (out)
         *out = content == 0 ? SX_TYPE_NONE
              : content == 1 ? first
@@ -31101,7 +31325,8 @@ static __exception int js_parse_block(JSParseState *s)
    fd->sx_safe_module_local. SX_TYPE_NONE leaves the recorded type alone, so
    a later call cannot erase an earlier one. */
 static void sx_mark_decl(JSFunctionDef *fd, JSAtom name,
-                         bool set_safe, bool set_mut, SxType type)
+                         bool set_safe, bool set_mut, SxType type,
+                         int struct_idx)
 {
     JSGlobalVar *hf;
     int idx;
@@ -31109,7 +31334,10 @@ static void sx_mark_decl(JSFunctionDef *fd, JSAtom name,
         if (fd->vars[idx].var_name == name) {
             if (set_safe) fd->vars[idx].is_safe = 1;
             if (set_mut) fd->vars[idx].is_sx_mut = 1;
-            if (type != SX_TYPE_NONE) fd->vars[idx].sx_type = type;
+            if (type != SX_TYPE_NONE) {
+                fd->vars[idx].sx_type = type;
+                fd->vars[idx].sx_struct_idx = (type == SX_TYPE_STRUCT) ? struct_idx : 0;
+            }
             return;
         }
     }
@@ -31158,15 +31386,39 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
                plain local so the typed opcodes apply at any nesting depth;
                `export safe let` stays a module var, and add_export_entry()
                demotes it back if a later `export {}` clause names it. */
-            fd->sx_safe_module_local = (fd->safe_next_decl && tok == TOK_LET &&
-                                        !export_flag && fd->module != NULL);
+            {
+                /* A struct-typed `let` at module top level is kept a plain
+                   local for the same reason a `safe let` is: only fd->vars
+                   is visible to sx_scalarize_structs. The annotation comes
+                   after the name, so peek past the ':' for a bare struct
+                   name and rewind. */
+                bool struct_local = false;
+                if (tok == TOK_LET && !export_flag && fd->module != NULL &&
+                    !fd->safe_next_decl && s->token.val == ':') {
+                    JSParsePos tpos;
+                    js_parse_get_pos(s, &tpos);
+                    if (next_token(s)) goto var_error;
+                    if (s->token.val == TOK_IDENT) {
+                        int k = sx_iface_lookup(&s->sx_ifaces, s->token.u.ident.atom);
+                        if (k >= 0 && s->sx_ifaces.items[k].field_count != 0) {
+                            if (next_token(s)) goto var_error;
+                            struct_local = (s->token.val == '=' || s->token.val == ';' ||
+                                            s->token.val == ',' || s->got_lf);
+                        }
+                    }
+                    if (js_parse_seek_token(s, &tpos)) goto var_error;
+                }
+                fd->sx_safe_module_local = ((fd->safe_next_decl || struct_local) &&
+                                            tok == TOK_LET && !export_flag &&
+                                            fd->module != NULL);
+            }
             if (js_define_var(s, name, tok)) {
                 fd->sx_safe_module_local = 0;
                 goto var_error;
             }
             fd->sx_safe_module_local = 0;
             if (fd->safe_next_decl || is_mut) {
-                sx_mark_decl(fd, name, fd->safe_next_decl, is_mut, SX_TYPE_NONE);
+                sx_mark_decl(fd, name, fd->safe_next_decl, is_mut, SX_TYPE_NONE, 0);
                 fd->safe_next_decl = 0;
             }
             /* peek_token() is the lightweight simple_next_token() lookahead,
@@ -31193,7 +31445,7 @@ static __exception int js_parse_var(JSParseState *s, int parse_flags, int tok,
             if (s->token.val == ':') {
                 SxType declared;
                 if (js_parse_type_annotation(s, false, &declared)) goto var_error;
-                sx_mark_decl(fd, name, false, false, declared);
+                sx_mark_decl(fd, name, false, false, declared, s->sx_last_struct);
             }
             if (tok == TOK_USING) {
                 /* Allocate a paired hidden local for the cached dispose
@@ -31838,15 +32090,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
         }
         if (js_parse_seek_token(s, &iface_pos)) goto fail;
         if (is_decl) {
-            int depth = 0;
-            bool saw_body = false;
-            do {
-                if (next_token(s)) goto fail;
-                if (s->token.val == '{') { depth++; saw_body = true; }
-                else if (s->token.val == '}' && depth) depth--;
-            } while ((!saw_body || depth > 0) && s->token.val != TOK_EOF);
-            if (next_token(s)) goto fail;
-            if (s->token.val == ';' && next_token(s)) goto fail;
+            if (sx_parse_interface_decl(s)) goto fail;
             return 0;
         }
     }
@@ -35312,7 +35556,7 @@ static __exception int js_parse_import(JSParseState *s)
 static int js_parse_ts_type_decl(JSParseState *s)
 {
     JSParsePos start;
-    bool matched = false;
+    bool matched = false, is_iface = false;
 
     js_parse_get_pos(s, &start);
 
@@ -35321,7 +35565,7 @@ static int js_parse_ts_type_decl(JSParseState *s)
        their members into undefined. They stay rejected, which is honest. */
     if (token_is_pseudo_keyword(s, JS_ATOM_interface)) {
         if (next_token(s)) return -1;
-        matched = token_is_ident(s->token.val);
+        matched = is_iface = token_is_ident(s->token.val);
     } else if (token_is_pseudo_keyword(s, JS_ATOM_ts_type)) {
         /* `type X =` or `type X<...> =`; anything else is an identifier. */
         if (next_token(s)) return -1;
@@ -35351,6 +35595,8 @@ static int js_parse_ts_type_decl(JSParseState *s)
     /* Consume to the end of the declaration: either a balanced brace body or
        a statement terminated by ';' or a newline. */
     if (js_parse_seek_token(s, &start)) return -1;
+    if (is_iface)
+        return sx_parse_interface_decl(s) ? -1 : 1;
     int depth = 0;
     bool saw_body = false;
     for (;;) {
@@ -35434,6 +35680,7 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
         list_add_tail(&fd->link, &parent->child_list);
         fd->is_strict_mode = parent->is_strict_mode;
         fd->parent_scope_level = parent->scope_level;
+        fd->sx_ifaces = parent->sx_ifaces;
     }
 
     fd->is_eval = is_eval;
@@ -39045,6 +39292,634 @@ static __exception int sx_inline_typed_calls(JSContext *ctx, JSFunctionDef *fd)
     return 0;
 }
 
+/* arcsx: scalar replacement of SX fixed-layout structs.
+
+   A primitive-only `interface` is an affine value with no observable identity
+   (spec/LANGUAGE.md "Ownership", spec/ABI.md: moving one into JavaScript
+   "consumes it and boxes a copy"). A local declared with such a type and used
+   only through its fields therefore never needs to be an object at all: every
+   field becomes a scalar local of its own, the literal becomes N stores, a
+   field read becomes get_loc, and a field write becomes put_loc. Nothing is
+   allocated, nothing enters the GC list, and the field locals carry the
+   field's declared type, so a `safe` owner with i32 fields reaches the
+   wrapping i32 opcodes exactly as a `safe let mut n: i32` does.
+
+   Plain JavaScript can never qualify: the gate is a binding whose annotation
+   names a struct interface, which only `.sx` has.
+
+   Runs where sx_inline_typed_calls runs -- after resolve_variables, before
+   resolve_labels -- so locals are get_loc/put_loc, jump operands are still
+   label ids, and bytes can be removed without repairing a jump. New locals are
+   appended with add_var(): compute_stack_size never reads var_count, the
+   vardefs copy in js_create_function reads the count at that point, frame
+   entry zero-fills every slot, and put_short_code widens an index encoding as
+   needed. A late local is never captured and never TDZ-initialized by
+   resolve_variables, so its `set_loc_uninitialized` is emitted here, mirroring
+   the original's, and every original `_check` opcode keeps its check.
+
+   The binding must be lexical, i.e. `let` or `const`. A `var` is hoisted out
+   of the block it is written in, so a `var` whose initializer throws halfway
+   is still readable afterwards -- and it would then read the fields written
+   before the throw instead of the `undefined` the whole binding actually
+   holds. A lexical binding cannot be reached that way: an initializer that
+   throws leaves its own block, and everything that could observe the binding
+   went with it.
+
+   Every mention of a candidate must be one of these pass-2 shapes, where v is
+   the struct local and f one of its fields:
+
+     set_loc_uninitialized v                     -> one per field local
+     object (<e_k> define_field f_k)* put_loc v  -> (<e_k> put_loc L_k)*
+     get_loc v; get_field f                      -> get_loc L_f
+     get_loc v; <e>; insert2; put_field f        -> <e>; dup; put_loc L_f
+     get_loc v; get_field2 f; <e>; op; insert2; put_field f
+                                                 -> get_loc L_f; <e>; op; dup; put_loc L_f
+     get_loc v; get_field2 f; post_inc; perm3; put_field f
+                                                 -> get_loc L_f; post_inc; put_loc L_f
+
+   Each rewrite is byte-for-byte what the parser emits for a scalar local
+   holding that field's value: the same load opcode, and a store whose
+   TDZ-checkedness matches it. That is the invariant the whole pass rests on
+   -- a field is not merely faster afterwards, it is indistinguishable from a
+   local, so every peephole in resolve_labels (add_loc_safe_i32, the
+   dup/put/drop elisions) applies to it on exactly the terms it applies to a
+   `safe let mut n: i32`, and the operators SX does not yet wrap do not start
+   wrapping just because the value lived in a struct.
+
+   and a by-value use of the bare binding -- an argument, a return, a store,
+   arithmetic -- is a move, which boxes a fresh copy at that point. That is the
+   defined semantics, so the copy is not a trick, but the rest of the ownership
+   rules are not enforced yet, so a program that violates them by using the
+   binding after moving it must not be able to tell the difference. Two rules
+   keep that true without a control-flow analysis: a move must be the last
+   mention of the binding in bytecode order, and it must not sit inside a
+   loop, where "last in bytecode order" says nothing about what runs after
+   it. A loop is any byte range spanned by a backward jump. A borrow (`&v`, marked by
+   the phase-1 sx_borrow opcode) hands the real object to a callee that may
+   mutate it, so it too leaves the binding untouched until the callee can be
+   inlined. Anything this pass cannot classify -- a second initializer, a
+   dynamic key, a delete, control flow inside a field expression, a capture --
+   also bails, per binding, leaving the bytecode as it was.
+
+   <e> is tracked by stack depth using opcode_info's n_pop/n_push (with the
+   argument count folded in for the npop formats). The object sits at a known
+   depth throughout, so the op that consumes it is the first whose n_pop
+   reaches that depth, and that op decides the shape. */
+
+enum {
+    SXS_ACT_NONE = 0,
+    SXS_ACT_SKIP,     /* emit nothing */
+    SXS_ACT_GET_LOC,  /* same get_loc / get_loc_check opcode, local `arg` */
+    SXS_ACT_PUT_LOC,  /* put_loc arg */
+    SXS_ACT_PUT_LOC_CHECK, /* put_loc_check arg */
+    SXS_ACT_SET_LOC,  /* dup; put_loc arg -- the parser's own shape for a store
+                         whose value is kept, so every resolve_labels fusion
+                         written for a scalar local applies unchanged */
+    SXS_ACT_SET_LOC_CHECK, /* dup; put_loc_check arg */
+    SXS_ACT_DECL,     /* set_loc_uninitialized for every field local of var arg */
+    SXS_ACT_MOVE,     /* box a copy of var arg: object; get_loc L_k; define_field f_k ... */
+};
+
+typedef struct SxsVar {
+    int8_t state;       /* 0: not a candidate, 1: candidate, -1: rejected */
+    bool saw_init;
+    bool saw_move;
+    int base;           /* index of the first field local, once allocated */
+    const SxIface *iface;
+} SxsVar;
+
+/* Net stack effect of the op at pos and its pop count, or false for an op
+   this scan refuses to reason about (control flow, frame suspension, scope
+   and eval machinery, references, anything exotic). */
+static bool sxs_stack_effect(const uint8_t *bc, int pos, int *n_pop, int *n_push)
+{
+    int op = bc[pos];
+    const JSOpCode *oi = &opcode_info[op];
+    *n_pop = oi->n_pop;
+    *n_push = oi->n_push;
+    switch (op) {
+    case OP_if_false: case OP_if_true: case OP_goto: case OP_catch:
+    case OP_gosub: case OP_ret: case OP_label: case OP_nip_catch:
+    case OP_return_undef: case OP_throw_error:
+    case OP_for_in_next: case OP_for_of_next: case OP_iterator_get_value_done:
+    case OP_iterator_close: case OP_iterator_next: case OP_iterator_call:
+    case OP_initial_yield: case OP_yield: case OP_yield_star:
+    case OP_async_yield_star: case OP_await:
+    case OP_eval: case OP_apply_eval:
+    case OP_with_get_var: case OP_with_put_var: case OP_with_delete_var:
+    case OP_with_make_ref: case OP_with_get_ref: case OP_with_get_ref_undef:
+    case OP_get_ref_value: case OP_put_ref_value:
+    case OP_make_loc_ref: case OP_make_arg_ref: case OP_make_var_ref_ref:
+    case OP_make_var_ref:
+    case OP_close_loc: case OP_set_loc_uninitialized:
+    case OP_using_dispose_init: case OP_using_dispose:
+    case OP_using_dispose_async: case OP_using_dispose_merge:
+    case OP_using_dispose_end: case OP_using_check:
+    case OP_special_object: case OP_rest:
+    case OP_define_class: case OP_define_class_computed:
+    case OP_get_super: case OP_get_super_value: case OP_put_super_value:
+    case OP_check_ctor_return: case OP_check_ctor: case OP_init_ctor:
+    case OP_check_brand: case OP_add_brand:
+    case OP_import: case OP_regexp:
+    case OP_copy_data_properties:
+    case OP_get_private_field: case OP_put_private_field:
+    case OP_define_private_field: case OP_private_in:
+    case OP_define_var: case OP_check_define_var: case OP_define_func:
+        return false;
+    case OP_call: case OP_tail_call: case OP_call_method:
+    case OP_tail_call_method: case OP_call_constructor: case OP_array_from:
+    case OP_concat:
+        *n_pop += get_u16(bc + pos + 1);
+        break;
+    default:
+        if (op >= OP_TEMP_START && op != OP_source_loc && op != OP_sx_borrow)
+            return false;
+        break;
+    }
+    return true;
+}
+
+/* From pos, with the tracked object `depth` slots from the top (1 = it is the
+   top), find the op that consumes it: the first whose pop count reaches that
+   depth. Returns its position and the depth there, or -1 when control flow
+   or an unknown op intervenes first. */
+static int sxs_find_consumer(const uint8_t *bc, int bc_len, int pos, int depth,
+                             int *depth_out)
+{
+    while (pos < bc_len) {
+        int op = bc[pos];
+        int n_pop, n_push;
+        if (op == OP_source_loc) {
+            pos += opcode_info[op].size;
+            continue;
+        }
+        switch (op) {
+        case OP_return: case OP_return_async: case OP_throw:
+        case OP_for_in_start: case OP_for_of_start: case OP_for_await_of_start:
+            /* consume the top; a legitimate move only when the object is it */
+            if (depth == 1) {
+                *depth_out = depth;
+                return pos;
+            }
+            return -1;
+        default:
+            break;
+        }
+        if (!sxs_stack_effect(bc, pos, &n_pop, &n_push))
+            return -1;
+        if (n_pop >= depth) {
+            *depth_out = depth;
+            return pos;
+        }
+        depth += n_push - n_pop;
+        pos += opcode_info[op].size;
+    }
+    return -1;
+}
+
+static int sxs_skip_source_loc(const uint8_t *bc, int bc_len, int pos)
+{
+    while (pos < bc_len && bc[pos] == OP_source_loc)
+        pos += opcode_info[OP_source_loc].size;
+    return pos;
+}
+
+/* Mark every byte spanned by a backward jump, which is every byte that can
+   run more than once. Pass-2 jumps carry label ids rather than offsets, so a
+   back edge is a jump whose OP_label marker sits at or before it. */
+static __exception int sxs_mark_loops(JSContext *ctx, JSFunctionDef *fd,
+                                      const uint8_t *bc, int bc_len,
+                                      uint8_t *in_loop)
+{
+    int *label_pos;
+    int pos, i;
+
+    if (fd->label_count <= 0)
+        return 0;
+    label_pos = js_malloc(ctx, sizeof(*label_pos) * fd->label_count);
+    if (!label_pos)
+        return -1;
+    for (i = 0; i < fd->label_count; i++)
+        label_pos[i] = -1;
+    for (pos = 0; pos < bc_len; pos += opcode_info[bc[pos]].size) {
+        if (bc[pos] == OP_label) {
+            i = (int)get_u32(bc + pos + 1);
+            if (i >= 0 && i < fd->label_count)
+                label_pos[i] = pos;
+        }
+    }
+    for (pos = 0; pos < bc_len; pos += opcode_info[bc[pos]].size) {
+        int lp;
+        if (opcode_info[bc[pos]].fmt != OP_FMT_label)
+            continue;
+        i = (int)get_u32(bc + pos + 1);
+        if (i < 0 || i >= fd->label_count)
+            continue;
+        lp = label_pos[i];
+        if (lp < 0 || lp > pos)
+            continue;               /* forward jump */
+        memset(in_loop + lp, 1, pos - lp + 1);
+    }
+    js_free(ctx, label_pos);
+    return 0;
+}
+
+static int sxs_field_index(const SxIface *it, JSAtom atom)
+{
+    int k;
+    for (k = 0; k < it->field_count; k++)
+        if (it->fields[k].atom == atom)
+            return k;
+    return -1;
+}
+
+/* Is the op at `cpos`, consuming the tracked object from depth `d`, a
+   by-value use the spec defines as a move? Only opcodes the parser and
+   resolve_variables can produce are listed: everything resolve_labels
+   invents -- get_length, is_undefined, the typeof tests -- comes into
+   existence after this pass has run. Every op here either takes the
+   value (an argument, a store, a return) or converts it (ToPrimitive,
+   ToPropertyKey, iteration, a dynamic read), all of which a boxed copy
+   answers identically. Stack shuffles are listed only where the object is
+   provably the value being placed, never the target. */
+static bool sxs_is_move_consumer(const uint8_t *bc, int cpos, int d)
+{
+    switch (bc[cpos]) {
+    case OP_call: case OP_tail_call: case OP_call_method:
+    case OP_tail_call_method: case OP_call_constructor: case OP_array_from:
+    case OP_apply: case OP_concat:
+        return true;
+    case OP_put_loc: case OP_put_loc_check: case OP_put_loc_check_init:
+    case OP_set_loc: case OP_put_arg: case OP_set_arg:
+    case OP_put_var_ref: case OP_put_var_ref_check:
+    case OP_put_var_ref_check_init: case OP_set_var_ref:
+    case OP_put_var: case OP_put_var_init:
+    case OP_return: case OP_return_async: case OP_throw:
+    case OP_for_in_start: case OP_for_of_start: case OP_for_await_of_start:
+    case OP_insert2: case OP_insert3: case OP_insert4:
+    case OP_drop: case OP_typeof: case OP_neg: case OP_plus: case OP_not:
+    case OP_lnot: case OP_to_propkey: case OP_to_object:
+    case OP_is_undefined_or_null:
+        return d == 1;
+    case OP_define_field: case OP_put_field: case OP_to_propkey2:
+        return d == 2;
+    case OP_put_array_el: case OP_define_array_el: case OP_append:
+        return d == 3;
+    case OP_get_array_el: case OP_get_array_el2:
+    case OP_add: case OP_sub: case OP_mul: case OP_div: case OP_mod:
+    case OP_pow: case OP_and: case OP_or: case OP_xor: case OP_shl:
+    case OP_sar: case OP_shr: case OP_lt: case OP_lte: case OP_gt:
+    case OP_gte: case OP_eq: case OP_neq: case OP_strict_eq:
+    case OP_strict_neq: case OP_instanceof: case OP_in:
+        return d == 1 || d == 2;
+    default:
+        return false;
+    }
+}
+
+static __exception int sx_scalarize_structs(JSContext *ctx, JSFunctionDef *fd)
+{
+    DynBuf bc_out;
+    uint8_t *bc_buf = fd->byte_code.buf;
+    int bc_len = fd->byte_code.size;
+    int pos, pos_next, i, k;
+    int ncand = 0;
+    SxsVar *vars = NULL;
+    uint8_t *act = NULL;
+    int32_t *act_arg = NULL, *act_var = NULL;
+    uint8_t *in_loop = NULL;
+    int ret = -1;
+
+    if (!fd->sx_ifaces || fd->var_count <= 0 || bc_len <= 0)
+        return 0;
+    /* A direct eval can reach any local by name. */
+    if (fd->has_eval_call)
+        return 0;
+    for (i = 0; i < fd->var_count; i++) {
+        const JSVarDef *vd = &fd->vars[i];
+        if (vd->sx_type == SX_TYPE_STRUCT && vd->sx_struct_idx > 0 &&
+            vd->sx_struct_idx <= fd->sx_ifaces->count &&
+            fd->sx_ifaces->items[vd->sx_struct_idx - 1].field_count > 0 &&
+            vd->is_lexical && !vd->is_captured)
+            ncand++;
+    }
+    if (ncand == 0)
+        return 0;
+
+    vars = js_mallocz(ctx, sizeof(*vars) * fd->var_count);
+    act = js_mallocz(ctx, bc_len);
+    act_arg = js_mallocz(ctx, sizeof(*act_arg) * bc_len);
+    act_var = js_mallocz(ctx, sizeof(*act_var) * bc_len);
+    in_loop = js_mallocz(ctx, bc_len);
+    if (!vars || !act || !act_arg || !act_var || !in_loop)
+        goto done;
+    if (sxs_mark_loops(ctx, fd, bc_buf, bc_len, in_loop))
+        goto done;
+    for (i = 0; i < fd->var_count; i++) {
+        const JSVarDef *vd = &fd->vars[i];
+        if (vd->sx_type == SX_TYPE_STRUCT && vd->sx_struct_idx > 0 &&
+            vd->sx_struct_idx <= fd->sx_ifaces->count &&
+            fd->sx_ifaces->items[vd->sx_struct_idx - 1].field_count > 0 &&
+            vd->is_lexical && !vd->is_captured) {
+            vars[i].state = 1;
+            vars[i].iface = &fd->sx_ifaces->items[vd->sx_struct_idx - 1];
+        }
+    }
+
+    /* One op belongs to one pattern; a position claimed twice by different
+       bindings means the classification went wrong, so both are dropped. */
+#define SXS_MARK(p, a, arg, v) do {                                     \
+        if (act[p] != SXS_ACT_NONE && act_var[p] != (v)) {              \
+            vars[act_var[p]].state = -1;                                \
+            vars[v].state = -1;                                         \
+        } else {                                                        \
+            act[p] = (a); act_arg[p] = (arg); act_var[p] = (v);         \
+        }                                                               \
+    } while (0)
+
+    /* Phase 1: classify every mention, recording the rewrite for each byte
+       position, or reject the binding. */
+    for (pos = 0; pos < bc_len; pos = pos_next) {
+        int op = bc_buf[pos];
+        int idx, q, c, d, f;
+        pos_next = pos + opcode_info[op].size;
+
+        if (op == OP_object) {
+            /* A literal whose fields are exactly a candidate's, in order,
+               stored straight into it, is that candidate's initializer. */
+            JSAtom atoms[SX_IFACE_MAX_FIELDS];
+            int fpos[SX_IFACE_MAX_FIELDS];
+            int n = 0;
+            q = pos_next;
+            for (;;) {
+                c = sxs_find_consumer(bc_buf, bc_len, q, 1, &d);
+                if (c < 0)
+                    break;
+                if (bc_buf[c] == OP_define_field && d == 2 && n < SX_IFACE_MAX_FIELDS) {
+                    atoms[n] = get_u32(bc_buf + c + 1);
+                    fpos[n] = c;
+                    n++;
+                    q = c + opcode_info[OP_define_field].size;
+                    continue;
+                }
+                if (bc_buf[c] == OP_put_loc && d == 1) {
+                    idx = get_u16(bc_buf + c + 1);
+                    if (idx < fd->var_count && vars[idx].state == 1) {
+                        const SxIface *it = vars[idx].iface;
+                        bool same = (n == it->field_count) && !vars[idx].saw_init;
+                        for (k = 0; same && k < n; k++)
+                            same = (atoms[k] == it->fields[k].atom);
+                        if (!same) {
+                            vars[idx].state = -1;
+                            break;
+                        }
+                        vars[idx].saw_init = true;
+                        SXS_MARK(pos, SXS_ACT_SKIP, 0, idx);
+                        for (k = 0; k < n; k++)
+                            SXS_MARK(fpos[k], SXS_ACT_PUT_LOC, k, idx);
+                        SXS_MARK(c, SXS_ACT_SKIP, 0, idx);
+                    }
+                }
+                break;
+            }
+            continue;
+        }
+
+        if (op == OP_make_loc_ref) {
+            idx = get_u16(bc_buf + pos + 5);
+            if (idx < fd->var_count)
+                vars[idx].state = -1;
+            continue;
+        }
+        if (opcode_info[op].fmt != OP_FMT_loc)
+            continue;
+        idx = get_u16(bc_buf + pos + 1);
+        if (idx >= fd->var_count || vars[idx].state != 1)
+            continue;
+        if (vars[idx].saw_move) {
+            vars[idx].state = -1;
+            continue;
+        }
+        switch (op) {
+        case OP_set_loc_uninitialized:
+            SXS_MARK(pos, SXS_ACT_DECL, 0, idx);
+            continue;
+        case OP_put_loc:
+            /* only the initializer's store is legal, and it is marked already */
+            if (act[pos] != SXS_ACT_SKIP || act_var[pos] != idx)
+                vars[idx].state = -1;
+            continue;
+        case OP_get_loc:
+        case OP_get_loc_check:
+            break;
+        default:
+            vars[idx].state = -1;
+            continue;
+        }
+
+        q = sxs_skip_source_loc(bc_buf, bc_len, pos_next);
+        if (q >= bc_len) {
+            vars[idx].state = -1;
+            continue;
+        }
+        if (bc_buf[q] == OP_get_field) {
+            f = sxs_field_index(vars[idx].iface, get_u32(bc_buf + q + 1));
+            if (f < 0) {
+                vars[idx].state = -1;
+                continue;
+            }
+            SXS_MARK(pos, SXS_ACT_GET_LOC, f, idx);
+            SXS_MARK(q, SXS_ACT_SKIP, 0, idx);
+            continue;
+        }
+        if (bc_buf[q] == OP_get_field2) {
+            int r;
+            f = sxs_field_index(vars[idx].iface, get_u32(bc_buf + q + 1));
+            if (f < 0) {
+                vars[idx].state = -1;
+                continue;
+            }
+            c = sxs_find_consumer(bc_buf, bc_len, q + opcode_info[OP_get_field2].size, 2, &d);
+            if (c < 0) {
+                vars[idx].state = -1;
+                continue;
+            }
+            r = sxs_skip_source_loc(bc_buf, bc_len, c + opcode_info[bc_buf[c]].size);
+            if (r >= bc_len || bc_buf[r] != OP_put_field ||
+                get_u32(bc_buf + r + 1) != vars[idx].iface->fields[f].atom) {
+                vars[idx].state = -1;
+                continue;
+            }
+            if (bc_buf[c] == OP_insert2 && d == 2) {
+                SXS_MARK(pos, SXS_ACT_GET_LOC, f, idx);
+                SXS_MARK(q, SXS_ACT_SKIP, 0, idx);
+                SXS_MARK(c, SXS_ACT_SKIP, 0, idx);
+                SXS_MARK(r, op == OP_get_loc_check ? SXS_ACT_SET_LOC_CHECK : SXS_ACT_SET_LOC, f, idx);
+            } else if (bc_buf[c] == OP_perm3 && d == 3) {
+                SXS_MARK(pos, SXS_ACT_GET_LOC, f, idx);
+                SXS_MARK(q, SXS_ACT_SKIP, 0, idx);
+                SXS_MARK(c, SXS_ACT_SKIP, 0, idx);
+                SXS_MARK(r, op == OP_get_loc_check ? SXS_ACT_PUT_LOC_CHECK : SXS_ACT_PUT_LOC, f, idx);
+            } else {
+                vars[idx].state = -1;
+            }
+            continue;
+        }
+        c = sxs_find_consumer(bc_buf, bc_len, q, 1, &d);
+        if (c < 0) {
+            vars[idx].state = -1;
+            continue;
+        }
+        if (bc_buf[c] == OP_insert2 && d == 2) {
+            int r = sxs_skip_source_loc(bc_buf, bc_len, c + opcode_info[OP_insert2].size);
+            if (r < bc_len && bc_buf[r] == OP_put_field &&
+                (f = sxs_field_index(vars[idx].iface, get_u32(bc_buf + r + 1))) >= 0) {
+                SXS_MARK(pos, SXS_ACT_SKIP, 0, idx);
+                SXS_MARK(c, SXS_ACT_SKIP, 0, idx);
+                SXS_MARK(r, op == OP_get_loc_check ? SXS_ACT_SET_LOC_CHECK : SXS_ACT_SET_LOC, f, idx);
+            } else {
+                vars[idx].state = -1;
+            }
+            continue;
+        }
+        if (bc_buf[c] == OP_sx_borrow) {
+            /* the callee gets the real object and may write through it */
+            vars[idx].state = -1;
+            continue;
+        }
+        if (sxs_is_move_consumer(bc_buf, c, d) && !in_loop[pos]) {
+            SXS_MARK(pos, SXS_ACT_MOVE, 0, idx);
+            vars[idx].saw_move = true;
+            continue;
+        }
+        vars[idx].state = -1;
+    }
+
+    /* Allocate the field locals of every surviving binding. */
+    ncand = 0;
+    for (i = 0; i < fd->var_count; i++) {
+        if (vars[i].state != 1)
+            continue;
+        if (!vars[i].saw_init) {
+            vars[i].state = -1;
+            continue;
+        }
+        ncand++;
+    }
+    if (ncand == 0) {
+        ret = 0;
+        goto done;
+    }
+    {
+        int orig_count = fd->var_count;
+        for (i = 0; i < orig_count; i++) {
+            const SxIface *it;
+            int scope_level, scope_next;
+            bool is_lexical, is_safe;
+            if (vars[i].state != 1)
+                continue;
+            it = vars[i].iface;
+            scope_level = fd->vars[i].scope_level;
+            scope_next = fd->vars[i].scope_next;
+            is_lexical = fd->vars[i].is_lexical;
+            is_safe = fd->vars[i].is_safe;
+            vars[i].base = fd->var_count;
+            for (k = 0; k < it->field_count; k++) {
+                JSVarDef *vd;
+                int nidx = add_var(ctx, fd, it->fields[k].atom);
+                if (nidx < 0)
+                    goto done;
+                vd = &fd->vars[nidx];
+                vd->scope_level = scope_level;
+                vd->scope_next = scope_next;
+                vd->is_lexical = is_lexical;
+                vd->is_safe = is_safe;
+                vd->sx_type = it->fields[k].sx_type;
+            }
+        }
+    }
+
+    /* Phase 2: emit. Actions of a rejected binding are ignored, so its
+       bytes go out unchanged. Dropped or replaced opcodes that carried an
+       atom release it here, since free_bytecode_atoms only ever sees the
+       emitted buffer. */
+    js_dbuf_init(ctx, &bc_out);
+    for (pos = 0; pos < bc_len; pos = pos_next) {
+        int op = bc_buf[pos];
+        int len = opcode_info[op].size;
+        int a = act[pos];
+        int v = act_var[pos];
+        pos_next = pos + len;
+
+        if (op == OP_sx_borrow)
+            continue;                       /* phase-1 marker: never emitted */
+        if (a == SXS_ACT_NONE || vars[v].state != 1) {
+            dbuf_put(&bc_out, bc_buf + pos, len);
+            continue;
+        }
+        if (opcode_info[op].fmt == OP_FMT_atom)
+            JS_FreeAtom(ctx, get_u32(bc_buf + pos + 1));
+        switch (a) {
+        case SXS_ACT_SKIP:
+            break;
+        case SXS_ACT_GET_LOC:
+            dbuf_putc(&bc_out, op);
+            dbuf_put_u16(&bc_out, vars[v].base + act_arg[pos]);
+            break;
+        case SXS_ACT_PUT_LOC:
+            dbuf_putc(&bc_out, OP_put_loc);
+            dbuf_put_u16(&bc_out, vars[v].base + act_arg[pos]);
+            break;
+        case SXS_ACT_PUT_LOC_CHECK:
+            dbuf_putc(&bc_out, OP_put_loc_check);
+            dbuf_put_u16(&bc_out, vars[v].base + act_arg[pos]);
+            break;
+        case SXS_ACT_SET_LOC:
+            dbuf_putc(&bc_out, OP_dup);
+            dbuf_putc(&bc_out, OP_put_loc);
+            dbuf_put_u16(&bc_out, vars[v].base + act_arg[pos]);
+            break;
+        case SXS_ACT_SET_LOC_CHECK:
+            dbuf_putc(&bc_out, OP_dup);
+            dbuf_putc(&bc_out, OP_put_loc_check);
+            dbuf_put_u16(&bc_out, vars[v].base + act_arg[pos]);
+            break;
+        case SXS_ACT_DECL:
+            for (k = 0; k < vars[v].iface->field_count; k++) {
+                dbuf_putc(&bc_out, OP_set_loc_uninitialized);
+                dbuf_put_u16(&bc_out, vars[v].base + k);
+            }
+            break;
+        case SXS_ACT_MOVE:
+            dbuf_putc(&bc_out, OP_object);
+            for (k = 0; k < vars[v].iface->field_count; k++) {
+                dbuf_putc(&bc_out, op);     /* get_loc or get_loc_check, as the original */
+                dbuf_put_u16(&bc_out, vars[v].base + k);
+                dbuf_putc(&bc_out, OP_define_field);
+                dbuf_put_u32(&bc_out, JS_DupAtom(ctx, vars[v].iface->fields[k].atom));
+            }
+            break;
+        default:
+            abort();
+        }
+    }
+#undef SXS_MARK
+    if (dbuf_error(&bc_out)) {
+        dbuf_free(&bc_out);
+        goto done;
+    }
+    dbuf_free(&fd->byte_code);
+    fd->byte_code = bc_out;
+    ret = 0;
+done:
+    js_free(ctx, vars);
+    js_free(ctx, act);
+    js_free(ctx, act_arg);
+    js_free(ctx, act_var);
+    js_free(ctx, in_loop);
+    return ret;
+}
+
 /* peephole optimizations and resolve goto/labels */
 static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
 {
@@ -39162,6 +40037,10 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                performance */
             line_num = get_u32(bc_buf + pos + 1);
             col_num = get_u32(bc_buf + pos + 5);
+            break;
+
+        case OP_sx_borrow:
+            /* phase-1 marker for sx_scalarize_structs; never emitted */
             break;
 
         case OP_label:
@@ -40541,6 +41420,11 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     if (resolve_variables(ctx, fd))
         goto fail;
 
+    /* First of the SX passes: a struct split into scalar locals is what
+       lets the loop fusion and the inliner below see its fields. */
+    if (sx_scalarize_structs(ctx, fd))
+        goto fail;
+
     if (fuse_i32_accum_loops(ctx, fd))
         goto fail;
 
@@ -41184,6 +42068,8 @@ static __exception int js_parse_function_decl2(JSParseState *s,
                        reaches JSFunctionBytecode->vardefs by the memcpy in
                        js_create_function. */
                     fd->args[idx].sx_type = declared;
+                    fd->args[idx].sx_struct_idx =
+                        (declared == SX_TYPE_STRUCT) ? s->sx_last_struct : 0;
                 }
                 if (rest) {
                     emit_op(s, OP_rest);
@@ -41749,6 +42635,7 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     if (!fd)
         goto fail1;
     s->cur_func = fd;
+    fd->sx_ifaces = &s->sx_ifaces;
     fd->eval_type = eval_type;
     fd->has_this_binding = (eval_type != JS_EVAL_TYPE_DIRECT);
     fd->backtrace_barrier = ((flags & JS_EVAL_FLAG_BACKTRACE_BARRIER) != 0);
@@ -41807,11 +42694,13 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     } else {
         ret_val = JS_EvalFunctionInternal(ctx, fun_obj, this_obj, var_refs, sf);
     }
+    sx_iface_table_free(ctx, &s->sx_ifaces);
     return ret_val;
  fail1:
     /* XXX: should free all the unresolved dependencies */
     if (m)
         js_free_module_def(ctx, m);
+    sx_iface_table_free(ctx, &s->sx_ifaces);
     return JS_EXCEPTION;
 }
 

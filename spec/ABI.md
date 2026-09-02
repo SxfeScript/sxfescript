@@ -17,6 +17,13 @@ declared scalar types are recorded rather than stripped, which is what gates
 the i32 arithmetic semantics and the typed-call inlining. `spec/LANGUAGE.md`
 has the contract and `spec/IMPLEMENTATION.md` has what is checked today.
 
+The allocation bytecode is the one the compiler has so far been able to do
+without rather than add: a struct whose every use the compiler can account for
+is split into scalar locals and never allocated, and one that escapes is built
+by the ordinary object opcodes at the point it escapes. An `sx_alloc` earns
+its slot when a struct that must exist as an object is common enough to
+measure, not before.
+
 Moving a layout value into JavaScript consumes it and boxes a copy. Borrowing it
 into JavaScript creates a revocable proxy. Typed JavaScript objects crossing
 into SX use shared/exclusive header locks, and incompatible property writes

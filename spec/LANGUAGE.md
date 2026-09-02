@@ -73,6 +73,15 @@ Primitive-only interfaces define affine fixed-layout structs. A literal becomes
 such a struct only in an explicit annotation, typed argument, or typed return
 context.
 
+Because such a value is affine and has no observable identity, a lexical
+binding of that type is compiled to one scalar local per field rather than to
+an object, and moving it into JavaScript builds the object at that point. The
+two are indistinguishable: field order, property attributes, arithmetic and the
+dead zone all behave as they would have. A binding the compiler cannot fully
+account for -- one that is captured, borrowed to a call, reassigned, read after
+a move, or given a literal that is not exactly its declared fields -- keeps its
+object. `spec/IMPLEMENTATION.md` records which is which.
+
 At control-flow joins, a value moved on any reachable branch is considered
 moved. Loop-carried owners must be reinitialized on every continuation path.
 Borrowed affine values cannot cross `await`.

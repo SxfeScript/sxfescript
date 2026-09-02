@@ -1,0 +1,99 @@
+// What splitting a fixed-layout struct into scalar locals is worth.
+//
+// A binding whose declared type is a primitive-only `interface` never becomes
+// an object: sx_scalarize_structs (quickjs.c) gives each field its own local.
+// "untyped" is the same program with the annotation removed, which keeps the
+// object and so measures what the split removes; "hand-split" is the same
+// arithmetic over three plain locals and is therefore the exact upper bound.
+//
+// Report is per loop iteration, minimum of 9 runs. Subtract the empty loop to
+// read the cost of the work itself.
+//
+//   sxn benchmarks/engine/struct_sroa_probe.sx
+
+const N = 2000000;
+
+function bench(name: string, fn): void {
+  let best = Infinity;
+  for (let r = 0; r < 9; r++) {
+    const t = performance.now();
+    fn();
+    const d = performance.now() - t;
+    if (d < best) best = d;
+  }
+  console.log(name.padEnd(26), (best * 1e6 / N).toFixed(2), "ns/op");
+}
+
+interface Vec3 { x: f64; y: f64; z: f64 }
+
+function emptyLoop(): number { let s = 0; for (let i = 0; i < N; i++) ; return s; }
+
+// One struct per iteration: allocation plus three field updates.
+function typedCreate(): number {
+  let s = 0;
+  for (let i = 0; i < N; i++) {
+    let mut p: Vec3 = { x: 0, y: 1, z: 2 };
+    p.x += p.y;
+    p.z += p.x;
+    s = p.z;
+  }
+  return s;
+}
+
+function untypedCreate(): number {
+  let s = 0;
+  for (let i = 0; i < N; i++) {
+    let p = { x: 0, y: 1, z: 2 };
+    p.x += p.y;
+    p.z += p.x;
+    s = p.z;
+  }
+  return s;
+}
+
+function handSplitCreate(): number {
+  let s = 0;
+  for (let i = 0; i < N; i++) {
+    let px = 0, py = 1, pz = 2;
+    px += py;
+    pz += px;
+    s = pz;
+  }
+  return s;
+}
+
+// One struct, updated in place: field access without the allocation.
+function typedUpdate(): number {
+  let mut p: Vec3 = { x: 0, y: 1, z: 2 };
+  for (let i = 0; i < N; i++) {
+    p.x += p.y;
+    p.z += p.x;
+  }
+  return p.z;
+}
+
+function untypedUpdate(): number {
+  let p = { x: 0, y: 1, z: 2 };
+  for (let i = 0; i < N; i++) {
+    p.x += p.y;
+    p.z += p.x;
+  }
+  return p.z;
+}
+
+function handSplitUpdate(): number {
+  let px = 0, py = 1, pz = 2;
+  for (let i = 0; i < N; i++) {
+    px += py;
+    pz += px;
+  }
+  return pz;
+}
+
+bench("empty loop", emptyLoop);
+bench("create: untyped", untypedCreate);
+bench("create: typed", typedCreate);
+bench("create: hand-split", handSplitCreate);
+bench("update: untyped", untypedUpdate);
+bench("update: typed", typedUpdate);
+bench("update: hand-split", handSplitUpdate);

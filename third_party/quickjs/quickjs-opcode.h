@@ -238,7 +238,7 @@ DEF(        inc_loc, 2, 0, 0, loc8)
 DEF(        add_loc, 2, 1, 0, loc8)
 /* SX safe i32 compound-add fast path. */
 DEF( add_loc_safe_i32, 2, 1, 0, loc8)
-DEF( inc_loc_safe_i32, 1, 0, 0, loc8)
+DEF( inc_loc_safe_i32, 2, 0, 0, loc8) /* size 2: the interpreter reads a loc8 operand */
 DEF(            not, 1, 1, 1, none)
 DEF(           lnot, 1, 1, 1, none)
 DEF(         typeof, 1, 1, 1, none)
@@ -318,6 +318,12 @@ def( set_class_name, 5, 1, 1, u32) /* emitted in phase 1, removed in phase 2 */
 def( dispose_scope, 3, 0, 0, u16) /* emitted in phase 1, removed in phase 2 */
 
 def(     source_loc, 9, 0, 0, u32x2) /* emitted in phase 1, removed in phase 3 */
+/* arcsx: SX borrow sigil, emitted after the operand of `&x` / `&mut x` so
+   sx_scalarize_structs can tell a borrow from a move. Shared and exclusive
+   borrows are not distinguished, because nothing yet reads the difference:
+   either one hands a callee the object, so either one keeps it. Stack
+   neutral; emitted in phase 1, removed in phase 3. */
+def(      sx_borrow, 1, 1, 1, none)
 
 DEF(    push_minus1, 1, 0, 1, none_int)
 DEF(         push_0, 1, 0, 1, none_int)

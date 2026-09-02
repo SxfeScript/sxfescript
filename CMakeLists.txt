@@ -228,6 +228,14 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # expected value here is Node's, checked with the annotations stripped.
   add_test(NAME sxn-typed-inline COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/typed_inline.sx)
   set_tests_properties(sxn-typed-inline PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # A binding whose declared type is a primitive-only interface is split into
+  # one scalar local per field, so no object is allocated. This asserts the
+  # split is invisible: same values, same wrapping as a scalar local of the
+  # same declaration, same JSON once the value escapes, same ReferenceError in
+  # the dead zone, and no split for the shapes that need a real object. Every
+  # expected value is Node's, bar the one i32 wrap that is SX's by definition.
+  add_test(NAME sxn-struct-sroa COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/struct_sroa.sx)
+  set_tests_properties(sxn-struct-sroa PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   # Reference cycles are invisible to refcounting and reclaimable only by the
   # cycle collector, which runs only on allocation. Sxn.gc() is the explicit
   # ask; this asserts a burst of 100k cyclic closures comes back.

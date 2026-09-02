@@ -1,0 +1,329 @@
+// A binding whose declared type is a primitive-only `interface` is split into
+// one scalar local per field (sx_scalarize_structs in quickjs.c), so no object
+// is allocated at all. These checks assert the split changes nothing
+// observable: the same values, the same wrapping, the same exceptions, the
+// same JSON when the value escapes, and no split at all for the shapes that
+// must keep a real object.
+//
+// Every expected value is what the same program produces with the annotations
+// removed, i.e. plain JavaScript.
+
+let failures = 0;
+function check(name: string, actual, expected): void {
+  if (!Object.is(actual, expected)) {
+    console.log("FAIL", name, "expected", expected, "got", actual);
+    failures += 1;
+  }
+}
+
+interface Vec3 { x: f64; y: f64; z: f64 }
+interface Counter { hits: i32; }
+interface Flag { on: bool; }
+
+// --- the shapes that are meant to split ----------------------------------
+function basics(): void {
+  let mut p: Vec3 = { x: 1.5, y: 2, z: 3 };
+  check("read", p.x, 1.5);
+  p.x = 10;
+  check("write", p.x, 10);
+  p.y += p.x;
+  check("compound add", p.y, 12);
+  p.z -= 0.5;
+  check("compound sub", p.z, 2.5);
+  p.z *= 4;
+  check("compound mul", p.z, 10);
+  p.x++;
+  check("postfix inc", p.x, 11);
+  ++p.x;
+  check("prefix inc", p.x, 12);
+  p.x--;
+  check("postfix dec", p.x, 11);
+  --p.x;
+  check("prefix dec", p.x, 10);
+  check("postfix returns the old value", p.x++, 10);
+  check("prefix returns the new value", ++p.x, 12);
+  p.x = p.y;
+  check("field to field", p.x, 12);
+  p.x = p.x + p.y;
+  check("field on both sides", p.x, 24);
+
+  let mut q: Vec3 = { x: 0, y: 0, z: 0 };
+  for (let i = 0; i < 4; i++) {
+    q.x += i;
+    q.y = q.x * 2;
+  }
+  check("loop x", q.x, 6);
+  check("loop y", q.y, 12);
+  if (q.x > 5) q.z = 1; else q.z = 2;
+  check("conditional write", q.z, 1);
+
+  let mut f: Flag = { on: false };
+  f.on = !f.on;
+  check("bool field", f.on, true);
+}
+basics();
+
+// --- a struct field must behave exactly as a scalar local ----------------
+// The declared type decides the arithmetic, and it must not change just
+// because the value lived in a struct. Only `+=` wraps on i32 today; the
+// other operators keep exact JavaScript arithmetic, and a field has to agree
+// with a local on every one of them.
+function parity(): void {
+  function fieldAdd(): number { safe let mut c: Counter = { hits: 2147483647 }; c.hits += 1; return c.hits; }
+  function localAdd(): number { safe let mut n: i32 = 2147483647; n += 1; return n; }
+  function fieldInc(): number { safe let mut c: Counter = { hits: 2147483647 }; c.hits++; return c.hits; }
+  function localInc(): number { safe let mut n: i32 = 2147483647; n++; return n; }
+  function fieldPre(): number { safe let mut c: Counter = { hits: 2147483647 }; ++c.hits; return c.hits; }
+  function localPre(): number { safe let mut n: i32 = 2147483647; ++n; return n; }
+  function fieldSub(): number { safe let mut c: Counter = { hits: -2147483648 }; c.hits -= 1; return c.hits; }
+  function localSub(): number { safe let mut n: i32 = -2147483648; n -= 1; return n; }
+  function fieldDec(): number { safe let mut c: Counter = { hits: -2147483648 }; c.hits--; return c.hits; }
+  function localDec(): number { safe let mut n: i32 = -2147483648; n--; return n; }
+
+  check("safe i32 field += wraps", fieldAdd(), -2147483648);
+  check("safe i32 field += agrees with a local", fieldAdd(), localAdd());
+  check("safe i32 field ++ agrees with a local", fieldInc(), localInc());
+  check("safe i32 field ++ is exact JS", fieldInc(), 2147483648);
+  check("safe i32 field prefix agrees with a local", fieldPre(), localPre());
+  check("safe i32 field -= agrees with a local", fieldSub(), localSub());
+  check("safe i32 field -- agrees with a local", fieldDec(), localDec());
+
+  // f64 fields stay exact, the same way a declared f64 local does.
+  let mut v: Vec3 = { x: 0, y: 0, z: 0 };
+  for (let i = 0; i < 3; i++) v.x += 0.5;
+  check("f64 field stays exact", v.x, 1.5);
+  v.y = 0.1 + 0.2;
+  check("f64 field keeps JS rounding", v.y, 0.30000000000000004);
+}
+parity();
+
+// --- a value that escapes is boxed, and reads the same -------------------
+function escaping(): void {
+  function moved(): string {
+    let mut p: Vec3 = { x: 1, y: 2, z: 3 };
+    p.x = 10;
+    p.z += 1;
+    return JSON.stringify(p);
+  }
+  check("moved into JSON", moved(), '{"x":10,"y":2,"z":4}');
+
+  function keys(): string {
+    let mut p: Vec3 = { x: 1, y: 2, z: 3 };
+    return Object.keys(p).join(",");
+  }
+  check("field order survives", keys(), "x,y,z");
+
+  function shape(): string {
+    let mut p: Vec3 = { x: 1, y: 2, z: 3 };
+    const d = Object.getOwnPropertyDescriptor(p, "y");
+    return [d.value, d.writable, d.enumerable, d.configurable].join(",");
+  }
+  check("property attributes survive", shape(), "2,true,true,true");
+
+  function passed(): number {
+    function sum(v): number { return v.x + v.y + v.z; }
+    let mut p: Vec3 = { x: 1, y: 2, z: 3 };
+    p.x = 4;
+    return sum(p);
+  }
+  check("passed by value", passed(), 9);
+
+  function returned(): number {
+    function make(): Vec3 { let mut p: Vec3 = { x: 1, y: 2, z: 3 }; p.y = 9; return p; }
+    return make().y;
+  }
+  check("returned", returned(), 9);
+
+  function stored(): number {
+    let mut p: Vec3 = { x: 5, y: 0, z: 0 };
+    const box = p;
+    return box.x;
+  }
+  check("stored in another binding", stored(), 5);
+
+  // A read after the value escaped keeps the binding an object, so the
+  // callee's mutation is still visible. Nothing here is split.
+  function mutatedAfterEscape(): number {
+    function poke(v): void { v.x = 99; }
+    let mut p: Vec3 = { x: 1, y: 2, z: 3 };
+    poke(p);
+    return p.x;
+  }
+  check("read after escape sees the callee's write", mutatedAfterEscape(), 99);
+
+  // The same, with the escape inside a loop.
+  function escapeInLoop(): number {
+    function poke(v): void { v.x += 1; }
+    let mut p: Vec3 = { x: 0, y: 0, z: 0 };
+    for (let i = 0; i < 3; i++) poke(p);
+    return p.x;
+  }
+  check("escape in a loop", escapeInLoop(), 3);
+}
+escaping();
+
+// --- borrows hand over the real object -----------------------------------
+function borrows(): void {
+  function bump(c: &mut Counter): void { c.hits += 1; }
+  let mut counter: Counter = { hits: 0 };
+  bump(&mut counter);
+  bump(&mut counter);
+  check("&mut writes through", counter.hits, 2);
+
+  function len2(v: &Vec3): f64 { return v.x * v.x + v.y * v.y; }
+  let mut p: Vec3 = { x: 3, y: 4, z: 0 };
+  check("& reads through", len2(&p), 25);
+  p.x = 6;
+  check("owner still writable after a borrow", len2(&p), 52);
+}
+borrows();
+
+// --- shapes that must be left alone --------------------------------------
+interface WithString { id: i32; name: string }
+interface WithMethod { n: i32; go(): void }
+interface WithOptional { n?: i32 }
+interface Nested { v: Vec3 }
+interface Empty {}
+
+function notSplit(): void {
+  // Not primitive-only, so not a fixed-layout struct: an ordinary object.
+  let mut a: WithString = { id: 1, name: "n" };
+  a.id += 1;
+  check("interface with a string", a.id + a.name, "2n");
+
+  let mut b: WithMethod = { n: 1, go() {} };
+  b.n += 1;
+  check("interface with a method", b.n, 2);
+
+  let mut c: WithOptional = { n: 1 };
+  c.n += 1;
+  check("optional member", c.n, 2);
+
+  let mut d: Nested = { v: { x: 1, y: 0, z: 0 } };
+  d.v.x += 1;
+  check("nested struct", d.v.x, 2);
+
+  let mut e: Empty = {};
+  check("empty interface", Object.keys(e).length, 0);
+
+  // A literal whose fields are not the declared ones is left alone.
+  let mut f: Vec3 = { x: 1, y: 2 };
+  check("missing field", f.z, undefined);
+  let mut g: Vec3 = { z: 1, y: 2, x: 3 };
+  check("fields out of order", g.x + g.y + g.z, 6);
+  let mut h: Vec3 = { x: 1, y: 2, z: 3, w: 4 };
+  check("extra field", h.w, 4);
+
+  // A dynamic key, a delete and an `in` all need the object.
+  let mut i: Vec3 = { x: 1, y: 2, z: 3 };
+  const k = "y";
+  check("dynamic key", i[k], 2);
+  delete i.z;
+  check("delete", "z" in i, false);
+
+  // A captured binding keeps its object.
+  let mut j: Vec3 = { x: 1, y: 2, z: 3 };
+  const readX = () => j.x;
+  j.x = 7;
+  check("captured", readX(), 7);
+
+  // Reassigning the whole binding.
+  let mut m: Vec3 = { x: 1, y: 2, z: 3 };
+  m = { x: 4, y: 5, z: 6 };
+  check("reassigned", m.x + m.y + m.z, 15);
+
+  // An un-annotated binding is an ordinary object, whatever it holds.
+  let n = { x: 1, y: 2, z: 3 };
+  n.x += 1;
+  check("no annotation", n.x, 2);
+
+  // An immutable owner still reads through its fields.
+  const o: Vec3 = { x: 1, y: 2, z: 3 };
+  check("const owner", o.x + o.y + o.z, 6);
+
+  // A `var` is hoisted out of its block, so an initializer that throws
+  // halfway leaves the whole binding undefined -- not the fields that were
+  // written before the throw. Only lexical bindings are split.
+  function hoisted(): string {
+    function boom(): number { throw new RangeError("no"); }
+    try {
+      var p: Vec3 = { x: 1, y: boom(), z: 3 };
+    } catch (e) {}
+    return String(p);
+  }
+  check("var with a throwing initializer", hoisted(), "undefined");
+}
+notSplit();
+
+// --- the temporal dead zone is still a ReferenceError --------------------
+function tdz(): void {
+  function readBeforeInit(): string {
+    try {
+      const before = p.x;
+      let mut p: Vec3 = { x: 1, y: 2, z: 3 };
+      return "no throw " + before;
+    } catch (e) {
+      return e.constructor.name;
+    }
+  }
+  check("read before init", readBeforeInit(), "ReferenceError");
+
+  function writeBeforeInit(): string {
+    try {
+      p.x = 1;
+      let mut p: Vec3 = { x: 1, y: 2, z: 3 };
+      return "no throw";
+    } catch (e) {
+      return e.constructor.name;
+    }
+  }
+  check("write before init", writeBeforeInit(), "ReferenceError");
+
+  function escapeBeforeInit(): string {
+    try {
+      const q = p;
+      let mut p: Vec3 = { x: 1, y: 2, z: 3 };
+      return "no throw";
+    } catch (e) {
+      return e.constructor.name;
+    }
+  }
+  check("escape before init", escapeBeforeInit(), "ReferenceError");
+}
+tdz();
+
+// --- a throwing field expression leaves the fields as they were ----------
+function throwing(): void {
+  let mut p: Vec3 = { x: 1, y: 2, z: 3 };
+  let threw = "";
+  try {
+    p.x = (() => { throw new RangeError("no"); })();
+  } catch (e) {
+    threw = e.constructor.name;
+  }
+  check("throwing rhs", threw, "RangeError");
+  check("field unchanged after a throw", p.x, 1);
+
+  let symThrew = "";
+  try { p.y += Symbol("s"); } catch (e) { symThrew = e.constructor.name; }
+  check("symbol still throws TypeError", symThrew, "TypeError");
+}
+throwing();
+
+// --- module scope --------------------------------------------------------
+let mut top: Vec3 = { x: 4, y: 5, z: 6 };
+top.x *= 2;
+check("module-level read/write", top.x + top.y + top.z, 19);
+check("module-level escape", JSON.stringify(top), '{"x":8,"y":5,"z":6}');
+
+// A struct declared inside a block, in a loop, one per iteration.
+let total = 0;
+for (let i = 0; i < 3; i++) {
+  let mut inner: Counter = { hits: i };
+  inner.hits *= 2;
+  total += inner.hits;
+}
+check("per-iteration struct", total, 6);
+
+if (failures !== 0) throw new Error(failures + " struct-SROA checks failed");
+console.log("struct SROA: all checks passed");

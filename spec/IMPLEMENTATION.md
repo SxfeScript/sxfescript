@@ -51,6 +51,18 @@
   `tests/fixtures/typed_inline.sx` asserts the splice changes nothing
   observable -- values, coercions, exceptions, reassignment, capture, wrong
   arity, use as a value -- with every expected value taken from Node.
+- Fixed-layout structs are compiled to scalars. An `interface` whose members
+  are all `i32`/`f32`/`f64`/`bool` is recorded per compilation unit while the
+  declaration is still erased, so `: Name` classifies as `SX_TYPE_STRUCT`; a
+  lexical binding of that type whose every use the compiler can account for is
+  split into one local per field by `sx_scalarize_structs`, and no object is
+  allocated. A use the pass cannot account for -- a capture, a borrow handed
+  to a call, a reassignment, a read after the value moved, a literal that is
+  not exactly the declared fields -- leaves that binding untouched, and a move
+  builds the object at the point it escapes. The measured effect is below.
+  `tests/fixtures/struct_sroa.sx` asserts the split is invisible, with every
+  expected value taken from Node bar the one i32 wrap that is SX's by
+  definition.
 - Cycle sweeping when the event loop is quiet, plus `Sxn.gc()` and an `rss`
   field on `Sxn.memoryUsage()`. Why it was needed, and what it is worth, is
   below.
@@ -247,6 +259,89 @@ pays for its frame; lifting that needs the arguments in caller temporaries,
 which means allocating locals after `resolve_variables`. And an inlined callee
 no longer appears in a stack trace if its arithmetic throws -- the same
 tradeoff every inlining compiler makes.
+
+### The other large removable cost is the object, and the type removes it
+
+The call frame was the first cost a declared type could delete outright. The
+second is the object itself, and it is larger. A JIT reaches it by speculating
+that a shape holds and deoptimizing when it does not; an interpreter cannot
+speculate. What it can do is read a type that was written down.
+
+`interface Vec3 { x: f64; y: f64; z: f64 }` is not a hint about an object. It
+is an affine fixed-layout value (`spec/LANGUAGE.md`), with no identity anything
+can observe, so a binding of that type that is never captured, borrowed or
+moved is three numbers and the object is dead weight. `sx_scalarize_structs`
+runs in the same pass-2 slot as `fuse_i32_accum_loops` and
+`sx_inline_typed_calls`, matches every mention of such a binding against the
+handful of byte sequences the parser emits for a field, and replaces the
+binding with one local per field. Measured with
+`benchmarks/engine/struct_sroa_probe.sx`, minimum of 9 runs over 2M
+iterations, macOS arm64, Release, per loop iteration:
+
+| | ns/op |
+|---|---|
+| empty loop | 4.07 |
+| create + update: untyped | 80.60 |
+| create + update: typed | 11.19 |
+| create + update: hand-split | 12.49 |
+| update only: untyped | 18.31 |
+| update only: typed | 6.40 |
+| update only: hand-split | 6.39 |
+
+80.6 to 11.2 ns on the row that allocates, 7.2x, and 18.3 to 6.4 on the row
+that only reads and writes fields, 2.9x. Both land on the hand-written
+ceiling -- the same arithmetic over three separate `let`s -- which is the
+bound this can reach, and the create row edges past it because the three
+`let`s of the hand-written version are three separate declarations. The
+`benchmarks/wintertc` rows are unmoved (buffer 19.9 ms, textencoder 4.9,
+events 6.8, worst pause 0.02), which is expected: no workload there declares
+a struct.
+
+Read the first row against the ledger's own object numbers rather than against
+a JIT. An empty `{}` costs 76 ns to create and destroy here and a two-field
+literal 79 ns even with the shape keep-alive ring, and the section below
+records that reaching a few nanoseconds per object means not doing per-object
+work at all -- bump allocation and a nursery, which is a different engine.
+This does something else: it does not make the object cheaper, it removes the
+object. The nursery argument is untouched by it, and so is the object-literal
+shape churn below, which is still there for every literal the compiler cannot
+account for.
+
+Four limits are worth stating rather than discovering.
+
+The binding must be lexical. A `var` is hoisted out of the block it is written
+in, so a `var` whose initializer throws halfway is still readable afterwards,
+and it would then read the fields written before the throw rather than the
+`undefined` the binding actually holds. A `let` cannot be reached that way: an
+initializer that throws leaves its own block, and everything that could
+observe the binding goes with it.
+
+A move must be the last mention of the binding in bytecode order, and must not
+sit inside a loop. Moving a struct into JavaScript boxes a copy, which is the
+defined semantics, but the ownership rules that make a move final are not
+enforced yet -- so a program that violates them by using the binding after
+moving it must not be able to tell that it did. Those two conditions are what
+a control-flow pass would replace with SX2001.
+
+A borrow keeps the object. `&mut v` hands a callee something it may write
+through, so the pass gives up on that binding entirely rather than trying to
+write the callee's mutations back into the caller's locals. Lifting that is
+the same work as extending `sx_inline_typed_calls` to a struct parameter, and
+wants doing in one piece: an inlined callee reading `v.x` from the caller's
+locals is where the borrow rules pay, and 28.9 -> 18.1 ns is the hand-inlined
+bound recorded above for a call that still keeps its object.
+
+The field must be named statically. `p[k]`, a `delete`, an `in`, and a literal
+whose fields are not exactly the declared ones all keep the object, because
+each of them asks a question only a property table can answer.
+
+One latent defect turned up on the way, and is fixed here rather than left:
+`OP_inc_loc_safe_i32` declared size 1 in `quickjs-opcode.h` while its
+interpreter case reads a one-byte operand, so `opcode_info` disagreed with the
+emitter by a byte. Nothing emitted it -- it is selected only for an unchecked
+`put_loc`, and every binding that can select it is lexical and therefore
+checked -- so it had never mattered, and briefly making the path live is what
+surfaced it. It stays dead; the declaration is now honest.
 
 ### A JIT is ruled out by platform, not by effort
 
@@ -555,6 +650,11 @@ Architectural work with no shortcut, still outstanding:
 - Replace the conservative source transformer with QuickJS parser-mode changes
   and shared parser tables for the LSP.
 - Add the per-function ownership CFG and all SX bytecodes described by the ABI.
+  The CFG is what would replace the two conservative conditions
+  `sx_scalarize_structs` currently puts on a move, and what SX2001 needs. The
+  allocation bytecode is deferred by measurement rather than outstanding: a
+  struct the compiler can account for is never allocated at all, and one that
+  escapes is built by the ordinary object opcodes. `spec/ABI.md` records that.
 - Add frame-owned arena storage, exception-safe cleanup, object borrow locks,
   revocable interop proxies, and typed native registration to QuickJS.
 - Replace the npm bootstrap delegation with the pinned native registry,

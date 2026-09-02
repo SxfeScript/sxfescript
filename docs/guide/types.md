@@ -75,6 +75,23 @@ On an M4 that took a two-argument call from 16.3 ns to 5.3, which is where a
 hand-written `a + b` lands. Remove the annotations and it is an ordinary call
 again. The measurements are in [the performance notes](../performance/).
 
+**A declared struct is not an object.** An `interface` whose fields are all
+`i32`, `f32`, `f64` or `bool` describes a fixed-layout value, so a binding of
+that type is compiled to one plain local per field and never allocated:
+
+```sx
+interface Vec3 { x: f64; y: f64; z: f64 }
+
+let mut p: Vec3 = { x: 0, y: 1, z: 2 };
+p.x += p.y;
+```
+
+Creating and updating one in a loop went from 80.6 ns per iteration to 11.2 on
+an M4, which is what the same arithmetic over three separate `let`s costs. Hand
+the value to something that wants an object -- `JSON.stringify(p)`, a call, a
+`return` -- and one is built at that point, with the same fields in the same
+order, so nothing downstream can tell.
+
 ## `safe`
 
 `safe` is an optional qualifier on `let` and `const`. It marks a binding as

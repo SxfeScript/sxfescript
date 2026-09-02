@@ -83,6 +83,13 @@ console.log(JSON.stringify(pos));
 That is what code crossing into native memory needs, and the exact rules —
 sizes, alignment, padding — are in [the language contract](../language/).
 
+It is also why such a value costs nothing. A binding whose declared type is one
+of these interfaces is compiled to one ordinary local per field, so `pos` above
+is three numbers and no object exists to allocate, collect, or look a property
+up in. JavaScript cannot be compiled this way — any object might be aliased by
+something the compiler cannot see — which is the whole reason for writing the
+type down. [Types and `.sx`](../types/) has the measurement.
+
 ## What to read next
 
 - [Types and `.sx`](../types/) — what the annotations do, and what `safe` means.

@@ -422,6 +422,60 @@ parameter still pays for its frame. And an inlined callee no longer appears in
 a stack trace if its arithmetic throws, which is the tradeoff every inlining
 compiler makes.
 
+## The declared struct buys more, and it is the object
+
+The section above removed a call frame. This one removes the object, and it is
+the larger of the two. A JIT gets at it by speculating on a shape and
+deoptimizing when the guess is wrong; an interpreter has nothing to speculate
+with. It has something better here, which is a type the programmer wrote down.
+
+`interface Vec3 { x: f64; y: f64; z: f64 }` describes an affine fixed-layout
+value with no identity anything can observe (`spec/LANGUAGE.md`), so a binding
+of that type whose uses the compiler can all account for is three numbers, and
+the object around them is dead weight. It is now compiled that way: one
+ordinary local per field, allocated never, collected never, and looked up in no
+property table. Measured on the Mac with
+`benchmarks/engine/struct_sroa_probe.sx`, minimum of 9 runs over 2M
+iterations, reported per loop iteration:
+
+| | ns/op |
+|---|---|
+| empty loop | 4.07 |
+| create + update: untyped | 80.60 |
+| create + update: typed | 11.19 |
+| create + update: hand-split | 12.49 |
+| update only: untyped | 18.31 |
+| update only: typed | 6.40 |
+| update only: hand-split | 6.39 |
+
+7.2x on the row that allocates a struct per iteration and 2.9x on the row that
+only reads and writes its fields, both landing on the hand-written ceiling --
+the same arithmetic over three separate `let`s. Plain JavaScript never
+qualifies, for the same reason it never qualifies for the inliner: the gate is
+a declared type, so a `.js` file is untouched. Remove the annotation and the
+object comes back.
+
+This is the one row in this document where the absence of a JIT is not the
+thing being apologised for. V8 does escape analysis on the same loop, but it
+has to prove what SX simply states, and it carries deoptimization metadata to
+survive being wrong. Nothing here can be wrong: a binding the compiler cannot
+fully account for -- captured, borrowed to a call, reassigned, read after it
+moved, or handed a literal that is not exactly its declared fields -- keeps its
+object, and a value that escapes has one built at the point it escapes, with
+the same fields in the same order.
+
+It also does not touch the object numbers elsewhere in this document. An empty
+`{}` still costs 76 ns to create and destroy, object literals still rebuild
+their intermediate shapes, and a nursery is still the only thing that changes
+either. What this removes is the object, not its price.
+
+The `benchmarks/wintertc` rows are unmoved (buffer 19.9 ms, textencoder 4.9,
+events 6.8, worst pause 0.02), which is expected: nothing in that suite
+declares a struct. `spec/IMPLEMENTATION.md` records the four limits -- lexical
+bindings only, a move that must be last and outside a loop, a borrow that
+keeps the object, and a field that must be named statically -- and why each
+one is where the line currently sits.
+
 ## An idle process never collected
 
 Not a speed result but a memory one, and the counterpart to the zero ceilings

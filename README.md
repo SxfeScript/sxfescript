@@ -103,14 +103,18 @@ opcode lowering, full control-flow ownership pass, native npm registry backend,
 and semantic LSP features are tracked in `spec/IMPLEMENTATION.md` and are not
 yet represented as complete production implementations.
 
-Two things the annotations do today rather than being stripped. `&mut` requires
-a `let mut` owner, so borrowing an immutable binding is a compile error naming
-SX2003 -- the one ownership rule enforced ahead of that control-flow pass. And
-the declared type reaches codegen: `safe let mut n: i32` wraps at the 32-bit
-boundary where every other annotation keeps exact JavaScript arithmetic, and a
-small function with a fully declared scalar signature is inlined into its
-caller, worth 3.1x on a two-argument add. `spec/PERFORMANCE.md` has the
-measurements.
+Three things the annotations do today rather than being stripped. `&mut`
+requires a `let mut` owner, so borrowing an immutable binding is a compile
+error naming SX2003 -- the one ownership rule enforced ahead of that
+control-flow pass. The declared type reaches codegen: `safe let mut n: i32`
+wraps at the 32-bit boundary where every other annotation keeps exact
+JavaScript arithmetic, and a small function with a fully declared scalar
+signature is inlined into its caller, worth 3.1x on a two-argument add. And a
+binding whose type is a primitive-only `interface` is compiled to one scalar
+local per field, so the object is never allocated at all -- 7.2x on a
+create-and-update loop, and the one place this language beats a JIT rather
+than trailing it, because a JIT can only guess at what an annotation states.
+`spec/PERFORMANCE.md` has the measurements.
 
 ## What the runtime does
 
