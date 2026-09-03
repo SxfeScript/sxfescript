@@ -84,4 +84,4 @@ check("transform ran", tsc.join("") === "A");
 
 check("WebAssembly is the gap", typeof globalThis.WebAssembly === "undefined");
 console.log(bad === 0 ? "ALL PASS" : "FAILURES: " + bad);
-process.exit(bad === 0 ? 0 : 1);
+if (bad !== 0) throw new Error(bad + " checks failed");

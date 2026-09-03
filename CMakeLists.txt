@@ -1,5 +1,55 @@
 cmake_minimum_required(VERSION 3.20)
 project(sxn VERSION 0.0.2 LANGUAGES C)
+# --- What this build contains -------------------------------------------
+# Two halves. The runtime half is the engine plus the WinterTC surface and
+# knows nothing about Node; the node half is everything that exists to
+# imitate it. Every option below defaults to what sxn has always built, so
+# the default configuration is unchanged.
+
+# The node: builtins, require, CommonJS, node_modules resolution and .node
+# addon loading.
+option(SXN_ENABLE_NODE "node: builtins, require and CommonJS" ON)
+
+# The sxn command-line tool. src/main.c is require, node_modules resolution,
+# package.json "exports" walking and .node dispatch from end to end, so it is
+# the node layer's own front end rather than something that merely uses it.
+# With it off the build produces examples/embed instead: the smallest main()
+# that installs the runtime half and runs a file.
+option(SXN_BUILD_CLI "Build the sxn command-line tool" ON)
+
+# Capabilities of the libuv backend. Each is a Sxn.* name rather than a
+# WinterTC one, so a build without them still answers the whole Minimum
+# Common API.
+option(SXN_ENABLE_SERVE "Sxn.serve, the HTTP server" ON)
+option(SXN_ENABLE_FS "Sxn.file's async reads and writes" ON)
+
+# Where the runtime's waiting happens (include/sxn_loop.h). "libuv" is what
+# sxn has always done and what Sxn.serve and Sxn.file need. "builtin" needs
+# nothing beyond libc and libcurl -- which waits on its own sockets, so fetch
+# and the timers both survive -- and drops those two.
+set(SXN_LOOP_BACKEND "libuv" CACHE STRING "Loop backend: libuv or builtin")
+set_property(CACHE SXN_LOOP_BACKEND PROPERTY STRINGS libuv builtin)
+
+# Fail at configure time rather than quietly downgrade something asked for.
+if(NOT SXN_LOOP_BACKEND STREQUAL "libuv" AND NOT SXN_LOOP_BACKEND STREQUAL "builtin")
+  message(FATAL_ERROR "SXN_LOOP_BACKEND must be 'libuv' or 'builtin', got '${SXN_LOOP_BACKEND}'")
+endif()
+if(NOT SXN_LOOP_BACKEND STREQUAL "libuv")
+  foreach(needs_uv SXN_ENABLE_SERVE SXN_ENABLE_FS SXN_ENABLE_NODE)
+    if(${needs_uv})
+      message(FATAL_ERROR "${needs_uv}=ON needs SXN_LOOP_BACKEND=libuv: a TCP listener, a thread pool and node:dgram/child_process/dns/os have no built-in equivalent")
+    endif()
+  endforeach()
+endif()
+# node:http is built directly on __sxnServe and node:fs on the async reads,
+# so the node layer is not independent of those two.
+if(SXN_ENABLE_NODE AND NOT (SXN_ENABLE_SERVE AND SXN_ENABLE_FS))
+  message(FATAL_ERROR "SXN_ENABLE_NODE=ON needs SXN_ENABLE_SERVE and SXN_ENABLE_FS: node:http is built on __sxnServe and node:fs on __sxnStat/__sxnWriteFileAsync")
+endif()
+if(SXN_BUILD_CLI AND NOT SXN_ENABLE_NODE)
+  message(FATAL_ERROR "SXN_BUILD_CLI=ON needs SXN_ENABLE_NODE: src/main.c is require, node_modules resolution and .node dispatch throughout")
+endif()
+
 # Every other dependency here (curl, zlib, libuv, libffi) resolves to a
 # dylib under /usr/lib on macOS - part of the OS, present on every Mac.
 # OpenSSL doesn't ship there anymore, so find_package(OpenSSL) resolves to
@@ -37,12 +87,16 @@ else()
 endif()
 # libuv ships a CMake config package from Homebrew and vcpkg, but Ubuntu's
 # libuv1-dev provides only pkg-config, so fall back to that rather than
-# requiring the config package everywhere.
-find_package(libuv CONFIG QUIET)
-if(NOT TARGET libuv::uv_a)
-  find_package(PkgConfig REQUIRED)
-  pkg_check_modules(LIBUV REQUIRED IMPORTED_TARGET libuv)
-  add_library(libuv::uv_a ALIAS PkgConfig::LIBUV)
+# requiring the config package everywhere. Looked for only when something is
+# going to use it: with SXN_LOOP_BACKEND=builtin a machine that has never
+# installed libuv configures and builds.
+if(SXN_LOOP_BACKEND STREQUAL "libuv")
+  find_package(libuv CONFIG QUIET)
+  if(NOT TARGET libuv::uv_a)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LIBUV REQUIRED IMPORTED_TARGET libuv)
+    add_library(libuv::uv_a ALIAS PkgConfig::LIBUV)
+  endif()
 endif()
 # New link for Task 5: gzip-decompressing npm tarballs needs zlib's inflate;
 # OpenSSL (already linked) has no gzip support. zlib ships with the OS on
@@ -71,22 +125,6 @@ set(CMAKE_C_EXTENSIONS OFF)
 # standard C. Apple's headers expose both regardless.
 if(UNIX AND NOT APPLE)
   add_compile_definitions(_GNU_SOURCE)
-endif()
-
-# The node: layer. Off is not wired up yet -- the sources and the dependency
-# discovery still assume it -- but the runtime half already compiles against
-# this rather than calling into node.c directly, so the seam is real and
-# testable before the switch exists.
-option(SXN_ENABLE_NODE "node: builtins, require and CommonJS" ON)
-
-# Where the runtime's waiting happens (include/sxn_loop.h). "libuv" is what
-# sxn has always done and what Sxn.serve and Sxn.file need. "builtin" has no
-# dependency beyond libc and libcurl, keeps timers and fetch, and drops those
-# two -- neither of which is a WinterTC name, so the surface stays whole.
-set(SXN_LOOP_BACKEND "libuv" CACHE STRING "Loop backend: libuv or builtin")
-set_property(CACHE SXN_LOOP_BACKEND PROPERTY STRINGS libuv builtin)
-if(NOT SXN_LOOP_BACKEND STREQUAL "libuv" AND NOT SXN_LOOP_BACKEND STREQUAL "builtin")
-  message(FATAL_ERROR "SXN_LOOP_BACKEND must be 'libuv' or 'builtin', got '${SXN_LOOP_BACKEND}'")
 endif()
 
 option(SXN_ENABLE_POISON "Poison moved and released arena storage" ON)
@@ -147,25 +185,51 @@ add_custom_command(
 )
 add_custom_target(sxn_node_compat_header DEPENDS ${SXN_NODE_COMPAT_HEADER})
 
-add_executable(sxn
-  src/main.c
-  src/package.c
-  src/lsp.c
+# The runtime half: the engine plus the WinterTC surface, and nothing that
+# knows what Node is.
+set(SXN_RUNTIME_SOURCES
   src/network.c
   src/clock.c
   src/loop.c
-  $<IF:$<STREQUAL:${SXN_LOOP_BACKEND},libuv>,${CMAKE_CURRENT_SOURCE_DIR}/src/loop_uv.c,${CMAKE_CURRENT_SOURCE_DIR}/src/loop_builtin.c>
   src/compression.c
-  src/node.c
-  src/node_sys.c
   src/ffi.c
-  src/napi.c
 )
-add_dependencies(sxn sxn_bootstrap_header sxn_node_compat_header)
+if(SXN_LOOP_BACKEND STREQUAL "libuv")
+  list(APPEND SXN_RUNTIME_SOURCES src/loop_uv.c)
+else()
+  list(APPEND SXN_RUNTIME_SOURCES src/loop_builtin.c)
+endif()
+
+# The node half.
+set(SXN_NODE_SOURCES src/node.c src/node_sys.c src/napi.c)
+
+if(SXN_BUILD_CLI)
+  add_executable(sxn
+    src/main.c
+    src/package.c
+    src/lsp.c
+    ${SXN_RUNTIME_SOURCES}
+    ${SXN_NODE_SOURCES}
+  )
+else()
+  # No CLI to build, so the thing that proves the runtime half stands alone:
+  # a main() that installs it and runs one file.
+  add_executable(sxn examples/embed/main.c ${SXN_RUNTIME_SOURCES})
+  set_target_properties(sxn PROPERTIES OUTPUT_NAME sxn-embed)
+endif()
+add_dependencies(sxn sxn_bootstrap_header)
+if(SXN_ENABLE_NODE)
+  add_dependencies(sxn sxn_node_compat_header)
+endif()
 target_include_directories(sxn PRIVATE include third_party/arcsx third_party/node-api ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_compile_definitions(sxn PRIVATE SXN_ENABLE_NODE=$<BOOL:${SXN_ENABLE_NODE}>
+  SXN_ENABLE_SERVE=$<BOOL:${SXN_ENABLE_SERVE}>
+  SXN_ENABLE_FS=$<BOOL:${SXN_ENABLE_FS}>
   SXN_LOOP_UV=$<STREQUAL:${SXN_LOOP_BACKEND},libuv>)
-target_link_libraries(sxn PRIVATE sxfe qjs qjs-libc OpenSSL::Crypto CURL::libcurl libuv::uv_a ZLIB::ZLIB)
+target_link_libraries(sxn PRIVATE sxfe qjs qjs-libc OpenSSL::Crypto CURL::libcurl ZLIB::ZLIB)
+if(SXN_LOOP_BACKEND STREQUAL "libuv")
+  target_link_libraries(sxn PRIVATE libuv::uv_a)
+endif()
 if(LIBFFI_FOUND)
   target_link_libraries(sxn PRIVATE PkgConfig::LIBFFI)
 elseif(LIBFFI_LIBRARY AND LIBFFI_INCLUDE_DIR)
@@ -204,7 +268,59 @@ if(WIN32)
 endif()
 
 include(CTest)
+
+# The embed tier: every fixture here has to run on the runtime half alone --
+# no node: layer, no require, no libuv. That is the whole assertion, and it
+# runs in the default build too, so a WinterTC global that starts depending
+# on a node primitive fails here before anyone configures the minimal build.
+#
+# wintertc_surface is the load-bearing one: it counts all 62 names of the
+# Minimum Common API, round-trips all three CompressionStream formats, and
+# exercises BYOB reads. The rest are the engine and JSON conformance
+# fixtures, which need nothing from either optional half.
+set(SXN_EMBED_FIXTURES
+  array_search
+  call_edge
+  capture_semantics
+  ctor_proto
+  declaration_scoping
+  encode_length_fusion
+  encodeinto_spec
+  event_target
+  float_math
+  formdata
+  js_conformance
+  js_overflow
+  json_edges
+  json_fuzz
+  lazy_builtins
+  map_set_hash
+  message_channel
+  performance_now
+  prop_cache_shadow
+  props_stress
+  regexp_conformance
+  splice_conformance
+  stack_safety
+  string_number_concat
+  tdz_fusion
+  template_literals
+  web_apis
+  web_streams
+  wintertc_surface
+)
+
 if(BUILD_TESTING AND SXN_BUILD_TESTS)
+  if(NOT SXN_BUILD_CLI)
+    # No sxn to drive them; the embed tier below is the whole suite.
+    foreach(f IN LISTS SXN_EMBED_FIXTURES)
+      add_test(NAME embed-${f} COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/${f}.mjs)
+      set_tests_properties(embed-${f} PROPERTIES LABELS embed TIMEOUT 120)
+    endforeach()
+  endif()
+endif()
+
+if(BUILD_TESTING AND SXN_BUILD_TESTS AND SXN_BUILD_CLI)
   add_executable(sxfe-tests tests/frontend_test.c)
   target_link_libraries(sxfe-tests PRIVATE sxfe)
   if(MSVC)
@@ -578,6 +694,14 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   set_tests_properties(sxn-serve-fetch-shape PROPERTIES TIMEOUT 30 FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-performance-now PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   set_tests_properties(sxn-encode-into PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+
+  # The embed tier, run through sxn as well. Same files, same assertion: if
+  # one of them starts needing something only the node layer installs, this
+  # catches it in the build everybody runs.
+  foreach(f IN LISTS SXN_EMBED_FIXTURES)
+    add_test(NAME embed-${f} COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/${f}.mjs)
+    set_tests_properties(embed-${f} PROPERTIES LABELS embed TIMEOUT 120)
+  endforeach()
 endif()
 
 install(TARGETS sxn RUNTIME DESTINATION bin)

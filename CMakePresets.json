@@ -6,22 +6,86 @@
       "displayName": "SXN Debug",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/debug",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "SXN_ENABLE_POISON": "ON" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "SXN_ENABLE_POISON": "ON"
+      }
     },
     {
       "name": "release",
       "displayName": "SXN Release",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/release",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "SXN_ENABLE_POISON": "OFF" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SXN_ENABLE_POISON": "OFF"
+      }
+    },
+    {
+      "name": "embed-uv",
+      "displayName": "SXN without the node layer (libuv kept)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/embed-uv",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SXN_ENABLE_NODE": "OFF",
+        "SXN_BUILD_CLI": "OFF"
+      }
+    },
+    {
+      "name": "minimal",
+      "displayName": "SXN runtime half alone: no node layer, no libuv",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/minimal",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SXN_ENABLE_NODE": "OFF",
+        "SXN_ENABLE_SERVE": "OFF",
+        "SXN_ENABLE_FS": "OFF",
+        "SXN_LOOP_BACKEND": "builtin",
+        "SXN_BUILD_CLI": "OFF"
+      }
     }
   ],
   "buildPresets": [
-    { "name": "debug", "configurePreset": "debug" },
-    { "name": "release", "configurePreset": "release" }
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "embed-uv",
+      "configurePreset": "embed-uv"
+    },
+    {
+      "name": "minimal",
+      "configurePreset": "minimal"
+    }
   ],
   "testPresets": [
-    { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true } }
+    {
+      "name": "debug",
+      "configurePreset": "debug",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "embed-uv",
+      "configurePreset": "embed-uv",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "minimal",
+      "configurePreset": "minimal",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
   ]
 }
-

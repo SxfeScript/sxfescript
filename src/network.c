@@ -201,26 +201,6 @@ static int sxn_strcasecmp(const char *a, const char *b) {
     return (unsigned char)*a - (unsigned char)*b;
 }
 
-/* Make room for `want` bytes in one go. A 1MB request body arriving through
-   a buffer that doubles from 256 bytes is copied about a dozen times on the
-   way in; when Content-Length says how big it will be, it is copied once. */
-static void dynbuf_reserve(DynBuf *buf, size_t want) {
-    if (want <= buf->cap) return;
-    /* Grow geometrically as well as to what was asked for: the read path
-       asks for "what I have plus another read", and honouring that exactly
-       would copy the whole buffer on every read. */
-    size_t cap = buf->cap ? buf->cap * 2 : 256;
-    if (cap < want) cap = want;
-    buf->data = realloc(buf->data, cap);
-    buf->cap = cap;
-}
-
-static void dynbuf_append(DynBuf *buf, const void *data, size_t n) {
-    dynbuf_reserve(buf, buf->length + n);
-    memcpy(buf->data + buf->length, data, n); buf->length += n;
-}
-static void dynbuf_puts(DynBuf *buf, const char *s) { dynbuf_append(buf, s, strlen(s)); }
-
 /* Forward declarations for the SxnChunkView borrow-lock machinery (full
    definitions further down, alongside FetchState/ChunkNode -- see that
    section's doc comment). conn_read_cb below needs to detect and
@@ -235,12 +215,6 @@ static JSClassID sxn_serverhandle_class_id;
 static JSClassDef sxn_serverhandle_class = { "ServerHandle", NULL, NULL, NULL, NULL };
 static JSValue sxn_chunkview_acquire(JSContext *ctx, SxnChunkViewState *st, int exclusive, JSValue *out_buffer);
 static void sxn_chunkview_release_shared(SxnChunkViewState *st);
-
-static const char *reason(int status) {
-    switch (status) { case 200: return "OK"; case 201: return "Created"; case 204: return "No Content";
-        case 400: return "Bad Request"; case 404: return "Not Found"; case 500: return "Internal Server Error";
-        default: return "Response"; }
-}
 
 /* The floor a sweep will not reduce the GC threshold below, and the initial
    threshold main.c sets. Kept in one place because the idle sweep and
@@ -320,9 +294,66 @@ static JSValue sxn_memory_usage(JSContext *ctx, JSValueConst this_val,
        process growing": the allocator can hold freed pages rather than
        return them, so the two move independently. Reported, never asserted
        on -- see tests/fixtures/leak_cycle_stress.sx. */
+#if SXN_LOOP_UV
     if (uv_resident_set_memory(&rss) == 0) MEM_FIELD("rss", rss);
+#else
+    /* Reading the OS's own number needs a platform call per platform, and
+       libuv is where that lives. Without it the field is simply absent
+       rather than a guess: a caller can tell "not measured here" from a
+       number, and every assertion in the tests is on mallocSize anyway. */
+    (void)rss;
+#endif
 #undef MEM_FIELD
     return result;
+}
+
+/* JSON straight from the bytes, with no string in between: a 1MB request
+   body would otherwise be copied into a JavaScript string first, and the
+   parser only wants the bytes. */
+static JSValue sxn_parse_json_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    size_t size = 0;
+    uint8_t *bytes = argc > 0 ? JS_GetUint8Array(ctx, &size, argv[0]) : NULL;
+    if (!bytes) return JS_ThrowTypeError(ctx, "expected a Uint8Array");
+    int64_t offset = 0, length = (int64_t)size;
+    if (argc > 1) JS_ToInt64(ctx, &offset, argv[1]);
+    if (argc > 2) JS_ToInt64(ctx, &length, argv[2]);
+    if (offset < 0 || length < 0 || (size_t)(offset + length) > size)
+        return JS_ThrowRangeError(ctx, "body slice out of range");
+    return JS_ParseJSON(ctx, (const char *)bytes + offset, (size_t)length, "<body>");
+}
+
+#if SXN_ENABLE_SERVE
+/* Sxn.serve, and node:http through it. A TCP listener is a libuv
+   capability: there is no portable stand-in worth writing, and Sxn.serve is
+   not a WinterTC name, so a build without it still has the whole Minimum
+   Common API. bootstrap.js already checks for the primitive before wrapping
+   it, so nothing on the JavaScript side needs to know. */
+
+/* Make room for `want` bytes in one go. A 1MB request body arriving through
+   a buffer that doubles from 256 bytes is copied about a dozen times on the
+   way in; when Content-Length says how big it will be, it is copied once. */
+static void dynbuf_reserve(DynBuf *buf, size_t want) {
+    if (want <= buf->cap) return;
+    /* Grow geometrically as well as to what was asked for: the read path
+       asks for "what I have plus another read", and honouring that exactly
+       would copy the whole buffer on every read. */
+    size_t cap = buf->cap ? buf->cap * 2 : 256;
+    if (cap < want) cap = want;
+    buf->data = realloc(buf->data, cap);
+    buf->cap = cap;
+}
+
+static void dynbuf_append(DynBuf *buf, const void *data, size_t n) {
+    dynbuf_reserve(buf, buf->length + n);
+    memcpy(buf->data + buf->length, data, n); buf->length += n;
+}
+static void dynbuf_puts(DynBuf *buf, const char *s) { dynbuf_append(buf, s, strlen(s)); }
+
+static const char *reason(int status) {
+    switch (status) { case 200: return "OK"; case 201: return "Created"; case 204: return "No Content";
+        case 400: return "Bad Request"; case 404: return "Not Found"; case 500: return "Internal Server Error";
+        default: return "Response"; }
 }
 
 static char *header_value(char *request, const char *name) {
@@ -698,21 +729,6 @@ static JSValue conn_body_string(JSContext *ctx, JSValueConst this_val,
     return JS_NewStringLen(ctx, (const char *)bytes + offset, (size_t)length);
 }
 
-/* JSON straight from the bytes, with no string in between: a 1MB request
-   body would otherwise be copied into a JavaScript string first, and the
-   parser only wants the bytes. */
-static JSValue sxn_parse_json_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    (void)this_val;
-    size_t size = 0;
-    uint8_t *bytes = argc > 0 ? JS_GetUint8Array(ctx, &size, argv[0]) : NULL;
-    if (!bytes) return JS_ThrowTypeError(ctx, "expected a Uint8Array");
-    int64_t offset = 0, length = (int64_t)size;
-    if (argc > 1) JS_ToInt64(ctx, &offset, argv[1]);
-    if (argc > 2) JS_ToInt64(ctx, &length, argv[2]);
-    if (offset < 0 || length < 0 || (size_t)(offset + length) > size)
-        return JS_ThrowRangeError(ctx, "body slice out of range");
-    return JS_ParseJSON(ctx, (const char *)bytes + offset, (size_t)length, "<body>");
-}
 
 static void conn_dispatch_request(ConnState *conn, char *request, size_t length) {
     JSContext *ctx = conn->serve->ctx;
@@ -1084,6 +1100,8 @@ static JSValue js_serve(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     }
     return handle;
 }
+
+#endif /* SXN_ENABLE_SERVE */
 
 /* --- Streaming fetch() -----------------------------------------------
    FetchState is shared between the curl_multi callbacks (which own one
@@ -2177,6 +2195,14 @@ static JSValue sxn_utf8_decode_text(JSContext *ctx, JSValueConst this_val, int a
     return text;
 }
 
+#if SXN_ENABLE_FS
+/* Sxn.file(path)'s async reads and writes, on libuv's thread pool. Like
+   Sxn.serve this is a capability of that backend rather than part of the
+   WinterTC surface; a build without it has no Sxn.file, and bootstrap.js
+   never mentions one. A synchronous fopen() stand-in was considered and
+   left out: the same API meaning two different things about concurrency in
+   two builds is worse than its absence. */
+
 /* Sxn.file(path).text() reads via libuv's thread pool (uv_fs_open/read/close)
    and resolves a real Promise from the completion callback, so the caller's
    synchronous code keeps running while the read happens off-thread. This is
@@ -2315,6 +2341,23 @@ static JSValue sxn_file(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     JS_FreeCString(ctx, path); return file;
 }
 
+#endif /* SXN_ENABLE_FS */
+
+/* Where console.log lands when the host did not bring one of its own. `sxn`
+   always has quickjs-libc's, so this is dead in that build and is the whole
+   of console in an embed that installs nothing. */
+static JSValue sxn_write_stdout(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_UNDEFINED;
+    size_t length = 0;
+    const char *text = JS_ToCStringLen(ctx, &length, argv[0]);
+    if (!text) return JS_EXCEPTION;
+    fwrite(text, 1, length, stdout);
+    fflush(stdout);
+    JS_FreeCString(ctx, text);
+    return JS_UNDEFINED;
+}
+
 /* The only way to reach fd 2 from JS: console.error/warn and
    process.stderr are built on this, so a diagnostic does not land in the
    program's own stdout. */
@@ -2365,15 +2408,21 @@ int sxn_install_network(JSContext *ctx) {
     JSValue global = JS_GetGlobalObject(ctx);
     JSValue runtime = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, runtime, "version", JS_NewString(ctx, "0.0.2"));
+#if SXN_ENABLE_SERVE
     JS_SetPropertyStr(ctx, runtime, "serve", JS_NewCFunction(ctx, js_serve, "serve", 2));
+#endif
+#if SXN_ENABLE_FS
     JS_SetPropertyStr(ctx, runtime, "file", JS_NewCFunction(ctx, sxn_file, "file", 1));
+#endif
     JS_SetPropertyStr(ctx, runtime, "write", JS_NewCFunction(ctx, sxn_write, "write", 2));
     JS_SetPropertyStr(ctx, runtime, "memoryUsage", JS_NewCFunction(ctx, sxn_memory_usage, "memoryUsage", 0));
     JS_SetPropertyStr(ctx, runtime, "gc", JS_NewCFunction(ctx, sxn_gc, "gc", 0));
     sxn_ffi_init(ctx);
     JS_SetPropertyStr(ctx, runtime, "ffi", JS_NewCFunction(ctx, sxn_ffi, "ffi", 4));
     JS_SetPropertyStr(ctx, global, "Sxn", runtime);
+#if SXN_ENABLE_SERVE
     JS_SetPropertyStr(ctx, global, "__sxnServe", JS_NewCFunction(ctx, js_serve, "__sxnServe", 2));
+#endif
 
     /* Native primitives consumed only by bootstrap.js (fetch's raw
        networking primitive, the monotonic clock, and OpenSSL-backed
@@ -2384,6 +2433,7 @@ int sxn_install_network(JSContext *ctx) {
        rather than wrapping it, so this is the function user code sees. */
     JS_SetPropertyStr(ctx, global, "__sxnParseJSONBytes", JS_NewCFunction(ctx, sxn_parse_json_bytes, "__sxnParseJSONBytes", 3));
     JS_SetPropertyStr(ctx, global, "__sxnWriteStderr", JS_NewCFunction(ctx, sxn_write_stderr, "__sxnWriteStderr", 1));
+    JS_SetPropertyStr(ctx, global, "__sxnWriteStdout", JS_NewCFunction(ctx, sxn_write_stdout, "__sxnWriteStdout", 1));
     JS_SetPropertyStr(ctx, global, "__sxnNow", JS_NewCFunction(ctx, sxn_now, "now", 0));
 #ifdef SXN_ABLATE_FUSION
     JS_SetPropertyStr(ctx, global, "__ablNop",

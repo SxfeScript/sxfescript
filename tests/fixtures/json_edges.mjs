@@ -139,4 +139,4 @@ for (const text of ['{"a":}', '"unterminated', '"ab"', "[1,]", "01", "1.", "+1"
 }
 
 console.log(bad === 0 ? "ALL PASS" : "FAILURES: " + bad);
-process.exit(bad === 0 ? 0 : 1);
+if (bad !== 0) throw new Error(bad + " checks failed");

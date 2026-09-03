@@ -2102,9 +2102,19 @@
       }
       return parts.join(" ");
     }
-    console.error = function error() { __sxnWriteStderr(format(Array.prototype.slice.call(arguments)) + "\n"); };
-    console.warn = console.error;
-    console.info = console.log;
-    console.debug = console.log;
+    /* Take a reference rather than assuming one. QuickJS installs console.log
+       through quickjs-libc's js_std_add_helpers, which `sxn` calls but an
+       embedder need not -- and `console.info = console.log` on a missing
+       console is a ReferenceError out of the installer. A host with its own
+       console installs it before sxn_install_network and keeps it; one
+       without gets a working log on stdout. */
+    var c = globalThis.console || (globalThis.console = {});
+    c.error = function error() { __sxnWriteStderr(format(Array.prototype.slice.call(arguments)) + "\n"); };
+    c.warn = c.error;
+    if (typeof c.log !== "function") {
+      c.log = function log() { __sxnWriteStdout(format(Array.prototype.slice.call(arguments)) + "\n"); };
+    }
+    c.info = c.log;
+    c.debug = c.log;
   })();
 })();
