@@ -21,6 +21,7 @@
 #include "sxfe.h"
 #include "sxn_bootstrap.h"
 #include "sxn_clock.h"
+#include "sxn_loop.h"
 
 /* Sxn.ffi lives in src/ffi.c: calling native code is an engine capability
    rather than a Node emulation, so it sits beside the runtime's own surface
@@ -55,11 +56,12 @@ void sxn_ffi_init(JSContext *ctx);
    reader; main.c drives it via sxn_run_event_loop after top-level eval. */
 static uv_loop_t *sxn_loop(void) { return uv_default_loop(); }
 
-/* Every monotonic read in this file goes through here. It was sxn_now_ns()
-   at each site, which tied the WinterTC half to libuv for the sake of a
-   clock; sxn_monotonic_ns (src/clock.c) reads the same counter libuv does on
-   every platform. */
-static uint64_t sxn_now_ns(void) { return sxn_monotonic_ns(); }
+/* Every monotonic read in this file goes through here. It was uv_hrtime() at
+   each site, which tied the WinterTC half to libuv for the sake of a clock.
+   The loop backend answers when it has one of its own -- the libuv backend
+   passes uv_hrtime, so the default build reads exactly what it read before --
+   and src/clock.c answers when it does not. */
+static uint64_t sxn_now_ns(void) { return sxn_loop_now_ns(); }
 
 /* --- curl_multi driven by sxn_loop(), the standard "hiperfifo" pattern:
    CURLMOPT_SOCKETFUNCTION/CURLMOPT_TIMERFUNCTION let libcurl drive
@@ -1755,45 +1757,59 @@ static JSValue js_sxn_fetch_raw(JSContext *ctx, JSValueConst this_val, int argc,
     return out;
 }
 
-/* --- setTimeout/setInterval: real uv_timer_t handles on sxn_loop() (the
-   same loop the curl_multi/serve/fs primitives above already share), not a
-   second timer mechanism and not queueMicrotask/busy-poll based -- so the
-   process genuinely sleeps between fires. bootstrap.js's setTimeout/
+/* --- setTimeout/setInterval, over whichever loop backend is installed
+   (src/loop.c). The libuv backend gives each one a real uv_timer_t on the
+   same loop the curl_multi/serve/fs primitives share, so the process
+   genuinely sleeps between fires rather than polling; a host-driven backend
+   hands them to the host's own timer wheel. bootstrap.js's setTimeout/
    setInterval/clearTimeout/clearInterval wrap this with Node's delay/arg
    handling; extra args are just closed over there, so this primitive only
    needs to know the callback, the delay, and whether to repeat. */
 typedef struct SxnTimer {
-    uv_timer_t handle;
+    void *handle;                 /* opaque, owned by the loop backend */
     JSContext *ctx;
     JSValue callback;
     int64_t id;
     int repeat;
+    int firing;                   /* inside its own callback right now */
+    int stopped;                  /* cleared while firing; the callback frees it */
     struct SxnTimer *prev, *next;
 } SxnTimer;
 
 static SxnTimer *sxn_timers_head = NULL;
 static int64_t sxn_timer_next_id = 1;
 
-static void sxn_timer_close_cb(uv_handle_t *handle) {
-    SxnTimer *timer = (SxnTimer *)handle->data;
+static void sxn_timer_release(SxnTimer *timer) {
     JS_FreeValue(timer->ctx, timer->callback);
     free(timer);
 }
 
 /* Unlinks from the active-timer list and tears the handle down; every call
    site (clearTimer, and a fired one-shot's own callback below) reaches this
-   at most once per timer, since a cleared/finished timer is no longer in
-   the list for a second clearTimer call to find. */
+   at most once per timer, since a cleared/finished timer is no longer in the
+   list for a second clearTimer call to find.
+
+   The one case that needs care is `clearInterval(id)` called from inside the
+   interval's own callback, which is how a repeating timer usually ends. The
+   SxnTimer cannot be freed here then: sxn_timer_cb still has to read
+   `repeat` off it when the call returns. Freeing it used to be deferred by
+   accident -- it happened in libuv's close callback, which runs at the end
+   of the loop turn -- so this says it rather than relying on a backend to
+   be late. */
 static void sxn_timer_stop(SxnTimer *timer) {
     if (timer->prev) timer->prev->next = timer->next; else sxn_timers_head = timer->next;
     if (timer->next) timer->next->prev = timer->prev;
-    uv_timer_stop(&timer->handle);
-    uv_close((uv_handle_t *)&timer->handle, sxn_timer_close_cb);
+    timer->prev = timer->next = NULL;
+    sxn_loop_timer_stop(timer->handle);
+    timer->handle = NULL;
+    if (timer->firing) { timer->stopped = 1; return; }
+    sxn_timer_release(timer);
 }
 
-static void sxn_timer_cb(uv_timer_t *handle) {
-    SxnTimer *timer = (SxnTimer *)handle->data;
+static void sxn_timer_cb(void *arg) {
+    SxnTimer *timer = (SxnTimer *)arg;
     JSContext *ctx = timer->ctx;
+    timer->firing = 1;
     JSValue ret = JS_Call(ctx, timer->callback, JS_UNDEFINED, 0, NULL);
     /* A throwing callback must not crash the process or corrupt engine
        state -- report it the same way main.c reports an uncaught top-level
@@ -1801,7 +1817,9 @@ static void sxn_timer_cb(uv_timer_t *handle) {
        never letting a JS_Call exception propagate past this dispatch). */
     if (JS_IsException(ret)) js_std_dump_error(ctx);
     JS_FreeValue(ctx, ret);
-    if (!timer->repeat) sxn_timer_stop(timer); /* a repeat timer keeps firing on libuv's own schedule until cleared */
+    timer->firing = 0;
+    if (timer->stopped) { sxn_timer_release(timer); return; } /* cleared itself */
+    if (!timer->repeat) sxn_timer_stop(timer); /* a repeat one keeps firing on the backend's schedule until cleared */
 }
 
 static JSValue sxn_set_timer(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -1822,10 +1840,8 @@ static JSValue sxn_set_timer(JSContext *ctx, JSValueConst this_val, int argc, JS
     timer->prev = NULL;
     sxn_timers_head = timer;
 
-    uv_timer_init(sxn_loop(), &timer->handle);
-    timer->handle.data = timer;
-    uint64_t ms = (uint64_t)delay_ms;
-    uv_timer_start(&timer->handle, sxn_timer_cb, ms, repeat ? ms : 0);
+    timer->handle = sxn_loop_timer_start((uint64_t)delay_ms, repeat,
+                                        sxn_timer_cb, timer);
     return JS_NewInt64(ctx, timer->id);
 }
 
@@ -2387,8 +2403,7 @@ static void sxn_maybe_idle_gc(JSContext *ctx, JSRuntime *rt, uint64_t blocked_ns
 
 JSValue sxn_await_with_loop(JSContext *ctx, JSValue obj) {
     JSRuntime *rt = JS_GetRuntime(ctx);
-    uv_loop_t *loop = sxn_loop();
-    uint64_t blocked_ns = 0, before;
+    uint64_t blocked_ns = 0;
     for (;;) {
         int state = JS_PromiseState(ctx, obj);
         if (state == JS_PROMISE_FULFILLED) {
@@ -2411,14 +2426,13 @@ JSValue sxn_await_with_loop(JSContext *ctx, JSValue obj) {
         if (err != 0)
             continue;                         /* a job ran; re-check the state */
 
-        /* No jobs left, so only the loop can move this forward. UV_RUN_ONCE
-           blocks until something is ready rather than spinning. If nothing is
-           pending either, the promise can never settle -- return it and let
-           the caller see a still-pending module rather than hang. */
+        /* No jobs left, so only the loop can move this forward. Blocking is
+           allowed here: nothing can run until something outside the engine
+           does. If nothing is pending either, the promise can never settle --
+           return it and let the caller see a still-pending module rather
+           than hang. */
         sxn_maybe_idle_gc(ctx, rt, blocked_ns);
-        before = sxn_now_ns();
-        int more_handles = uv_run(loop, UV_RUN_ONCE);
-        blocked_ns = sxn_now_ns() - before;
+        int more_handles = sxn_loop_poll(1, UINT64_MAX, &blocked_ns);
         if (!more_handles && !JS_IsJobPending(rt))
             return obj;
     }
@@ -2495,33 +2509,46 @@ static void sxn_maybe_idle_gc(JSContext *ctx, JSRuntime *rt, uint64_t blocked_ns
     sxn_sweep_cycles(rt);
 }
 
-int sxn_run_event_loop(JSContext *ctx) {
-    uv_loop_t *loop = sxn_loop();
+/* One turn: drain every job, report what nothing handled, maybe sweep, then
+   let the loop backend make progress once.
+ *
+ * This is the whole runtime pump, and it is public because a host with its
+ * own loop drives the runtime by calling it once a frame with block == 0
+ * rather than handing control to sxn_run_event_loop below.
+ *
+ * blocked_hint_ns is for exactly that caller. The idle sweep fires only when
+ * the process has demonstrably been waiting, which it learns from how long
+ * poll blocked; a host-driven backend does not block here, so it reports 0
+ * and the sweep would never fire. A host that knows it has slack -- after
+ * presenting a frame, say -- passes its own measurement and gets the same
+ * policy. Passing 0 opts out and leaves Sxn.gc() as the explicit ask.
+ *
+ * Returns nonzero while anything could still make progress. */
+int sxn_runtime_tick(JSContext *ctx, int block, uint64_t blocked_hint_ns) {
     JSRuntime *rt = JS_GetRuntime(ctx);
-    uint64_t blocked_ns = 0;
-    for (;;) {
-        JSContext *ctx1; int err;
-        uint64_t before;
-        while ((err = JS_ExecutePendingJob(rt, &ctx1)) > 0) {}
-        if (err < 0) break;
-        /* Every job that could still settle a rejected promise has now run,
-           so anything still on the list is unhandled: report it (which is
-           what fires onunhandledrejection) before waiting for more I/O. */
-        sxn_flush_rejections(ctx);
-        /* Nothing is in flight here and uv_run is about to block, so this is
-           the cheapest moment in the process to spend a collection -- and how
-           long the last one blocked says whether there was anything to do. */
-        sxn_maybe_idle_gc(ctx, rt, blocked_ns);
-        /* UV_RUN_ONCE blocks (no busy-loop) until the next batch of I/O is
-           ready, then returns so we can drain any jobs it just enqueued
-           before waiting on the next batch. Exits once nothing is left:
-           no active/ref'd handles (e.g. no serve() was ever called) and no
-           pending job, which is what keeps a plain script's exit identical
-           to before this loop existed. */
-        before = sxn_now_ns();
-        int more_handles = uv_run(loop, UV_RUN_ONCE);
-        blocked_ns = sxn_now_ns() - before;
-        if (!more_handles && !JS_IsJobPending(rt)) break;
-    }
+    static uint64_t blocked_ns;
+    JSContext *ctx1; int err;
+
+    while ((err = JS_ExecutePendingJob(rt, &ctx1)) > 0) {}
+    if (err < 0) return 0;
+    /* Every job that could still settle a rejected promise has now run, so
+       anything still on the list is unhandled: report it (which is what
+       fires onunhandledrejection) before waiting for more I/O. */
+    sxn_flush_rejections(ctx);
+    /* Nothing is in flight here and the loop is about to wait, so this is the
+       cheapest moment in the process to spend a collection -- and how long
+       the last wait took says whether there was anything to do. */
+    sxn_maybe_idle_gc(ctx, rt, blocked_hint_ns ? blocked_hint_ns : blocked_ns);
+
+    int more_handles = sxn_loop_poll(block, UINT64_MAX, &blocked_ns);
+    return more_handles || JS_IsJobPending(rt);
+}
+
+int sxn_run_event_loop(JSContext *ctx) {
+    /* Blocks between turns rather than spinning, and exits once nothing is
+       left: no active handles (no serve() was ever called, say) and no
+       pending job, which is what keeps a plain script's exit identical to
+       before this loop existed. */
+    while (sxn_runtime_tick(ctx, 1, 0)) {}
     return JS_HasException(ctx);
 }

@@ -143,6 +143,8 @@ add_executable(sxn
   src/lsp.c
   src/network.c
   src/clock.c
+  src/loop.c
+  src/loop_uv.c
   src/compression.c
   src/node.c
   src/node_sys.c
