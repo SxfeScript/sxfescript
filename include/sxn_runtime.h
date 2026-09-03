@@ -1,6 +1,6 @@
 /* The runtime half's public header: the engine plus the WinterTC surface.
  *
- * This is what an embedder includes. Everything declared here is in libsxnrt
+ * This is what an embedder includes. Everything declared here is in libarcsx
  * and none of it knows what Node is; see include/sxn_node.h for the other
  * half and include/sxn_loop.h for supplying your own event loop.
  *

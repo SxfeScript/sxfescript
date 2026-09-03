@@ -1,6 +1,6 @@
 /* The node half's header: everything that exists to imitate Node.
  *
- * In libsxnnode, which is built only when SXN_ENABLE_NODE is on. A build
+ * In libsxn, which is built only when SXN_ENABLE_NODE is on. A build
  * without it has the whole WinterTC surface and none of these; that is the
  * point of the split, so nothing in include/sxn_runtime.h refers back here.
  */

@@ -189,7 +189,7 @@ add_custom_target(sxn_node_compat_header DEPENDS ${SXN_NODE_COMPAT_HEADER})
 # knows what Node is. This is the library an embedder links -- ArcSX as a
 # drop-in QuickJS that brings TextEncoder, URL, fetch and the Streams with it.
 # Its public headers are include/sxn_runtime.h and include/sxn_loop.h.
-add_library(sxnrt STATIC
+add_library(arcsx STATIC
   src/network.c
   src/clock.c
   src/loop.c
@@ -197,48 +197,51 @@ add_library(sxnrt STATIC
   src/ffi.c
   $<IF:$<STREQUAL:${SXN_LOOP_BACKEND},libuv>,${CMAKE_CURRENT_SOURCE_DIR}/src/loop_uv.c,${CMAKE_CURRENT_SOURCE_DIR}/src/loop_builtin.c>
 )
-add_dependencies(sxnrt sxn_bootstrap_header)
-target_include_directories(sxnrt PUBLIC include third_party/arcsx
+add_dependencies(arcsx sxn_bootstrap_header)
+target_include_directories(arcsx PUBLIC include third_party/arcsx
   PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
-target_compile_definitions(sxnrt PUBLIC
+target_compile_definitions(arcsx PUBLIC
   SXN_ENABLE_NODE=$<BOOL:${SXN_ENABLE_NODE}>
   SXN_ENABLE_SERVE=$<BOOL:${SXN_ENABLE_SERVE}>
   SXN_ENABLE_FS=$<BOOL:${SXN_ENABLE_FS}>
   SXN_LOOP_UV=$<STREQUAL:${SXN_LOOP_BACKEND},libuv>)
-target_link_libraries(sxnrt PUBLIC sxfe qjs qjs-libc OpenSSL::Crypto CURL::libcurl ZLIB::ZLIB)
+target_link_libraries(arcsx PUBLIC sxfe qjs qjs-libc OpenSSL::Crypto CURL::libcurl ZLIB::ZLIB)
 if(SXN_LOOP_BACKEND STREQUAL "libuv")
-  target_link_libraries(sxnrt PUBLIC libuv::uv_a)
+  target_link_libraries(arcsx PUBLIC libuv::uv_a)
 endif()
 if(LIBFFI_FOUND)
-  target_link_libraries(sxnrt PUBLIC PkgConfig::LIBFFI)
+  target_link_libraries(arcsx PUBLIC PkgConfig::LIBFFI)
 elseif(LIBFFI_LIBRARY AND LIBFFI_INCLUDE_DIR)
-  target_include_directories(sxnrt PRIVATE ${LIBFFI_INCLUDE_DIR})
-  target_link_libraries(sxnrt PUBLIC ${LIBFFI_LIBRARY})
+  target_include_directories(arcsx PRIVATE ${LIBFFI_INCLUDE_DIR})
+  target_link_libraries(arcsx PUBLIC ${LIBFFI_LIBRARY})
 else()
   message(FATAL_ERROR "libffi not found; it backs Sxn.ffi (brew install libffi / apt install libffi-dev)")
 endif()
 if(NOT WIN32)
-  target_link_libraries(sxnrt PUBLIC ${CMAKE_DL_LIBS})
+  target_link_libraries(arcsx PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
-# The node half. Depends on sxnrt and nothing depends on it, which is the
+# The node half. Depends on arcsx and nothing depends on it, which is the
 # whole layering claim in one line of CMake.
 if(SXN_ENABLE_NODE)
-  add_library(sxnnode STATIC src/node.c src/node_sys.c src/napi.c)
-  add_dependencies(sxnnode sxn_node_compat_header)
-  target_include_directories(sxnnode PUBLIC include
+  add_library(sxn_node STATIC src/node.c src/node_sys.c src/napi.c)
+  # libsxn.a. The CMake target cannot be called `sxn` because the
+  # executable already is, and ~120 add_test lines name that target.
+  set_target_properties(sxn_node PROPERTIES OUTPUT_NAME sxn)
+  add_dependencies(sxn_node sxn_node_compat_header)
+  target_include_directories(sxn_node PUBLIC include
     PRIVATE third_party/arcsx third_party/node-api ${CMAKE_CURRENT_BINARY_DIR}/generated)
-  target_link_libraries(sxnnode PUBLIC sxnrt)
+  target_link_libraries(sxn_node PUBLIC arcsx)
 endif()
 
 if(SXN_BUILD_CLI)
   add_executable(sxn src/main.c src/package.c src/lsp.c)
-  target_link_libraries(sxn PRIVATE sxnnode)
+  target_link_libraries(sxn PRIVATE sxn_node)
 else()
   # No CLI to build, so the thing that proves the runtime half stands alone:
   # a main() that installs it and runs one file.
   add_executable(sxn examples/embed/main.c)
-  target_link_libraries(sxn PRIVATE sxnrt)
+  target_link_libraries(sxn PRIVATE arcsx)
   set_target_properties(sxn PROPERTIES OUTPUT_NAME sxn-embed)
 endif()
 target_include_directories(sxn PRIVATE third_party/arcsx third_party/node-api)
@@ -254,10 +257,10 @@ if(WIN32)
   # third_party/arcsx's cutils.h includes <windows.h> itself, before any
   # #define in main.c would take effect, and windows.h only honors the first
   # inclusion's API level.
-  # PUBLIC on sxnrt, so every source that reaches windows.h through the
+  # PUBLIC on arcsx, so every source that reaches windows.h through the
   # engine's headers -- in either library and in the executable -- agrees
   # on the API level rather than the first one included winning.
-  target_compile_definitions(sxnrt PUBLIC _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
+  target_compile_definitions(arcsx PUBLIC _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
   # MinGW's linker default stack reserve is 2MB; sxn_js_stack_budget()
   # (src/main.c) already reserves 2MB of that for native frames beyond the
   # interpreter's own checks, leaving nothing and forcing the 1MB floor.
@@ -713,9 +716,9 @@ install(TARGETS sxn RUNTIME DESTINATION bin)
 # The runtime half is a library an embedder links against, so it installs
 # with the headers that describe it. quickjs.h comes along because
 # sxn_runtime.h includes it: these functions take and return JSValues.
-# qjs and qjs-libc come too: libsxnrt.a is a thin archive over the engine,
+# qjs and qjs-libc come too: libarcsx.a is a thin archive over the engine,
 # not a bundle of it, so an installed tree without them does not link.
-install(TARGETS sxnrt sxfe qjs qjs-libc ARCHIVE DESTINATION lib)
+install(TARGETS arcsx sxfe qjs qjs-libc ARCHIVE DESTINATION lib)
 install(FILES include/sxn_runtime.h include/sxn_loop.h
               third_party/arcsx/quickjs.h
         DESTINATION include)

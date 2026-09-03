@@ -794,14 +794,14 @@ runs, not only in a configuration nobody configures. Default Debug is
 `--preset minimal` (node off, libuv gone) are 29/29 each. In the minimal
 build `nm` reports zero `uv_` symbols and `find_package(libuv)` never runs.
 
-**Two libraries and a thin front end.** `libsxnrt.a` is the runtime half:
-the engine, the WinterTC surface, the loop and `Sxn.ffi`. `libsxnnode.a` is
-everything that imitates Node, and it links `sxnrt` -- the dependency points
+**Two libraries and a thin front end.** `libarcsx.a` is the runtime half:
+the engine, the WinterTC surface, the loop and `Sxn.ffi`. `libsxn.a` is
+everything that imitates Node, and it links `arcsx` -- the dependency points
 one way and CMake would refuse the other, which is the layering claim stated
 where a build can check it rather than in prose. `sxn` is then `main.c`,
-`package.c` and `lsp.c` over `sxnnode`; with `SXN_BUILD_CLI=OFF` the same
-target becomes `examples/embed/main.c` over `sxnrt` alone, and
-`libsxnnode.a` is not produced at all.
+`package.c` and `lsp.c` over `sxn_node`; with `SXN_BUILD_CLI=OFF` the same
+target becomes `examples/embed/main.c` over `arcsx` alone, and
+`libsxn.a` is not produced at all.
 
 The public headers are `include/sxn_runtime.h` -- `sxn_install_runtime`,
 `sxn_runtime_tick`, `sxn_run_event_loop`, `sxn_await_with_loop`,

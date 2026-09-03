@@ -83,7 +83,7 @@ libcurl and zlib only:
 cmake --preset minimal          # SXN_ENABLE_NODE=OFF, SXN_LOOP_BACKEND=builtin
 ```
 
-It builds `libsxnrt.a` and installs it with `include/sxn_runtime.h`, so an
+It builds `libarcsx.a` and installs it with `include/sxn_runtime.h`, so an
 embedder can link the WinterTC surface into its own program the way it
 already links QuickJS. `spec/RUNTIME.md` has what that build contains and
 what it gives up.
