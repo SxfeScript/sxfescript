@@ -73,6 +73,12 @@ if(UNIX AND NOT APPLE)
   add_compile_definitions(_GNU_SOURCE)
 endif()
 
+# The node: layer. Off is not wired up yet -- the sources and the dependency
+# discovery still assume it -- but the runtime half already compiles against
+# this rather than calling into node.c directly, so the seam is real and
+# testable before the switch exists.
+option(SXN_ENABLE_NODE "node: builtins, require and CommonJS" ON)
+
 option(SXN_ENABLE_POISON "Poison moved and released arena storage" ON)
 option(SXN_BUILD_TESTS "Build SXN tests" ON)
 
@@ -143,6 +149,7 @@ add_executable(sxn
 )
 add_dependencies(sxn sxn_bootstrap_header sxn_node_compat_header)
 target_include_directories(sxn PRIVATE include third_party/arcsx third_party/node-api ${CMAKE_CURRENT_BINARY_DIR}/generated)
+target_compile_definitions(sxn PRIVATE SXN_ENABLE_NODE=$<BOOL:${SXN_ENABLE_NODE}>)
 target_link_libraries(sxn PRIVATE sxfe qjs qjs-libc OpenSSL::Crypto CURL::libcurl libuv::uv_a ZLIB::ZLIB)
 if(LIBFFI_FOUND)
   target_link_libraries(sxn PRIVATE PkgConfig::LIBFFI)

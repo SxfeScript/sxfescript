@@ -213,13 +213,24 @@ static size_t sxn_sweep_cycles(JSRuntime *rt) {
     return live;
 }
 
+/* Caches a layer above this one keeps, dropped before a sweep because they
+   are strong references the collector cannot see past. Today there is one:
+   the node layer's EventEmitter emit memo, which holds an emitter's _events
+   object, its event name and its listener list. The seam is here rather than
+   a direct call so that this file never names the node layer -- a build
+   without it compiles this to nothing. */
+static void sxn_release_caches(JSContext *ctx) {
+#if SXN_ENABLE_NODE
+    sxn_free_ee_memo(ctx);
+#else
+    (void)ctx;
+#endif
+}
+
 static JSValue sxn_gc(JSContext *ctx, JSValueConst this_val,
                       int argc, JSValueConst *argv) {
     (void)this_val; (void)argc; (void)argv;
-    /* The emit memo holds strong references to one emitter's _events object,
-       its event name and its listener list, so it is a root the sweep cannot
-       see past. Releasing it first is what lets that graph go. */
-    sxn_free_ee_memo(ctx);
+    sxn_release_caches(ctx);
     return JS_NewInt64(ctx, (int64_t)sxn_sweep_cycles(JS_GetRuntime(ctx)));
 }
 
@@ -3190,7 +3201,7 @@ static void sxn_maybe_idle_gc(JSContext *ctx, JSRuntime *rt, uint64_t blocked_ns
     now = uv_hrtime();
     if (last_sweep_ns && now - last_sweep_ns < SXN_IDLE_GC_INTERVAL_NS) return;
     last_sweep_ns = now;
-    sxn_free_ee_memo(ctx);
+    sxn_release_caches(ctx);
     sxn_sweep_cycles(rt);
 }
 
