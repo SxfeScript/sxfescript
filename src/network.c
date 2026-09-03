@@ -20,6 +20,7 @@
 #endif
 #include "sxfe.h"
 #include "sxn_bootstrap.h"
+#include "sxn_clock.h"
 
 /* Sxn.ffi lives in src/ffi.c: calling native code is an engine capability
    rather than a Node emulation, so it sits beside the runtime's own surface
@@ -53,6 +54,12 @@ void sxn_ffi_init(JSContext *ctx);
 /* One process-wide loop, shared by the server socket and the async file
    reader; main.c drives it via sxn_run_event_loop after top-level eval. */
 static uv_loop_t *sxn_loop(void) { return uv_default_loop(); }
+
+/* Every monotonic read in this file goes through here. It was sxn_now_ns()
+   at each site, which tied the WinterTC half to libuv for the sake of a
+   clock; sxn_monotonic_ns (src/clock.c) reads the same counter libuv does on
+   every platform. */
+static uint64_t sxn_now_ns(void) { return sxn_monotonic_ns(); }
 
 /* --- curl_multi driven by sxn_loop(), the standard "hiperfifo" pattern:
    CURLMOPT_SOCKETFUNCTION/CURLMOPT_TIMERFUNCTION let libcurl drive
@@ -1837,7 +1844,7 @@ static uint64_t sxn_time_origin_ns;
 
 static JSValue sxn_now(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val; (void)argc; (void)argv;
-    return JS_NewFloat64(ctx, (double)(uv_hrtime() - sxn_time_origin_ns) / 1e6);
+    return JS_NewFloat64(ctx, (double)(sxn_now_ns() - sxn_time_origin_ns) / 1e6);
 }
 
 static JSValue sxn_random_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -2275,7 +2282,7 @@ static JSValue sxn_write(JSContext *ctx, JSValueConst this_val, int argc, JSValu
 
 int sxn_install_network(JSContext *ctx) {
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) return -1;
-    sxn_time_origin_ns = uv_hrtime();
+    sxn_time_origin_ns = sxn_now_ns();
 
     JSRuntime *rt = JS_GetRuntime(ctx);
     JS_NewClassID(rt, &sxn_stream_class_id);
@@ -2409,9 +2416,9 @@ JSValue sxn_await_with_loop(JSContext *ctx, JSValue obj) {
            pending either, the promise can never settle -- return it and let
            the caller see a still-pending module rather than hang. */
         sxn_maybe_idle_gc(ctx, rt, blocked_ns);
-        before = uv_hrtime();
+        before = sxn_now_ns();
         int more_handles = uv_run(loop, UV_RUN_ONCE);
-        blocked_ns = uv_hrtime() - before;
+        blocked_ns = sxn_now_ns() - before;
         if (!more_handles && !JS_IsJobPending(rt))
             return obj;
     }
@@ -2481,7 +2488,7 @@ static void sxn_maybe_idle_gc(JSContext *ctx, JSRuntime *rt, uint64_t blocked_ns
     if (!sxn_idle_gc_enabled) return;
     if (blocked_ns < SXN_IDLE_GC_BLOCKED_NS) return;
     if (JS_GetMallocSize(rt) < sxn_idle_gc_floor) return;
-    now = uv_hrtime();
+    now = sxn_now_ns();
     if (last_sweep_ns && now - last_sweep_ns < SXN_IDLE_GC_INTERVAL_NS) return;
     last_sweep_ns = now;
     sxn_release_caches(ctx);
@@ -2511,9 +2518,9 @@ int sxn_run_event_loop(JSContext *ctx) {
            no active/ref'd handles (e.g. no serve() was ever called) and no
            pending job, which is what keeps a plain script's exit identical
            to before this loop existed. */
-        before = uv_hrtime();
+        before = sxn_now_ns();
         int more_handles = uv_run(loop, UV_RUN_ONCE);
-        blocked_ns = uv_hrtime() - before;
+        blocked_ns = sxn_now_ns() - before;
         if (!more_handles && !JS_IsJobPending(rt)) break;
     }
     return JS_HasException(ctx);
