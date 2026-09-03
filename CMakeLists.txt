@@ -79,6 +79,16 @@ endif()
 # testable before the switch exists.
 option(SXN_ENABLE_NODE "node: builtins, require and CommonJS" ON)
 
+# Where the runtime's waiting happens (include/sxn_loop.h). "libuv" is what
+# sxn has always done and what Sxn.serve and Sxn.file need. "builtin" has no
+# dependency beyond libc and libcurl, keeps timers and fetch, and drops those
+# two -- neither of which is a WinterTC name, so the surface stays whole.
+set(SXN_LOOP_BACKEND "libuv" CACHE STRING "Loop backend: libuv or builtin")
+set_property(CACHE SXN_LOOP_BACKEND PROPERTY STRINGS libuv builtin)
+if(NOT SXN_LOOP_BACKEND STREQUAL "libuv" AND NOT SXN_LOOP_BACKEND STREQUAL "builtin")
+  message(FATAL_ERROR "SXN_LOOP_BACKEND must be 'libuv' or 'builtin', got '${SXN_LOOP_BACKEND}'")
+endif()
+
 option(SXN_ENABLE_POISON "Poison moved and released arena storage" ON)
 option(SXN_BUILD_TESTS "Build SXN tests" ON)
 
@@ -144,7 +154,7 @@ add_executable(sxn
   src/network.c
   src/clock.c
   src/loop.c
-  src/loop_uv.c
+  $<IF:$<STREQUAL:${SXN_LOOP_BACKEND},libuv>,${CMAKE_CURRENT_SOURCE_DIR}/src/loop_uv.c,${CMAKE_CURRENT_SOURCE_DIR}/src/loop_builtin.c>
   src/compression.c
   src/node.c
   src/node_sys.c
@@ -153,7 +163,8 @@ add_executable(sxn
 )
 add_dependencies(sxn sxn_bootstrap_header sxn_node_compat_header)
 target_include_directories(sxn PRIVATE include third_party/arcsx third_party/node-api ${CMAKE_CURRENT_BINARY_DIR}/generated)
-target_compile_definitions(sxn PRIVATE SXN_ENABLE_NODE=$<BOOL:${SXN_ENABLE_NODE}>)
+target_compile_definitions(sxn PRIVATE SXN_ENABLE_NODE=$<BOOL:${SXN_ENABLE_NODE}>
+  SXN_LOOP_UV=$<STREQUAL:${SXN_LOOP_BACKEND},libuv>)
 target_link_libraries(sxn PRIVATE sxfe qjs qjs-libc OpenSSL::Crypto CURL::libcurl libuv::uv_a ZLIB::ZLIB)
 if(LIBFFI_FOUND)
   target_link_libraries(sxn PRIVATE PkgConfig::LIBFFI)

@@ -85,6 +85,14 @@ uint64_t sxn_loop_now_ns(void);
 /* The backend compiled into this build: src/loop_uv.c or src/loop_builtin.c. */
 const SxnLoopOps *sxn_default_loop_ops(void);
 
+/* Let libcurl make progress, and wait on its own sockets for up to
+   max_wait_ms if `block` and it has any. Returns nonzero while a transfer is
+   in flight. The built-in backend calls this because libcurl is the only
+   thing it has that owns a descriptor; the libuv backend never does, because
+   there the multi handle is driven by uv_poll_t. Implemented by the fetch
+   layer, or by a stub returning 0 when fetch is not compiled in. */
+int sxn_curl_pump(int block, uint64_t max_wait_ms);
+
 #ifdef __cplusplus
 }
 #endif

@@ -63,18 +63,30 @@ static uv_loop_t *sxn_loop(void) { return uv_default_loop(); }
    and src/clock.c answers when it does not. */
 static uint64_t sxn_now_ns(void) { return sxn_loop_now_ns(); }
 
-/* --- curl_multi driven by sxn_loop(), the standard "hiperfifo" pattern:
+/* --- fetch's transfers, in whichever way the loop backend can drive them.
+   One curl_multi handle for the whole process either way; what differs is
+   who waits on its sockets.
+
+   With libuv, the standard "hiperfifo" pattern:
    CURLMOPT_SOCKETFUNCTION/CURLMOPT_TIMERFUNCTION let libcurl drive
    uv_poll_t/uv_timer_t handles instead of blocking inside
-   curl_easy_perform, so fetch() no longer stalls the runtime while a
-   response streams in. One multi handle for the whole process, matching
-   the one-loop-per-process design of sxn_loop(). */
+   curl_easy_perform, so fetch() does not stall the runtime while a response
+   streams in, and the transfer shares the loop with the server and the
+   timers.
+
+   Without it, libcurl waits on its own sockets: curl_multi_poll blocks until
+   a transfer is ready or the timeout expires, with no external loop at all.
+   That is what makes fetch -- a WinterTC name -- survive a build with no
+   libuv, and it is why the built-in backend can genuinely sleep rather than
+   spin: libcurl is the only thing there that owns a descriptor. */
 static CURLM *sxn_curl_multi = NULL;
+
+static void sxn_curl_check_multi_info(void);
+
+#if SXN_LOOP_UV
 static uv_timer_t sxn_curl_timer;
 
 typedef struct CurlSocketCtx { uv_poll_t poll_handle; curl_socket_t sockfd; } CurlSocketCtx;
-
-static void sxn_curl_check_multi_info(void);
 
 static void curl_socket_close_cb(uv_handle_t *handle) { free(handle->data); }
 
@@ -137,6 +149,41 @@ static void sxn_curl_multi_init(void) {
     curl_multi_setopt(sxn_curl_multi, CURLMOPT_SOCKETFUNCTION, curl_handle_socket_cb);
     curl_multi_setopt(sxn_curl_multi, CURLMOPT_TIMERFUNCTION, curl_start_timeout_cb);
 }
+
+/* uv drives the multi handle here, so there is nothing for a backend to
+   pump. Defined anyway so the seam has one shape in both builds. */
+int sxn_curl_pump(int block, uint64_t max_wait_ms) {
+    (void)block; (void)max_wait_ms;
+    return 0;
+}
+
+#else  /* no libuv: libcurl waits for itself */
+
+static void sxn_curl_multi_init(void) {
+    if (sxn_curl_multi) return;
+    sxn_curl_multi = curl_multi_init();
+    /* No socket or timer callback: without them curl_multi_poll keeps its
+       own descriptor set, which is exactly what we want it to do. */
+}
+
+int sxn_curl_pump(int block, uint64_t max_wait_ms) {
+    int running = 0;
+    if (!sxn_curl_multi) return 0;
+    curl_multi_perform(sxn_curl_multi, &running);
+    sxn_curl_check_multi_info();
+    if (running && block) {
+        int numfds = 0;
+        /* Capped so a caller that asked to wait a bounded time gets it, and
+           so a transfer with no traffic still wakes to be re-checked. */
+        long ms = max_wait_ms > 200 ? 200 : (long)max_wait_ms;
+        curl_multi_poll(sxn_curl_multi, NULL, 0, ms, &numfds);
+        curl_multi_perform(sxn_curl_multi, &running);
+        sxn_curl_check_multi_info();
+    }
+    return running;
+}
+
+#endif /* SXN_LOOP_UV */
 
 /* Grow-as-you-go byte buffer used to assemble a whole HTTP response before
    handing it to a single uv_write, mirroring the byte stream the old
