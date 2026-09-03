@@ -4777,7 +4777,12 @@ JSModuleDef *sxn_node_module_load(JSContext *ctx, const char *name) {
     return NULL;
 }
 
+void sxn_install_node_sys(JSContext *ctx);
+
 int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
+    /* The libuv-backed system primitives node_compat.js reads: stat, the UDP
+       sockets, spawn, the DNS lookup and node:os (src/node_sys.c). */
+    sxn_install_node_sys(ctx);
     if (sxn_atom_events == JS_ATOM_NULL) sxn_atom_events = JS_NewAtom(ctx, "_events");
     if (sxn_atom_length == JS_ATOM_NULL) sxn_atom_length = JS_NewAtom(ctx, "length");
     if (sxn_atom_error == JS_ATOM_NULL) sxn_atom_error = JS_NewAtom(ctx, "error");

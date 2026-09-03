@@ -144,6 +144,7 @@ add_executable(sxn
   src/network.c
   src/compression.c
   src/node.c
+  src/node_sys.c
   src/ffi.c
   src/napi.c
 )
