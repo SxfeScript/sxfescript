@@ -4,7 +4,7 @@
 
 - Standalone CMake project and ArcSX QuickJS fork (originally a direct
   snapshot of Rayact's customized fork; see
-  `third_party/QUICKJS-PROVENANCE.md`).
+  `third_party/ARCSX-PROVENANCE.md`).
 - `.sx`, `.js`, `.mjs`, and `.cjs` CLI entrypoints.
 - Native QuickJS parsing of `.sx` syntax -- interfaces, type annotations,
   `let mut`, `safe`, `unsafe`, and `&`/`&mut` borrow sigils -- with no
@@ -13,7 +13,7 @@
   component but is no longer on the execution path.
 - One ownership rule is enforced rather than erased: `&mut x` requires `x` to
   be a `let mut` owner, and borrowing an immutable one is a parse error naming
-  SX2003 (`js_parse_unary`, third_party/quickjs/quickjs.c). The check rules
+  SX2003 (`js_parse_unary`, third_party/arcsx/quickjs.c). The check rules
   only on a bare identifier it can resolve in the current function's lexical
   scope chain or in its top-level lexicals; a parameter, a captured outer
   binding, or anything it cannot resolve is left alone rather than guessed at.
@@ -93,7 +93,7 @@
   trust boundary (bytecode is not a safe format for untrusted input).
 - The vendored QuickJS-ng tooling (`qjs`, `qjsc`) reports itself as ArcSX in
   every user-visible banner and in the comment `qjsc` writes atop a
-  generated header; `third_party/QUICKJS-PROVENANCE.md` has the lineage this
+  generated header; `third_party/ARCSX-PROVENANCE.md` has the lineage this
   is built on.
 
 ## Performance shape (measured, benchmarks/wintertc/run.sh)

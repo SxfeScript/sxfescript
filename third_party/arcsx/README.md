@@ -1,3 +1,10 @@
+> **This directory is ArcSX**, this repository's fork of quickjs-ng. The
+> directory is named for the fork; the source files, `quickjs.h`, and the
+> `qjs`/`qjs-libc`/`qjsc` CMake targets keep their upstream names, because
+> embedders compile them by those names. Local changes are tagged `arcsx:` in
+> the source. See `../ARCSX-PROVENANCE.md` for the lineage and the exported
+> revision. Everything below is the upstream quickjs-ng README, unchanged.
+
 # ⚡️ QuickJS - A mighty JavaScript engine
 
 ## Overview

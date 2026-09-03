@@ -56,7 +56,7 @@ same design tradeoff that produces the worst-case pause figure above, which
 is the side of it this runtime wins.
 
 The throughput rows reflect a series of ArcSX/runtime optimizations (all
-tagged `arcsx:` in `third_party/quickjs`), roughly in order of payoff:
+tagged `arcsx:` in `third_party/arcsx`), roughly in order of payoff:
 
 - **Arena allocator**, ported from upstream quickjs-ng. Small objects come
   from per-size arenas instead of individual `malloc`s, and the refcount/GC

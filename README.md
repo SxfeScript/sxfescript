@@ -7,7 +7,7 @@ erasable TypeScript-style annotations without a Vite or AOT build step.
 This repository is intentionally independent from Rayact. Its QuickJS source
 was a direct snapshot of Rayact's customized fork at commit `66f4965`, and has
 since diverged under its own name, **ArcSX** (see
-`third_party/QUICKJS-PROVENANCE.md` for the full lineage).
+`third_party/ARCSX-PROVENANCE.md` for the full lineage).
 
 A pitch-and-explainer site for both -- SxfeScript against TypeScript, what
 ArcSX actually runs, and what's open for debate versus fixed -- lives at
@@ -88,7 +88,7 @@ Run the example:
 ```
 
 **Run the tests against a Debug build.** QuickJS gates its leak tracking on
-`#ifndef NDEBUG` (`ENABLE_DUMPS` in `third_party/quickjs/quickjs.c`), so in a
+`#ifndef NDEBUG` (`ENABLE_DUMPS` in `third_party/arcsx/quickjs.c`), so in a
 Release build the `sxn-leak-check` test still runs but has nothing to detect
 and always passes. A Debug build is what actually catches a leaked atom,
 object or string -- an atom leak in the `node:*` layer sat unnoticed behind a

@@ -2,7 +2,7 @@
    keyword, not a real JS keyword. It must remain usable as an ordinary
    identifier in plain .js/.mjs/.cjs source that the native parser also
    handles (see update_token_ident/js_parse_statement_or_decl in
-   third_party/quickjs/quickjs.c). */
+   third_party/arcsx/quickjs.c). */
 {
     let interface = 1;
     if (interface !== 1) throw new Error("interface as let binding failed");

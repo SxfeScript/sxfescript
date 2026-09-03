@@ -10,7 +10,7 @@
 
 The Raythings remote was unavailable when this standalone repository was
 created, so the committed tree was exported with `git archive` and is tracked
-directly. QuickJS retains its MIT license in `third_party/quickjs/LICENSE`.
+directly. QuickJS retains its MIT license in `third_party/arcsx/LICENSE`.
 
 To refresh the snapshot, first commit and test the desired QuickJS revision,
 archive only its tracked tree, replace this directory while preserving SXFE

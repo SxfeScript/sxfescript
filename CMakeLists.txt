@@ -79,7 +79,7 @@ option(SXN_BUILD_TESTS "Build SXN tests" ON)
 set(QJS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
 set(QJS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(QJS_BUILD_WERROR OFF CACHE BOOL "" FORCE)
-add_subdirectory(third_party/quickjs EXCLUDE_FROM_ALL)
+add_subdirectory(third_party/arcsx EXCLUDE_FROM_ALL)
 
 add_library(sxfe STATIC
   src/frontend.c
@@ -141,7 +141,7 @@ add_executable(sxn
   src/napi.c
 )
 add_dependencies(sxn sxn_bootstrap_header sxn_node_compat_header)
-target_include_directories(sxn PRIVATE include third_party/quickjs third_party/node-api ${CMAKE_CURRENT_BINARY_DIR}/generated)
+target_include_directories(sxn PRIVATE include third_party/arcsx third_party/node-api ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(sxn PRIVATE sxfe qjs qjs-libc OpenSSL::Crypto CURL::libcurl libuv::uv_a ZLIB::ZLIB)
 if(LIBFFI_FOUND)
   target_link_libraries(sxn PRIVATE PkgConfig::LIBFFI)
@@ -163,7 +163,7 @@ if(WIN32)
   # least 0x0602 (Windows 8) per mingw-w64's own processthreadsapi.h - 0x0600
   # (Vista) still leaves it undeclared, found by checking that header, not by
   # guessing. Set as a compile definition rather than in-source:
-  # third_party/quickjs's cutils.h includes <windows.h> itself, before any
+  # third_party/arcsx's cutils.h includes <windows.h> itself, before any
   # #define in main.c would take effect, and windows.h only honors the first
   # inclusion's API level.
   target_compile_definitions(sxn PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)

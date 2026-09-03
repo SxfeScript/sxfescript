@@ -83,9 +83,9 @@ else
   # above for that step (bytecode is arch-independent - see CMakeLists.txt's note
   # on why the compiler must come from this exact source tree).
   ssh "$REMOTE" "cd $REMOTE_DIR && cmake --build build/release-arm64 --target qjsc >/dev/null && \
-    cp build/release/third_party/quickjs/qjsc build/release-arm64/third_party/quickjs/qjsc && \
-    touch build/release-arm64/third_party/quickjs/qjsc"
-  ssh "$REMOTE" "cd $REMOTE_DIR && PATH=\"$REMOTE_DIR/build/release-arm64/third_party/quickjs:\$PATH\" cmake --build build/release-arm64"
+    cp build/release/third_party/arcsx/qjsc build/release-arm64/third_party/arcsx/qjsc && \
+    touch build/release-arm64/third_party/arcsx/qjsc"
+  ssh "$REMOTE" "cd $REMOTE_DIR && PATH=\"$REMOTE_DIR/build/release-arm64/third_party/arcsx:\$PATH\" cmake --build build/release-arm64"
   ssh "$REMOTE" "aarch64-linux-gnu-strip $REMOTE_DIR/build/release-arm64/sxn -o /tmp/sxn-linux-arm64"
   scp "$REMOTE:/tmp/sxn-linux-arm64" dist/sxn-linux-arm64
   chmod +x dist/sxn-linux-arm64
