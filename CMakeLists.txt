@@ -136,6 +136,7 @@ add_executable(sxn
   src/package.c
   src/lsp.c
   src/network.c
+  src/compression.c
   src/node.c
   src/ffi.c
   src/napi.c

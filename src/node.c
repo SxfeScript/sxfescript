@@ -1220,101 +1220,6 @@ static JSValue sxn_zlib_run(JSContext *ctx, JSValueConst input,
     return result;
 }
 
-/* Streaming zlib, for CompressionStream/DecompressionStream and anything else
-   that has to hand bytes over a chunk at a time. The one-shot path above
-   keeps a reset stream for the whole call; this one keeps a z_stream per
-   object for as long as the object lives, which is what a stream needs. */
-static JSClassID sxn_zstream_class_id;
-
-typedef struct { z_stream zs; bool compress, open; } SxnZStream;
-
-static void sxn_zstream_finalizer(JSRuntime *rt, JSValue val) {
-    SxnZStream *s = JS_GetOpaque(val, sxn_zstream_class_id);
-    if (!s) return;
-    if (s->open) { if (s->compress) deflateEnd(&s->zs); else inflateEnd(&s->zs); }
-    js_free_rt(rt, s);
-}
-
-static JSClassDef sxn_zstream_class_def = {
-    .class_name = "ZlibStream",
-    .finalizer = sxn_zstream_finalizer,
-};
-
-/* __sxnZlibStreamNew(windowBits, level, decompress) */
-static JSValue js_zlib_stream_new(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    (void)this_val;
-    int32_t window_bits = 15, level = Z_DEFAULT_COMPRESSION;
-    if (argc > 0) JS_ToInt32(ctx, &window_bits, argv[0]);
-    if (argc > 1) JS_ToInt32(ctx, &level, argv[1]);
-    bool decompress = argc > 2 && JS_ToBool(ctx, argv[2]);
-
-    SxnZStream *s = js_mallocz(ctx, sizeof(*s));
-    if (!s) return JS_EXCEPTION;
-    s->compress = !decompress;
-    int rc = decompress ? inflateInit2(&s->zs, window_bits)
-                        : deflateInit2(&s->zs, level, Z_DEFLATED, window_bits, 8, Z_DEFAULT_STRATEGY);
-    if (rc != Z_OK) { js_free(ctx, s); return JS_ThrowInternalError(ctx, "zlib init failed: %d", rc); }
-    s->open = true;
-
-    JS_NewClassID(JS_GetRuntime(ctx), &sxn_zstream_class_id);
-    JS_NewClass(JS_GetRuntime(ctx), sxn_zstream_class_id, &sxn_zstream_class_def);
-    JSValue obj = JS_NewObjectClass(ctx, sxn_zstream_class_id);
-    if (JS_IsException(obj)) { sxn_zstream_finalizer(JS_GetRuntime(ctx), obj); return obj; }
-    JS_SetOpaque(obj, s);
-    return obj;
-}
-
-/* __sxnZlibStreamPush(stream, bytes, finish) -> Uint8Array of whatever came out */
-static JSValue js_zlib_stream_push(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    (void)this_val;
-    SxnZStream *s = argc > 0 ? JS_GetOpaque(argv[0], sxn_zstream_class_id) : NULL;
-    if (!s || !s->open) return JS_ThrowTypeError(ctx, "not an open zlib stream");
-    size_t in_len = 0;
-    uint8_t *in = NULL;
-    if (argc > 1 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
-        in = JS_GetUint8Array(ctx, &in_len, argv[1]);
-        if (!in) return JS_ThrowTypeError(ctx, "zlib expects bytes");
-    }
-    bool finish = argc > 2 && JS_ToBool(ctx, argv[2]);
-
-    size_t cap = in_len + 64, len = 0;
-    uint8_t *out = js_malloc(ctx, cap);
-    if (!out) return JS_EXCEPTION;
-    s->zs.next_in = in;
-    s->zs.avail_in = (uInt)in_len;
-    int rc = Z_OK;
-    do {
-        if (len == cap) {
-            uint8_t *grown = js_realloc(ctx, out, cap * 2);
-            if (!grown) { js_free(ctx, out); return JS_EXCEPTION; }
-            out = grown; cap *= 2;
-        }
-        s->zs.next_out = out + len;
-        s->zs.avail_out = (uInt)(cap - len);
-        rc = s->compress ? deflate(&s->zs, finish ? Z_FINISH : Z_NO_FLUSH)
-                         : inflate(&s->zs, finish ? Z_FINISH : Z_NO_FLUSH);
-        len = cap - s->zs.avail_out;
-        if (rc == Z_STREAM_END) break;
-        if (rc != Z_OK && rc != Z_BUF_ERROR) {
-            js_free(ctx, out);
-            return JS_ThrowInternalError(ctx, "zlib %s failed: %d", s->compress ? "deflate" : "inflate", rc);
-        }
-        if (rc == Z_BUF_ERROR && !finish) break;
-    } while (s->zs.avail_out == 0 || (finish && rc != Z_STREAM_END));
-
-    if (finish) {
-        if (!s->compress && rc != Z_STREAM_END) {
-            js_free(ctx, out);
-            return JS_ThrowInternalError(ctx, "unexpected end of compressed data");
-        }
-        if (s->compress) deflateEnd(&s->zs); else inflateEnd(&s->zs);
-        s->open = false;
-    }
-    JSValue bytes = JS_NewUint8ArrayCopy(ctx, out, len);
-    js_free(ctx, out);
-    return bytes;
-}
-
 static JSValue js_zlib_deflate(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
     int32_t bits = 15, level = Z_DEFAULT_COMPRESSION;
@@ -4988,8 +4893,6 @@ int sxn_install_node_compat(JSContext *ctx, const char *exec_path) {
     JS_SetPropertyStr(ctx, global, "__sxnJoinChunks", JS_NewCFunction(ctx, js_join_chunks, "__sxnJoinChunks", 1));
     JS_SetPropertyStr(ctx, global, "__sxnHttpHeaders", JS_NewCFunction(ctx, js_http_headers, "__sxnHttpHeaders", 1));
     JS_SetPropertyStr(ctx, global, "__sxnBuiltinRequire", JS_NewCFunction(ctx, js_builtin_require, "__sxnBuiltinRequire", 1));
-    JS_SetPropertyStr(ctx, global, "__sxnZlibStreamNew", JS_NewCFunction(ctx, js_zlib_stream_new, "__sxnZlibStreamNew", 3));
-    JS_SetPropertyStr(ctx, global, "__sxnZlibStreamPush", JS_NewCFunction(ctx, js_zlib_stream_push, "__sxnZlibStreamPush", 3));
     JS_SetPropertyStr(ctx, global, "__sxnBuiltinNames", JS_NewCFunction(ctx, js_builtin_names, "__sxnBuiltinNames", 0));
     JS_SetPropertyStr(ctx, global, "__sxnIsBuiltin", JS_NewCFunction(ctx, js_is_builtin, "__sxnIsBuiltin", 1));
     JS_SetPropertyStr(ctx, global, "__sxnLatin1Bytes", JS_NewCFunctionMagic(ctx, js_buffer_encode_units, "__sxnLatin1Bytes", 1, JS_CFUNC_generic_magic, 0));

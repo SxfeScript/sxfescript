@@ -25,6 +25,7 @@
    rather than a Node emulation, so it sits beside the runtime's own surface
    and not in the node: layer. See the header comment there. */
 JSValue sxn_ffi(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+void sxn_install_compression(JSContext *ctx);
 void sxn_ffi_init(JSContext *ctx);
 
 #include <ctype.h>
@@ -3046,6 +3047,10 @@ int sxn_install_network(JSContext *ctx) {
     JS_SetPropertyStr(ctx, global, "__sxnSetTimer", JS_NewCFunction(ctx, sxn_set_timer, "__sxnSetTimer", 3));
     JS_SetPropertyStr(ctx, global, "__sxnClearTimer", JS_NewCFunction(ctx, sxn_clear_timer, "__sxnClearTimer", 1));
     JS_FreeValue(ctx, global);
+    /* CompressionStream/DecompressionStream (src/compression.c). WinterTC
+       names, so they belong to this half even though zlib is also what
+       node:zlib is built on. */
+    sxn_install_compression(ctx);
 
     /* Compiled by qjsc during the build, so startup reads a ready function
        instead of parsing the file again on every launch. The source carries
