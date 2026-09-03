@@ -730,6 +730,77 @@ The ad-hoc pinning of Buffer/Uint8Array/ArrayBuffer shapes in
 `sxn_pin_core_shapes` (src/node.c) is the same problem solved narrowly for
 three known types; a general fix would subsume it.
 
+## The two halves are a build option now
+
+`spec/RUNTIME.md` and `spec/NODE.md` have described sxn as two halves for a
+while, and `spec/NATIVE.md:45` promised that "a build that wants the runtime
+without the Node surface drops `src/napi.c` and the vendored headers and
+loses nothing else". None of it was true: every host source compiled into one
+executable, libuv, libcurl, OpenSSL, zlib and libffi were all unconditional,
+and `src/napi.c:7` named an `SXN_ENABLE_NAPI` symbol that existed nowhere
+else in the tree.
+
+It is true now, and the shape it took is worth recording.
+
+**Four edges had to move before any switch could exist.** `Sxn.gc` and the
+idle sweep called `sxn_free_ee_memo`, defined in the node layer -- the one
+place the runtime reached into it. `CompressionStream` and
+`DecompressionStream` are WinterTC names whose zlib primitives lived in
+`src/node.c`, so a node-free build lost two globals it is supposed to own.
+About 840 lines of libuv primitives that only `node_compat.js` ever reads --
+`fs.stat`, UDP, spawn, DNS, `node:os` -- sat in `src/network.c` beside the
+WinterTC surface. And `bootstrap.js` assumed `console.log` existed, which is
+true of `sxn` (quickjs-libc's `js_std_add_helpers` installs it) and need not
+be true of an embedder, so the installer would have failed with a
+`ReferenceError` on the way in.
+
+**The loop is four functions.** `SxnLoopOps` in `include/sxn_loop.h`:
+`timer_start`, `timer_stop`, `poll`, and an optional clock. No sockets, no
+filesystem, no descriptor polling -- a backend that had to answer those would
+be a second libuv. Two ship: libuv, and one needing nothing beyond libc and
+libcurl. `sxn_run_event_loop` and `sxn_await_with_loop` collapsed onto a
+shared `sxn_runtime_tick`, which is the function a host with its own frame
+pump calls once a turn instead of handing over control.
+
+**fetch does not need libuv, which is what makes the claim work.** It is one
+of the 62 Minimum Common API names and it looked libuv-bound because the
+curl_multi handle is driven through `uv_poll_t`/`uv_timer_t`. But libcurl
+waits on its own sockets: `curl_multi_poll` blocks until a transfer is ready
+or the timeout expires with no external loop. So the built-in backend can
+genuinely sleep rather than spin, because libcurl is the only thing it has
+that owns a descriptor.
+
+**Two things do not survive, and both are the right ones to lose.**
+`Sxn.serve` is a TCP listener and `Sxn.file` is a thread pool; neither has a
+portable stand-in worth writing, and neither is a WinterTC name. A
+synchronous `fopen` fallback for `Sxn.file` was considered and rejected: the
+same API meaning two different things about concurrency in two builds is
+worse than its absence.
+
+**One real bug, found by a test rather than by reading.** Moving timers onto
+the interface meant the `SxnTimer` was freed at `timer_stop` rather than in
+libuv's close callback, and `clearInterval` called from inside the interval's
+own callback then left `sxn_timer_cb` reading freed memory for `repeat`.
+`sxn-leak-idle-sweep` segfaulted immediately. It had been safe by accident,
+because libuv defers the free to the end of the loop turn. The fix is a
+firing/stopped pair so it does not depend on a backend being late, and the
+same hazard is handled explicitly in the built-in backend's timer walk.
+
+**What it costs to check.** The `embed` tier is 29 fixtures that must run on
+the runtime half alone, and it runs in the default build too -- so a WinterTC
+global that starts depending on a node primitive fails in the build everyone
+runs, not only in a configuration nobody configures. Default Debug is
+132/133 and Release 133/133; `--preset embed-uv` (node off, libuv kept) and
+`--preset minimal` (node off, libuv gone) are 29/29 each. In the minimal
+build `nm` reports zero `uv_` symbols and `find_package(libuv)` never runs.
+
+**What is still one build rather than two.** There is no library target yet:
+the sources are grouped into `SXN_RUNTIME_SOURCES` and `SXN_NODE_SOURCES` and
+compiled straight into an executable, either `sxn` or `examples/embed`. An
+embedder consuming this as a library, with an installed public header, is the
+next step and needs a decision about what that header exposes beyond
+`sxn_install_network`, `sxn_runtime_tick` and `SxnLoopOps`.
+
 ## Required production completion
 
 Architectural work with no shortcut, still outstanding:

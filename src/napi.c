@@ -4,7 +4,8 @@
  * Sxn.ffi (src/ffi.c) is an engine capability -- Rayact embeds this engine
  * and loads native code in its own core. Node-API is the opposite: it exists
  * only to run npm's compiled addons, Rayact has its own module ABI and wants
- * none of it, and a mobile build drops this file entirely (SXN_ENABLE_NAPI).
+ * none of it, and a mobile build drops this file entirely: it is compiled
+ * only when SXN_ENABLE_NODE is on.
  *
  * The shape of the problem is worth stating, because it is the reverse of
  * FFI. An addon exports one symbol, `napi_register_module_v1`, and imports

@@ -6,7 +6,38 @@ web APIs (every name in the Minimum Common API except WebAssembly's), the
 what runs because it imitates Node.
 The split matters because only this half travels when the engine is embedded
 elsewhere (`spec/NATIVE.md` explains why for the native-code case
-specifically).
+specifically), and it is a build option rather than a description:
+`cmake --preset minimal` builds this half with no `node:` layer and no libuv,
+and the 29 fixtures of the `embed` test tier are the ones that have to pass
+there. They run in the default build too, so a name on this page that starts
+depending on the other half fails before anyone configures that build.
+
+## What an embedder gets, and what it supplies
+
+`sxn_install_network(ctx)` installs everything on this page onto a context the
+host made. Two things in it need something outside the engine to make
+progress -- a timer has to fire later, and a promise waiting on I/O has to be
+given a chance to settle -- and those go through `SxnLoopOps`
+(`include/sxn_loop.h`): four functions, `timer_start`, `timer_stop`, `poll`
+and an optional clock. Deliberately no sockets and no filesystem; a backend
+that had to answer those would be a second libuv.
+
+Two backends ship. The libuv one is the default and is what `sxn` has always
+done. The other needs nothing beyond libc and libcurl, which waits on its own
+sockets, so `fetch` and the timers both survive with no libuv linked and the
+process still sleeps rather than spins. A host with a loop of its own --- a
+frame pump, an application main loop -- supplies the third: it installs its
+own `SxnLoopOps` and calls `sxn_runtime_tick(ctx, 0, slack_ns)` once a turn
+instead of handing control to `sxn_run_event_loop`.
+
+`Sxn.serve` and `Sxn.file` are the two things that do not survive that. A TCP
+listener and a thread pool have no portable stand-in worth writing, so they
+are capabilities of the libuv backend and are absent otherwise. Neither is a
+WinterTC name, so the Minimum Common API is still answered in full; a build
+without them simply has no `Sxn.serve` and no `Sxn.file`, and `bootstrap.js`
+already checks for the primitive rather than assuming it. `Sxn.memoryUsage()`
+keeps every field except `rss`, which needs a per-platform call that libuv is
+where we keep.
 
 If you're choosing what to build against: code written to this surface plus
 `spec/NODE.md`'s CommonJS/ESM loader runs on `sxn`, in a browser Worker, and

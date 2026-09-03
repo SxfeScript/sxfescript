@@ -47,6 +47,10 @@ curl -fsSL https://sxfescript.github.io/v0.0.2/install.sh | bash
 You need OpenSSL, libcurl, libuv, zlib and libffi on the system. CMake finds
 all five and fails clearly, naming the missing one, if any are absent.
 
+Those five are for the whole runtime. Building only the half that embeds —
+the WinterTC surface, with no `node:` layer and no libuv — needs OpenSSL,
+libcurl and zlib: `cmake --preset minimal`.
+
 ```sh
 brew install openssl curl libuv zlib libffi          # macOS
 ```

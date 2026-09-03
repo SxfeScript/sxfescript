@@ -7,6 +7,15 @@ mobile or embedded build can drop entirely without losing anything on the
 the native-code case, and the same reasoning applies to this whole layer:
 Node emulation is dead weight to an embedder with no Node surface of its own.
 
+This half is a build option, not just a description: `-DSXN_ENABLE_NODE=OFF`
+compiles none of it, and the runtime half in `spec/RUNTIME.md` is complete
+without it. The dependency runs one way only, and one detail of it is worth
+stating because it is the reason the option is shaped the way it is:
+`node:http` is built directly on `__sxnServe` and `node:fs` on the async file
+primitives, so this layer needs `Sxn.serve` and `Sxn.file`, and therefore
+needs the libuv loop backend. Turning it on with either of those off is a
+configure-time error rather than a surprise at link time.
+
 ## Running a file the way Node runs it
 
 `sxn` decides module-or-CommonJS the way Node does: `.mjs`/`.mts` are always

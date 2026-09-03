@@ -5,7 +5,8 @@ full, with examples, in `spec/RUNTIME.md`. This page stays as the pointer to
 it and the one implementation detail worth knowing separately: the transport.
 
 `fetch`/`Sxn.fetch` are backed by libcurl. `Sxn.serve` is a native HTTP
-server with its own event loop integration (`sxn_loop()` in `src/network.c`,
+server with its own event loop integration (the loop backend behind
+`include/sxn_loop.h`,
 a thin wrapper over `uv_default_loop()`) rather than a JS-level framework
 sitting on top of sockets -- request parsing, response writing, SSE framing,
 and the WebSocket upgrade handshake all happen in C.

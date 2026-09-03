@@ -75,6 +75,16 @@ openssl curl libuv zlib libffi` on macOS; `apt install libssl-dev libcurl4-opens
 libuv1-dev zlib1g-dev libffi-dev` on Debian/Ubuntu). CMake finds all five and
 fails clearly, naming the missing one, if any aren't there.
 
+That is the full build. A build that wants the runtime half on its own --
+the WinterTC surface with no `node:` layer and no libuv -- needs OpenSSL,
+libcurl and zlib only:
+
+```sh
+cmake --preset minimal          # SXN_ENABLE_NODE=OFF, SXN_LOOP_BACKEND=builtin
+```
+
+`spec/RUNTIME.md` has what that build contains and what it gives up.
+
 ```sh
 cmake --preset debug
 cmake --build --preset debug

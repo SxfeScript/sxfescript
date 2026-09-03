@@ -48,7 +48,15 @@ SHA-256 artifact verification.
 Hence the split. `Sxn.ffi` is an engine capability that travels; the `.node`
 loader is Node emulation that does not. A build that wants the runtime
 without the Node surface drops `src/napi.c` and the vendored headers and
-loses nothing else.
+loses nothing else -- `-DSXN_ENABLE_NODE=OFF`, which is a build option rather
+than a description now.
+
+`src/napi.c` could not be ported to a loop backend other than libuv even if
+it were worth doing: it uses `uv_queue_work` for async work and
+`uv_async_t`/`uv_mutex_t`/`uv_cond_t` for thread-safe functions, and
+`napi_get_uv_event_loop` hands an addon a `uv_loop_t *` as part of the
+Node-API contract itself. An addon can ask for the loop, so there has to be
+one.
 
 Worth saying plainly, because it is the reason the mobile runtime is treated
 as QuickJS rather than as Node: on iOS you cannot `dlopen` code that arrived
