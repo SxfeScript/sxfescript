@@ -1,4 +1,6 @@
 #include "sxfe.h"
+#include "sxn_node.h"
+#include "sxn_runtime.h"
 #include "quickjs.h"
 #include "quickjs-libc.h"
 
@@ -965,7 +967,7 @@ static int execute_file(int argc, char **argv, const char *filename,
        flag before the script name doesn't leak into the script's own argv
        the way it did when this was hardcoded to skip exactly one. */
     js_std_add_helpers(context, argc - arg_offset, argv + arg_offset);
-    if (sxn_install_network(context) != 0) {
+    if (sxn_install_runtime(context) != 0) {
         fputs("sxn: unable to initialize network runtime\n", stderr);
         goto failure;
     }

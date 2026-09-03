@@ -2,6 +2,8 @@
 #include <quickjs-libc.h>
 #include <uv.h>
 #include "sxfe.h"
+#include "sxn_node.h"
+#include "sxn_runtime.h"
 #include "sxn_node_compat.h"
 #include <zlib.h>
 

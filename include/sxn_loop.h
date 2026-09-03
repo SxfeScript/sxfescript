@@ -68,7 +68,7 @@ typedef struct SxnLoopOps {
     uint64_t (*now_ns)(void *user);
 } SxnLoopOps;
 
-/* Install a backend. Call before sxn_install_network; passing NULL restores
+/* Install a backend. Call before sxn_install_runtime; passing NULL restores
    the one this build was compiled with. `user` is handed back to every
    function above and is never inspected. */
 void sxn_set_loop_ops(const SxnLoopOps *ops, void *user);

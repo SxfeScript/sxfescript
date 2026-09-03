@@ -186,61 +186,62 @@ add_custom_command(
 add_custom_target(sxn_node_compat_header DEPENDS ${SXN_NODE_COMPAT_HEADER})
 
 # The runtime half: the engine plus the WinterTC surface, and nothing that
-# knows what Node is.
-set(SXN_RUNTIME_SOURCES
+# knows what Node is. This is the library an embedder links -- ArcSX as a
+# drop-in QuickJS that brings TextEncoder, URL, fetch and the Streams with it.
+# Its public headers are include/sxn_runtime.h and include/sxn_loop.h.
+add_library(sxnrt STATIC
   src/network.c
   src/clock.c
   src/loop.c
   src/compression.c
   src/ffi.c
+  $<IF:$<STREQUAL:${SXN_LOOP_BACKEND},libuv>,${CMAKE_CURRENT_SOURCE_DIR}/src/loop_uv.c,${CMAKE_CURRENT_SOURCE_DIR}/src/loop_builtin.c>
 )
-if(SXN_LOOP_BACKEND STREQUAL "libuv")
-  list(APPEND SXN_RUNTIME_SOURCES src/loop_uv.c)
-else()
-  list(APPEND SXN_RUNTIME_SOURCES src/loop_builtin.c)
-endif()
-
-# The node half.
-set(SXN_NODE_SOURCES src/node.c src/node_sys.c src/napi.c)
-
-if(SXN_BUILD_CLI)
-  add_executable(sxn
-    src/main.c
-    src/package.c
-    src/lsp.c
-    ${SXN_RUNTIME_SOURCES}
-    ${SXN_NODE_SOURCES}
-  )
-else()
-  # No CLI to build, so the thing that proves the runtime half stands alone:
-  # a main() that installs it and runs one file.
-  add_executable(sxn examples/embed/main.c ${SXN_RUNTIME_SOURCES})
-  set_target_properties(sxn PROPERTIES OUTPUT_NAME sxn-embed)
-endif()
-add_dependencies(sxn sxn_bootstrap_header)
-if(SXN_ENABLE_NODE)
-  add_dependencies(sxn sxn_node_compat_header)
-endif()
-target_include_directories(sxn PRIVATE include third_party/arcsx third_party/node-api ${CMAKE_CURRENT_BINARY_DIR}/generated)
-target_compile_definitions(sxn PRIVATE SXN_ENABLE_NODE=$<BOOL:${SXN_ENABLE_NODE}>
+add_dependencies(sxnrt sxn_bootstrap_header)
+target_include_directories(sxnrt PUBLIC include third_party/arcsx
+  PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+target_compile_definitions(sxnrt PUBLIC
+  SXN_ENABLE_NODE=$<BOOL:${SXN_ENABLE_NODE}>
   SXN_ENABLE_SERVE=$<BOOL:${SXN_ENABLE_SERVE}>
   SXN_ENABLE_FS=$<BOOL:${SXN_ENABLE_FS}>
   SXN_LOOP_UV=$<STREQUAL:${SXN_LOOP_BACKEND},libuv>)
-target_link_libraries(sxn PRIVATE sxfe qjs qjs-libc OpenSSL::Crypto CURL::libcurl ZLIB::ZLIB)
+target_link_libraries(sxnrt PUBLIC sxfe qjs qjs-libc OpenSSL::Crypto CURL::libcurl ZLIB::ZLIB)
 if(SXN_LOOP_BACKEND STREQUAL "libuv")
-  target_link_libraries(sxn PRIVATE libuv::uv_a)
+  target_link_libraries(sxnrt PUBLIC libuv::uv_a)
 endif()
 if(LIBFFI_FOUND)
-  target_link_libraries(sxn PRIVATE PkgConfig::LIBFFI)
+  target_link_libraries(sxnrt PUBLIC PkgConfig::LIBFFI)
 elseif(LIBFFI_LIBRARY AND LIBFFI_INCLUDE_DIR)
-  target_include_directories(sxn PRIVATE ${LIBFFI_INCLUDE_DIR})
-  target_link_libraries(sxn PRIVATE ${LIBFFI_LIBRARY})
+  target_include_directories(sxnrt PRIVATE ${LIBFFI_INCLUDE_DIR})
+  target_link_libraries(sxnrt PUBLIC ${LIBFFI_LIBRARY})
 else()
   message(FATAL_ERROR "libffi not found; it backs Sxn.ffi (brew install libffi / apt install libffi-dev)")
 endif()
 if(NOT WIN32)
-  target_link_libraries(sxn PRIVATE ${CMAKE_DL_LIBS})
+  target_link_libraries(sxnrt PUBLIC ${CMAKE_DL_LIBS})
 endif()
+
+# The node half. Depends on sxnrt and nothing depends on it, which is the
+# whole layering claim in one line of CMake.
+if(SXN_ENABLE_NODE)
+  add_library(sxnnode STATIC src/node.c src/node_sys.c src/napi.c)
+  add_dependencies(sxnnode sxn_node_compat_header)
+  target_include_directories(sxnnode PUBLIC include
+    PRIVATE third_party/arcsx third_party/node-api ${CMAKE_CURRENT_BINARY_DIR}/generated)
+  target_link_libraries(sxnnode PUBLIC sxnrt)
+endif()
+
+if(SXN_BUILD_CLI)
+  add_executable(sxn src/main.c src/package.c src/lsp.c)
+  target_link_libraries(sxn PRIVATE sxnnode)
+else()
+  # No CLI to build, so the thing that proves the runtime half stands alone:
+  # a main() that installs it and runs one file.
+  add_executable(sxn examples/embed/main.c)
+  target_link_libraries(sxn PRIVATE sxnrt)
+  set_target_properties(sxn PROPERTIES OUTPUT_NAME sxn-embed)
+endif()
+target_include_directories(sxn PRIVATE third_party/arcsx third_party/node-api)
 # A .node addon imports its napi_* functions from whoever loaded it, so this
 # executable has to hand its dynamic symbols to dlopen rather than keep them
 # private. Without this the addon loads and then cannot find napi_get_cb_info.
@@ -253,7 +254,10 @@ if(WIN32)
   # third_party/arcsx's cutils.h includes <windows.h> itself, before any
   # #define in main.c would take effect, and windows.h only honors the first
   # inclusion's API level.
-  target_compile_definitions(sxn PRIVATE _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
+  # PUBLIC on sxnrt, so every source that reaches windows.h through the
+  # engine's headers -- in either library and in the executable -- agrees
+  # on the API level rather than the first one included winning.
+  target_compile_definitions(sxnrt PUBLIC _CRT_SECURE_NO_WARNINGS WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
   # MinGW's linker default stack reserve is 2MB; sxn_js_stack_budget()
   # (src/main.c) already reserves 2MB of that for native frames beyond the
   # interpreter's own checks, leaving nothing and forcing the 1MB floor.
@@ -705,3 +709,13 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS AND SXN_BUILD_CLI)
 endif()
 
 install(TARGETS sxn RUNTIME DESTINATION bin)
+
+# The runtime half is a library an embedder links against, so it installs
+# with the headers that describe it. quickjs.h comes along because
+# sxn_runtime.h includes it: these functions take and return JSValues.
+# qjs and qjs-libc come too: libsxnrt.a is a thin archive over the engine,
+# not a bundle of it, so an installed tree without them does not link.
+install(TARGETS sxnrt sxfe qjs qjs-libc ARCHIVE DESTINATION lib)
+install(FILES include/sxn_runtime.h include/sxn_loop.h
+              third_party/arcsx/quickjs.h
+        DESTINATION include)

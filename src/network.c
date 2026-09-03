@@ -19,6 +19,12 @@
 #include <unistd.h>
 #endif
 #include "sxfe.h"
+#include "sxn_runtime.h"
+#if SXN_ENABLE_NODE
+/* The runtime's single call into the node layer: sxn_release_caches
+   below drops the emit memo before a sweep. Nothing else here. */
+#include "sxn_node.h"
+#endif
 #include "sxn_bootstrap.h"
 #include "sxn_clock.h"
 #include "sxn_loop.h"
@@ -2386,7 +2392,7 @@ static JSValue sxn_write(JSContext *ctx, JSValueConst this_val, int argc, JSValu
     return JS_NewInt64(ctx, (int64_t)written);
 }
 
-int sxn_install_network(JSContext *ctx) {
+int sxn_install_runtime(JSContext *ctx) {
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) return -1;
     sxn_time_origin_ns = sxn_now_ns();
 

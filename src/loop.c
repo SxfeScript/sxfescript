@@ -1,7 +1,7 @@
 /* Which loop backend is in effect.
  *
  * The selection is a variable rather than a compile-time constant so an
- * embedder can install its own before sxn_install_network. Everything in the
+ * embedder can install its own before sxn_install_runtime. Everything in the
  * runtime reaches the loop through the four calls below; nothing else in
  * src/ names a backend. */
 

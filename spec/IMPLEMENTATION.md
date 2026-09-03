@@ -794,12 +794,27 @@ runs, not only in a configuration nobody configures. Default Debug is
 `--preset minimal` (node off, libuv gone) are 29/29 each. In the minimal
 build `nm` reports zero `uv_` symbols and `find_package(libuv)` never runs.
 
-**What is still one build rather than two.** There is no library target yet:
-the sources are grouped into `SXN_RUNTIME_SOURCES` and `SXN_NODE_SOURCES` and
-compiled straight into an executable, either `sxn` or `examples/embed`. An
-embedder consuming this as a library, with an installed public header, is the
-next step and needs a decision about what that header exposes beyond
-`sxn_install_network`, `sxn_runtime_tick` and `SxnLoopOps`.
+**Two libraries and a thin front end.** `libsxnrt.a` is the runtime half:
+the engine, the WinterTC surface, the loop and `Sxn.ffi`. `libsxnnode.a` is
+everything that imitates Node, and it links `sxnrt` -- the dependency points
+one way and CMake would refuse the other, which is the layering claim stated
+where a build can check it rather than in prose. `sxn` is then `main.c`,
+`package.c` and `lsp.c` over `sxnnode`; with `SXN_BUILD_CLI=OFF` the same
+target becomes `examples/embed/main.c` over `sxnrt` alone, and
+`libsxnnode.a` is not produced at all.
+
+The public headers are `include/sxn_runtime.h` -- `sxn_install_runtime`,
+`sxn_runtime_tick`, `sxn_run_event_loop`, `sxn_await_with_loop`,
+`sxn_configure_idle_gc` -- and `include/sxn_loop.h` for a host supplying its
+own loop. They install alongside the archives and `quickjs.h`, which comes
+too because these functions take and return real `JSValue`s. The node
+declarations moved out of `sxfe.h` into `include/sxn_node.h`, so `sxfe.h` is
+the frontend and arena header it is named for again and an embedder cannot
+accidentally declare a function its build does not contain.
+
+`sxn_install_network` is now `sxn_install_runtime`. It never installed a
+network: it installs the whole WinterTC surface, and the old name would have
+been the first thing to explain to anyone embedding this.
 
 ## Required production completion
 

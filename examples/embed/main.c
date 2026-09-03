@@ -1,7 +1,7 @@
 /* The smallest thing that runs a script on the runtime half alone.
  *
  * This is what an embedder does: make a QuickJS runtime and context the way
- * it already does, call sxn_install_network to get the WinterTC surface on
+ * it already does, call sxn_install_runtime to get the WinterTC surface on
  * it -- TextEncoder, URL, URLPattern, Headers/Request/Response, the Streams,
  * structuredClone, crypto, the timers, fetch -- and then drive the loop.
  *
@@ -19,13 +19,11 @@
 #include <quickjs-libc.h>
 
 #include "sxfe.h"
+#include "sxn_runtime.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-int sxn_runtime_tick(JSContext *ctx, int block, uint64_t blocked_hint_ns);
-JSValue sxn_await_with_loop(JSContext *ctx, JSValue obj);
 
 static char *read_file(const char *path, size_t *len) {
     FILE *f = fopen(path, "rb");
@@ -57,12 +55,12 @@ int main(int argc, char **argv) {
     if (!ctx) { JS_FreeRuntime(rt); return 2; }
 
     /* console.log and the argv helpers. An embedder with its own console
-       installs it here instead, before sxn_install_network, so the runtime's
+       installs it here instead, before sxn_install_runtime, so the runtime's
        console.info/debug alias theirs rather than the other way round. */
     js_std_init_handlers(rt);
     js_std_add_helpers(ctx, argc - 1, argv + 1);
 
-    if (sxn_install_network(ctx) != 0) {
+    if (sxn_install_runtime(ctx) != 0) {
         fputs("sxn-embed: cannot install the runtime surface\n", stderr);
         js_std_free_handlers(rt); JS_FreeContext(ctx); JS_FreeRuntime(rt);
         return 2;

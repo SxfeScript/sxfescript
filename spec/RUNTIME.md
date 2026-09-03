@@ -14,8 +14,10 @@ depending on the other half fails before anyone configures that build.
 
 ## What an embedder gets, and what it supplies
 
-`sxn_install_network(ctx)` installs everything on this page onto a context the
-host made. Two things in it need something outside the engine to make
+`sxn_install_runtime(ctx)` installs everything on this page onto a context
+the host made. It lives in `libsxnrt.a`, declared in
+`include/sxn_runtime.h`, and the archive links nothing that knows what
+Node is. Two things in it need something outside the engine to make
 progress -- a timer has to fire later, and a promise waiting on I/O has to be
 given a chance to settle -- and those go through `SxnLoopOps`
 (`include/sxn_loop.h`): four functions, `timer_start`, `timer_stop`, `poll`
@@ -29,6 +31,10 @@ process still sleeps rather than spins. A host with a loop of its own --- a
 frame pump, an application main loop -- supplies the third: it installs its
 own `SxnLoopOps` and calls `sxn_runtime_tick(ctx, 0, slack_ns)` once a turn
 instead of handing control to `sxn_run_event_loop`.
+
+The node half is `libsxnnode.a`, a separate archive that links `sxnrt`
+and that nothing links back. With `SXN_ENABLE_NODE=OFF` it is not built,
+which is why this page can promise a surface rather than describe one.
 
 `Sxn.serve` and `Sxn.file` are the two things that do not survive that. A TCP
 listener and a thread pool have no portable stand-in worth writing, so they

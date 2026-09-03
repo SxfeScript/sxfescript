@@ -112,7 +112,7 @@ static JSValue js_zlib_stream_push(JSContext *ctx, JSValueConst this_val, int ar
     return bytes;
 }
 
-/* Called from sxn_install_network (src/network.c), beside the other
+/* Called from sxn_install_runtime (src/network.c), beside the other
    primitives bootstrap.js consumes. */
 void sxn_install_compression(JSContext *ctx) {
     JSValue global = JS_GetGlobalObject(ctx);
