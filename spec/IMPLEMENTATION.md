@@ -375,6 +375,61 @@ emitter by a byte. Nothing emitted it -- it is selected only for an unchecked
 checked -- so it had never mattered, and briefly making the path live is what
 surfaced it. It stays dead; the declaration is now honest.
 
+### The property cache was flushed by every property anyone added
+
+`js_prop_cache_invalidate` bumps a runtime-wide generation counter, which
+invalidates every entry in the shape-keyed property cache at once. It was
+called unconditionally on entry to `add_property` -- so every object literal
+field, every constructor field and every expando threw away the whole cache.
+An ExpressX request builds a 13-property response, adds eight properties to a
+native `Request` and builds an outcome object, so it did that twenty-odd
+times, and every field read between them paid a miss and a refill.
+
+Only a prototype's new property can make a live entry wrong. The cache answers
+"a receiver of shape S finds this at depth d, slot k", and it is only ever
+filled from a property that was *found*. Adding to an ordinary object changes
+that object's own shape, so an entry keyed on the old one stops matching it
+and nothing else moved. Adding to a prototype can shadow something a site
+already found further down the chain, and that is the one case where a live
+entry is still matched and is wrong. Every other way a property can move --
+resize, compact, in-place shape update, prototype reassignment, a freed
+shape's address -- already invalidates at its own site.
+
+That gate needed one other change to be sound. `is_prototype` was set only in
+`JS_SetPrototypeInternal`, which leaves it false for `Foo.prototype` and for
+every builtin prototype: upstream uses the flag only to track
+`Array.prototype`, not to answer "is anyone inheriting from me". It is now set
+in `js_new_shape_nohash`, the single funnel every shape creation passes
+through, so an object is flagged the moment a shape names it as a prototype --
+which necessarily precedes any cached entry whose chain includes it, because
+an entry is only filled from a receiver that was actually walked.
+
+`tests/fixtures/prop_cache_shadow.mjs` is the guard: warm call sites, then own
+properties shadowing inherited ones, a nearer prototype shadowing a further
+one, `Object.prototype` gaining and losing a property, a constructor
+prototype's method replaced and then shadowed, `setPrototypeOf` under a warm
+site, an accessor redefined as data, and 500 iterations of ordinary object
+churn that must disturb none of it. Node runs the same file and agrees.
+Removing the `is_prototype` line makes it fail on the `Foo.prototype` case,
+which is the one upstream leaves unflagged.
+
+Worth, measured three ways:
+
+| | flush every add | gated |
+|---|---|---|
+| 12 warm reads beside one 4-field literal | 150.9 ns | 128.0 |
+| ExpressX, per request, seven shapes | -- | 0.1 to 1.8% |
+| `benchmarks/wintertc` throughput | -- | unmoved |
+
+The first row is the shape the cache exists for and the interference is
+mostly gone: 25.7 ns of it per iteration against 5.6. The other two are the
+honest part. ExpressX reads few fields twice on the same shape -- a fresh
+`Request` and a fresh response object per request -- so most of its reads
+would miss anyway, and the wintertc workloads are Buffer, TextEncoder,
+EventEmitter and JSON, none of which is a warm read set. The change is kept
+because it is strictly less work for the same answer, not because those two
+rows moved.
+
 ### A JIT is ruled out by platform, not by effort
 
 iOS does not grant W^X/JIT entitlements to third-party apps, so a

@@ -236,6 +236,13 @@ if(BUILD_TESTING AND SXN_BUILD_TESTS)
   # expected value is Node's, bar the one i32 wrap that is SX's by definition.
   add_test(NAME sxn-struct-sroa COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/struct_sroa.sx)
   set_tests_properties(sxn-struct-sroa PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
+  # The property cache is flushed when a prototype gains a property, and not
+  # when an ordinary object does. This is the second half: a warm call site
+  # that has already found a property, and then something that should shadow
+  # or move it. Every answer is Node's, and `node tests/fixtures/
+  # prop_cache_shadow.mjs` runs the same file.
+  add_test(NAME sxn-prop-cache-shadow COMMAND sxn ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/prop_cache_shadow.mjs)
+  set_tests_properties(sxn-prop-cache-shadow PROPERTIES FAIL_REGULAR_EXPRESSION "FAIL")
   # Reference cycles are invisible to refcounting and reclaimable only by the
   # cycle collector, which runs only on allocation. Sxn.gc() is the explicit
   # ask; this asserts a burst of 100k cyclic closures comes back.

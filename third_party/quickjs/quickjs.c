@@ -1270,9 +1270,12 @@ struct JSShape {
    - A hit requires an exact (pc, shape) match *and* a matching global
      generation stamp, so a stale entry can never be used.
    - `gen` is bumped by js_prop_cache_invalidate() at every point that can
-     change where a property lives: adding, deleting, resizing, compacting,
-     in-place shape updates, prototype changes, and shape frees (the last
-     also rules out a freed shape's address being reused by a new one).
+     change where a property lives: deleting, resizing, compacting, in-place
+     shape updates, prototype changes, shape frees (which also rules out a
+     freed shape's address being reused by a new one), and adding a property
+     to an object that is somebody's prototype. Adding to an ordinary object
+     needs no bump: its own shape changes, so an entry keyed on the old shape
+     stops matching it, and nothing else moved. See add_property.
    - Only the *location* is cached, never a value, so ordinary writes to an
      existing slot need no invalidation: the value is always read fresh.
    Walking `depth` prototypes from a live receiver is safe because
@@ -6758,8 +6761,20 @@ static inline JSShape *js_new_shape_nohash(JSContext *ctx, JSObject *proto,
     sh = get_shape_from_alloc(sh_alloc, hash_size);
     JS_REF_COUNT(sh) = 1;
     add_gc_object(rt, &sh->header, JS_GC_OBJ_TYPE_SHAPE);
-    if (proto)
+    if (proto) {
         js_dup(JS_MKPTR(JS_TAG_OBJECT, proto));
+        /* arcsx: every shape creation passes through here, so this is where
+           an object becomes reachable as somebody's prototype. Upstream sets
+           is_prototype only in JS_SetPrototypeInternal, which leaves it false
+           for `Foo.prototype` and for every builtin prototype -- fine while
+           the flag only tracked Array.prototype, but add_property now uses it
+           to decide whether a property being added can shadow one a call site
+           has already cached deeper in a chain. Flagged here, the answer is
+           always yes when it might be: a cached entry can only name a chain
+           that some real receiver walked, and creating that receiver's shape
+           ran this line first. */
+        proto->is_prototype = true;
+    }
     sh->proto = proto;
     /* prop_hash_mask must be set before prop_hash_end(sh) is used, as the hash
        location depends on it in the merged-header layout. */
@@ -11518,10 +11533,26 @@ JSValue JS_GetPropertyStr(JSContext *ctx, JSValueConst this_obj,
 static JSProperty *add_property(JSContext *ctx,
                                 JSObject *p, JSAtom prop, int prop_flags)
 {
-    js_prop_cache_invalidate(ctx->rt); /* arcsx: shape gains a property */
     JSShape *sh, *new_sh;
 
     if (unlikely(p->is_prototype)) {
+        /* arcsx: only a prototype's new property can invalidate a cached
+           lookup. The cache answers "a receiver of shape S finds this at
+           depth d, slot k", and it is only ever filled from a property that
+           was found. Adding to an ordinary object changes that object's own
+           shape, so an entry keyed on the old one stops matching it and no
+           other object's layout moved; adding to a prototype can shadow
+           something a site already found further down the chain, which is the
+           one case a live entry could still be matched and be wrong. Every
+           other way a property can move -- resize, compact, in-place shape
+           update, prototype reassignment, a freed shape's address -- keeps
+           its own invalidation at its own site.
+
+           This is the difference between flushing the runtime's whole
+           property cache on every object literal, constructor field and
+           expando, and flushing it when a prototype gains a method.
+           spec/PERFORMANCE.md has what it was worth. */
+        js_prop_cache_invalidate(ctx->rt);
         /* track addition of small integer properties to
            Array.prototype and Object.prototype */
         if (unlikely((p == JS_VALUE_GET_OBJ(ctx->class_proto[JS_CLASS_ARRAY]) ||

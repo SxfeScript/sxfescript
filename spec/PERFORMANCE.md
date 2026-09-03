@@ -64,6 +64,16 @@ tagged `arcsx:` in `third_party/quickjs`), roughly in order of payoff:
   pass allocated 7-8 blocks; recycling them is what took Buffer 83->36 ms
   and TextEncoder 65->23.5 ms in a single change, and cut the pause
   benchmark's total time from 1.1 s to 0.41 s.
+- **The property cache, flushed only by a prototype.** Adding a property to
+  any object at all used to invalidate every entry in the shape-keyed
+  property cache, so an object literal beside a warm read set threw the reads
+  away on every iteration. Only a prototype's new property can shadow
+  something a call site already found, so only that invalidates now. Twelve
+  warm reads sharing a loop with one four-field literal go 150.9 -> 128.0 ns
+  an iteration; the interference the flush caused was 25.7 ns of that and is
+  now 5.6. The rows in this document do not move -- none of these workloads
+  is a warm read set -- and `spec/IMPLEMENTATION.md` has the soundness
+  argument and the fixture that guards it.
 - **Pinned core-type shapes.** QuickJS interns the empty shape behind
   `new Foo()` in a runtime-wide table, but nothing holds a reference to it,
   so a loop that allocates and drops one object per iteration destroys the
