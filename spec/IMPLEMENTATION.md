@@ -252,13 +252,45 @@ The `benchmarks/wintertc` rows are unchanged by all of it (buffer 19.4 ms,
 textencoder 4.6, events 6.7, worst pause 0.04), which is expected: none of
 those workloads calls a small function with a declared scalar signature.
 
-Two limits worth stating rather than discovering later. The splice requires
-the body to load every parameter once in declaration order, so
+**It fired for one of the three ways to write the function.** Recorded
+because the gap survived the fixture that was written to catch exactly this
+kind of thing. The pass identifies a callee by `OP_fclosure` immediately
+followed by `OP_put_loc`, and rejects a local touched by any other
+`OP_FMT_loc` opcode. Only a hoisted `function` declaration produces that
+shape: `resolve_variables` stores its closure straight into the slot at scope
+entry (`OP_enter_scope`). Every other form is a function *expression* the
+parser names after its binding, which puts an `OP_set_name` between the
+closure and the store, and a lexical binding carries an
+`OP_set_loc_uninitialized` for its dead zone besides. So
+
+    function add(a: i32, b: i32): i32 { return a + b }   5.82 ns
+    const  add = (a: i32, b: i32): i32 => a + b         17.58 ns
+    var    add = function (a, b) { … }                  16.04 ns
+
+on the M4, minimum of 9 runs over 5M iterations -- and the arrow is the form
+`.sx` is written in. `tests/fixtures/typed_inline.sx` used declarations
+throughout, which is why it never showed.
+
+Both blockers are now matched: an optional `OP_set_name` between the closure
+and the store, and `OP_set_loc_uninitialized` exempted from the
+disqualifying-opcode test. The call site accepts a checked load as well as a
+plain one, and when it was checked the load is kept and its value dropped
+rather than erased, because a lexical callee can still be in its dead zone at
+a call site that follows its store in bytecode order -- a `case` falling past
+the declaration reaches one. That costs two opcodes against the frame's ten:
+6.11 ns for the arrow against 5.80 for the declaration, both against 17.58
+before. The fixture now covers all five binding forms and the dead zone, with
+every expected value taken from Node.
+
+Two limits remain worth stating rather than discovering later. The splice
+requires the body to load every parameter once in declaration order, so
 `(a, b) => a * b + c` and anything reusing a parameter (`v.x * v.x`) still
 pays for its frame; lifting that needs the arguments in caller temporaries,
 which means allocating locals after `resolve_variables`. And an inlined callee
 no longer appears in a stack trace if its arithmetic throws -- the same
-tradeoff every inlining compiler makes.
+tradeoff every inlining compiler makes. A module-level function is a module
+var rather than a local, so it is still never a candidate, which is what
+keeps a real `.sx` module's own helpers out.
 
 ### The other large removable cost is the object, and the type removes it
 

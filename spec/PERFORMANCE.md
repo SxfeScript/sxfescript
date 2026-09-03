@@ -416,6 +416,15 @@ opcode, which matters because the opcode space is full -- the template-literal
 `concat` op above took the last slot. Plain JavaScript never qualifies: the
 gate is the declared signature, so a `.js` file is untouched.
 
+For a while it bought this only for `function add(…) {…}`. Every other way of
+writing the same function is a function expression, and the two marks the
+parser leaves on one -- a name, and a dead-zone init on a lexical binding --
+each disqualified the callee, so `const add = (a: i32, b: i32): i32 => a + b`
+cost 17.58 ns where the declaration cost 5.82. That form is the one `.sx` is
+written in. Both are matched now, and the arrow costs 6.11 ns: the odd 0.3 is
+the checked load, kept and dropped rather than erased, so a callee still in
+its dead zone throws where the language says it does.
+
 Two limits are worth stating rather than discovering. The splice needs the
 body to load every parameter once in declaration order, so anything reusing a
 parameter still pays for its frame. And an inlined callee no longer appears in

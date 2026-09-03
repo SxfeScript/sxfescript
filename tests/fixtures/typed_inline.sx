@@ -58,6 +58,53 @@ function throwing(): void {
 }
 throwing();
 
+// --- every way of binding the callee ------------------------------------
+// The splice used to fire only for a hoisted `function` declaration, because
+// the other forms are function *expressions*: the parser names them with an
+// OP_set_name between the closure and the store, and a lexical binding also
+// carries a dead-zone init. Both are one store of one function, and the arrow
+// is the form .sx is actually written in.
+function bindingForms(): void {
+  function decl(a: i32, b: i32): i32 { return a + b; }
+  const arrow = (a: i32, b: i32): i32 => a + b;
+  let letArrow = (a: i32, b: i32): i32 => a + b;
+  var varFn = function (a: i32, b: i32): i32 { return a + b; };
+  const named = function add(a: i32, b: i32): i32 { return a + b; };
+
+  check("function declaration", decl(2, 3), 5);
+  check("const arrow", arrow(2, 3), 5);
+  check("let arrow", letArrow(2, 3), 5);
+  check("var function expression", varFn(2, 3), 5);
+  check("named function expression", named(2, 3), 5);
+
+  // The name is still the binding's, which is what OP_set_name was for.
+  check("arrow takes the binding's name", arrow.name, "arrow");
+  check("named expression keeps its own name", named.name, "add");
+
+  // Coercion and exceptions have to survive the splice on these forms too.
+  check("arrow concatenates", arrow("a", "b"), "ab");
+  let threw = "";
+  try { arrow(Symbol("s"), 1); } catch (e) { threw = e.constructor.name; }
+  check("arrow still throws TypeError", threw, "TypeError");
+}
+bindingForms();
+
+// --- a lexical callee is still checked for its dead zone -----------------
+// A `case` can fall past the declaration and reach a call site that sits
+// after the store in bytecode order. The splice must not answer where the
+// language throws.
+function deadZone(c: i32): string {
+  switch (c) {
+    case 1: const add = (a: i32, b: i32): i32 => a + b; return "d" + add(1, 2);
+    case 2: return "t" + add(1, 2);
+  }
+  return "none";
+}
+check("declared then called", deadZone(1), "d3");
+let dzThrew = "";
+try { deadZone(2); } catch (e) { dzThrew = e.constructor.name; }
+check("called in the dead zone", dzThrew, "ReferenceError");
+
 // --- a reassigned binding must not be spliced ----------------------------
 function reassigned(): number {
   function pick(a: i32, b: i32): i32 { return a + b; }

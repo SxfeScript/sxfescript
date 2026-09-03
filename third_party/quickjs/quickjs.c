@@ -39179,6 +39179,7 @@ static __exception int sx_inline_typed_calls(JSContext *ctx, JSFunctionDef *fd)
     bool changed = false;
     int *func_of_loc = NULL;
     int pending_out = -1, pending_cpool = -1, pending_depth = 0;
+    bool pending_checked = false;
 
     if (fd->var_count <= 0 || fd->cpool_count <= 0)
         return 0;
@@ -39197,24 +39198,38 @@ static __exception int sx_inline_typed_calls(JSContext *ctx, JSFunctionDef *fd)
         int op = bc_buf[pos];
         int idx;
         pos_next = pos + opcode_info[op].size;
-        if (op == OP_fclosure && pos_next < bc_len &&
-            bc_buf[pos_next] == OP_put_loc) {
-            int cpool_idx = (int)get_u32(bc_buf + pos + 1);
-            idx = (int)get_u16(bc_buf + pos_next + 1);
-            if (idx < fd->var_count && func_of_loc[idx] == -1 &&
-                cpool_idx >= 0 && cpool_idx < fd->cpool_count) {
-                func_of_loc[idx] = cpool_idx;
-                pos_next += opcode_info[OP_put_loc].size;
-            } else if (idx < fd->var_count) {
-                func_of_loc[idx] = -2;
-                pos_next += opcode_info[OP_put_loc].size;
+        /* `function f() {}` stores its closure straight into the slot at
+           scope entry. Every other way of writing the same function --
+           `const f = (a: i32): i32 => …`, `let f = …`, `var f = function …`
+           -- is a function expression the parser names after the binding,
+           which puts an OP_set_name between the fclosure and the store. Both
+           are one store of one constant-pool function, and the second shape
+           is the one .sx code is actually written in, so both are matched. */
+        if (op == OP_fclosure) {
+            int store = pos_next;
+            if (store < bc_len && bc_buf[store] == OP_set_name)
+                store += opcode_info[OP_set_name].size;
+            if (store < bc_len && bc_buf[store] == OP_put_loc) {
+                int cpool_idx = (int)get_u32(bc_buf + pos + 1);
+                idx = (int)get_u16(bc_buf + store + 1);
+                if (idx < fd->var_count && func_of_loc[idx] == -1 &&
+                    cpool_idx >= 0 && cpool_idx < fd->cpool_count)
+                    func_of_loc[idx] = cpool_idx;
+                else if (idx < fd->var_count)
+                    func_of_loc[idx] = -2;
+                pos_next = store + opcode_info[OP_put_loc].size;
+                continue;
             }
-            continue;
         }
         /* Any other mention of a local as anything but a plain read makes it
-           unusable: a second store, a TDZ init, a closure capture. */
+           unusable: a second store, a closure capture.
+           OP_set_loc_uninitialized is the exception. resolve_variables emits
+           one for every lexical binding at scope entry, so a `const` or `let`
+           callee always carries one, and it is not a second store -- it is
+           the dead zone, which the checked read below still tests for. */
         if (opcode_info[op].fmt == OP_FMT_loc &&
-            op != OP_get_loc && op != OP_get_loc_check) {
+            op != OP_get_loc && op != OP_get_loc_check &&
+            op != OP_set_loc_uninitialized) {
             idx = (int)get_u16(bc_buf + pos + 1);
             if (idx < fd->var_count)
                 func_of_loc[idx] = -2;
@@ -39245,11 +39260,28 @@ static __exception int sx_inline_typed_calls(JSContext *ctx, JSFunctionDef *fd)
             if (pending_depth == argc &&
                 sx_inline_candidate(cb, argc, &tail_start)) {
                 /* Erase the callee load; the arguments already emitted after
-                   it shift down and stay in their original order. */
+                   it shift down and stay in their original order.
+
+                   A lexical callee is the exception. Its load is checked,
+                   because the binding can still be in its dead zone at a call
+                   site that sits after the store in bytecode order and is
+                   reached without it -- a `case` falling past the declaration,
+                   say. Splicing the body there would answer where the language
+                   throws, so the checked load stays and its value is dropped:
+                   two opcodes, against the ten a frame costs. */
                 int drop = opcode_info[OP_get_loc].size;
-                memmove(bc_out.buf + pending_out, bc_out.buf + pending_out + drop,
-                        bc_out.size - pending_out - drop);
-                bc_out.size -= drop;
+                if (pending_checked) {
+                    int at = pending_out + drop;
+                    if (!dbuf_putc(&bc_out, OP_drop)) {
+                        memmove(bc_out.buf + at + 1, bc_out.buf + at,
+                                bc_out.size - 1 - at);
+                        bc_out.buf[at] = OP_drop;
+                    }
+                } else {
+                    memmove(bc_out.buf + pending_out, bc_out.buf + pending_out + drop,
+                            bc_out.size - pending_out - drop);
+                    bc_out.size -= drop;
+                }
                 sx_inline_emit_tail(cb, tail_start, &bc_out);
                 pending_out = -1;
                 changed = true;
@@ -39268,12 +39300,13 @@ static __exception int sx_inline_typed_calls(JSContext *ctx, JSFunctionDef *fd)
             }
         }
 
-        if (pending_out < 0 && op == OP_get_loc) {
+        if (pending_out < 0 && (op == OP_get_loc || op == OP_get_loc_check)) {
             int idx = (int)get_u16(bc_buf + pos + 1);
             if (idx < fd->var_count && func_of_loc[idx] >= 0) {
                 pending_out = bc_out.size;
                 pending_cpool = func_of_loc[idx];
                 pending_depth = 0;
+                pending_checked = (op == OP_get_loc_check);
             }
         }
         dbuf_put(&bc_out, bc_buf + pos, len);
