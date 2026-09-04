@@ -26,15 +26,21 @@ platform/architecture combinations.
 The fresh Linux HTTP run used an AMD Ryzen 7 5700G, 16 threads, Node v23.11.1,
 Go 1.26, bombardier, 100,000 requests, and 125 connections per row:
 
-| Test | ExpressX (16 processes) | Winner |
-|---|---:|---|
-| Static | 165,633 req/s | ExpressX |
-| Parameterized | 145,742 req/s | Go net/http (150,195) |
-| REST (1 MB JSON POST) | 798 req/s | ExpressX |
+| Framework | Static | Parameterized | REST (1 MB JSON POST) |
+|---|---:|---:|---:|
+| **ExpressX (16 processes)** | **168,773** | **155,380** | **848** |
+| Go net/http | 156,218 | 149,622 | 723 |
+| Fastify (16 processes) | 90,623 | 86,201 | 536 |
+| Koa (16 processes) | 68,929 | 65,094 | 725 |
+| Express (16 processes) | 36,032 | 35,314 | 765 |
+| ExpressX (1 process) | 38,028 | 34,201 | 232 |
+| Express (1 process) | 8,003 | 7,841 | 220 |
 
-ExpressX's single-process rows were 35,404 / 33,066 / 232 req/s for the same
-tests. Results vary with machine load; compare rows within one run. The full
-report and raw data are maintained in the ExpressX benchmark repository.
+ExpressX takes all three, by 8% on Static and 4% on Parameterized against
+Go, and 11% on REST against Express. Go uses every core from one process, so
+the 16-process rows are the fair comparison against it. Results vary with
+machine load; compare rows within one run. The full report and raw data are
+maintained in the ExpressX benchmark repository.
 
 ## Builds and verification
 
