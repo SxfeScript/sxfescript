@@ -200,13 +200,13 @@ working laptop under load, and the Linux box is slower per core but idle.
 | Compiler | Apple clang | gcc 13.2 |
 | Node | v25.2.1 | v23.11.1 |
 | Bun | 1.2.17 | 1.2.21 |
-| Load while measuring | 2-5 | 0.4-1.2 |
+| Load while measuring | 2.4-3.6 | 0.4-1.4 |
 
 Read each machine's table against itself, never across the two. Both now run
 the same major Node; the Linux box's Bun is a few patches ahead. What still
 differs is the kernel: `performance.now` costs far more per call there, which
 is why its pause totals read in seconds for all three runtimes. Same tree,
-same tests, same 95 fixtures passing on both.
+same tests, same 133 tests passing on both.
 
 How each row is measured: throughput rows are the harness's own 1,000-run
 medians. The two startup rows are 20 interleaved launches per runtime, quoted
@@ -220,15 +220,15 @@ runtime's startup cost.
 
 | Category | sxn | Node | Bun | Winner |
 |---|---|---|---|---|
-| Real-world end-to-end task | **8.4 ms** | 76.6 ms | 15.6 ms | sxn |
-| Cold start | **7.5 ms** | 42.5 ms | 9.4 ms | sxn |
-| Sustained throughput: Buffer ops | **19.4 ms** | 24.5 ms | 27.1 ms | sxn |
-| Sustained throughput: TextEncoder | **4.7 ms** | 39.8 ms | 6.2 ms | sxn |
-| Sustained throughput: EventEmitter | 6.7 ms | **5.4 ms** | 9.2 ms | Node |
-| Sustained throughput: JSON round trip | 48.0 ms | 29.3 ms | **24.8 ms** | Bun |
-| Pause consistency: total time | **146.6 ms** | 241.7 ms | 277.0 ms | sxn |
-| Pause consistency: worst single pause | **0.01 ms** | 0.28 ms | 3.13 ms | sxn |
-| Parse 32k-line generated file | **20.1 ms** | 49.9 ms | 25.6 ms | sxn |
+| Real-world end-to-end task | **10.0 ms** | 75.8 ms | 16.4 ms | sxn |
+| Cold start | **8.1 ms** | 43.5 ms | 9.6 ms | sxn |
+| Sustained throughput: Buffer ops | **19.3 ms** | 24.5 ms | 27.5 ms | sxn |
+| Sustained throughput: TextEncoder | **4.6 ms** | 39.7 ms | 6.3 ms | sxn |
+| Sustained throughput: EventEmitter | 6.6 ms | **5.4 ms** | 9.3 ms | Node |
+| Sustained throughput: JSON round trip | 47.1 ms | 29.8 ms | **25.0 ms** | Bun |
+| Pause consistency: total time | **149.8 ms** | 244.1 ms | 284.1 ms | sxn |
+| Pause consistency: worst single pause | **0.02 ms** | 0.21 ms | 2.89 ms | sxn |
+| Parse 32k-line generated file | **23.1 ms** | 55.8 ms | 25.8 ms | sxn |
 
 Seven of nine. The two that are not sxn's are the two worth reading: a JIT
 inlines an EventEmitter call to nothing, and an ablation that skips this
@@ -241,21 +241,23 @@ in it -- `JSON.parse` is C in all three, but what surrounds it is not.
 
 | Category | sxn | Node | Bun | Winner |
 |---|---|---|---|---|
-| Real-world end-to-end task | **7.5 ms** | 56.7 ms | 22.4 ms | sxn |
-| Cold start | **7.4 ms** | 23.1 ms | 13.3 ms | sxn |
-| Sustained throughput: Buffer ops | **38.0 ms** | 39.2 ms | 83.2 ms | sxn |
-| Sustained throughput: TextEncoder | **9.1 ms** | 80.6 ms | 18.0 ms | sxn |
-| Sustained throughput: EventEmitter | 15.9 ms | **10.1 ms** | 25.2 ms | Node |
-| Sustained throughput: JSON round trip | 82.9 ms | 113.5 ms | **60.3 ms** | Bun |
-| Pause consistency: total time | **2855.9 ms** | 3295.3 ms | 3252.4 ms | sxn |
-| Pause consistency: worst single pause | **0.25 ms** | 1.72 ms | 6.48 ms | sxn |
-| Parse 32k-line generated file | **36.6 ms** | 51.5 ms | 54.2 ms | sxn |
+| Real-world end-to-end task | **7.3 ms** | 56.1 ms | 21.6 ms | sxn |
+| Cold start | **7.1 ms** | 22.8 ms | 12.9 ms | sxn |
+| Sustained throughput: Buffer ops | **38.3 ms** | 39.1 ms | 82.9 ms | sxn |
+| Sustained throughput: TextEncoder | **8.4 ms** | 80.5 ms | 17.4 ms | sxn |
+| Sustained throughput: EventEmitter | 14.7 ms | **10.1 ms** | 24.7 ms | Node |
+| Sustained throughput: JSON round trip | 86.7 ms | 112.7 ms | **58.9 ms** | Bun |
+| Pause consistency: total time | **2846.2 ms** | 3294.1 ms | 3303.1 ms | sxn |
+| Pause consistency: worst single pause | **0.11 ms** | 1.74 ms | 6.27 ms | sxn |
+| Parse 32k-line generated file | **36.2 ms** | 52.2 ms | 52.2 ms | sxn |
 
 Seven of nine again, and the same two are not sxn's, which is the useful
 part: two machines, two chips, two operating systems, and the shape of the
 result does not move. Buffer is the one row where Node is close here rather
 than behind, and JSON is closer than it is on the Mac -- against this Node,
-sxn takes JSON while Bun keeps it.
+sxn takes JSON while Bun keeps it. Parse is a three-way split on the Mac and
+a two-way one here: Node and Bun land on the same number and sxn is a third
+faster than both.
 
 The full write-up -- pause-row detail, the no-JIT tradeoff, every
 optimization behind these numbers in the order it landed, and what's still
