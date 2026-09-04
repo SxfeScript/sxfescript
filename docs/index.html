@@ -186,7 +186,7 @@
           <code>sxn</code> runs your <code>.js</code>, <code>.ts</code> and <code>.sx</code>
           files with no build step, loads <code>node_modules</code>, and serves HTTP.
           It cold-starts in 8.1&nbsp;ms against Node's 43.5, and its worst
-          garbage-collection pause is 0.02&nbsp;ms against Node's 0.21 and Bun's 2.89
+          garbage-collection pause is 0.04&nbsp;ms against Node's 0.22 and Bun's 2.55
           &mdash; because there is no JIT to warm up. That is deliberate: iOS will not
           let a third-party app generate machine code, so this one is built to be fast
           without it.

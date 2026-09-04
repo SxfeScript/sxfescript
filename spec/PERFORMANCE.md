@@ -7,8 +7,8 @@ behind those numbers: what each row actually measures, the optimizations
 that produced them, and what's still open.
 
 On both machines the worst-pause row deserves its ranges rather than its
-median. On the Mac, individual samples were 0.01-0.05 ms here against Node's
-0.19-0.34 and Bun's 2.70-4.32; stability is the claim, not just the
+median. On the Mac, individual samples were 0.01-0.13 ms here against Node's
+0.19-0.77 and Bun's 2.39-3.44; stability is the claim, not just the
 minimum. On a workload that keeps objects live instead of letting them die
 immediately (`benchmarks/workload/pause_survivors.js`: 2000 survivors while
 churning 2M allocations) the worst pause is 0.040 ms against Node's 0.197 and
